@@ -82,6 +82,74 @@
     detail: string;
   }
 
+  /**
+   * One representative connection type for a node pair, for drawing on the
+   * edge itself.
+   *
+   * Measured profiles are preferred because they name the transport that is
+   * actually carrying traffic, but they only appear once the profiler has
+   * run. Until then the topology edge's own IP is enough to classify the
+   * link, so the badge shows up immediately rather than after the first
+   * probe round.
+   */
+  function connectionTypeForPair(entry: {
+    a: string;
+    b: string;
+    connections: { from: string; ip: string }[];
+  }): ConnectionType | null {
+    const ctx = {
+      nodeNetwork: nodeNetworkData,
+      nodeThunderbolt: nodeThunderboltData,
+    };
+    const profiled = collectPairProfiles(entry.a, entry.b);
+    // RDMA outranks TCP-over-Thunderbolt, which outranks anything else: the
+    // fastest path between the pair is the one worth labelling.
+    const ranked = [...profiled].sort(
+      (left, right) => typeRank(right.type) - typeRank(left.type),
+    );
+    const best = ranked.find((candidate) => candidate.type.kind !== "unknown");
+    if (best) return best.type;
+
+    for (const connection of entry.connections) {
+      if (connection.ip === "RDMA" || connection.ip === "?") continue;
+      const inferred = inferSocketConnectionType(
+        connection.from,
+        connection.ip,
+        ctx,
+      );
+      if (inferred.kind !== "unknown") return inferred;
+    }
+    return null;
+  }
+
+  /**
+   * The on-edge transport label: transport keyword plus the negotiated rate
+   * when the OS gave us one, e.g. "ETH 1G" / "TB5" / "Wi-Fi". The supported
+   * ceiling that reveals a mis-negotiated link (1G on a 10G card) lives in
+   * the tooltip's Max column, not here.
+   */
+  function badgeText(type: ConnectionType): string {
+    const speed = formatNominalSpeed(type.activeSpeedMbps);
+    return speed ? `${type.badge} ${speed}` : type.badge;
+  }
+
+  /** Compact Mbps for the badge: "1G", "10G", "100M". Empty when unknown. */
+  function formatNominalSpeed(mbps: number | undefined): string {
+    if (mbps == null || !isFinite(mbps) || mbps <= 0) return "";
+    if (mbps >= 1000) {
+      const gbps = mbps / 1000;
+      return Number.isInteger(gbps) ? `${gbps}G` : `${gbps.toFixed(1)}G`;
+    }
+    return `${Math.round(mbps)}M`;
+  }
+
+  function typeRank(type: ConnectionType): number {
+    if (type.isRdma) return 3;
+    if (type.kind === "thunderbolt") return 2;
+    if (type.kind === "ethernet") return 1;
+    return 0;
+  }
+
   /** Collect every measured profile in either direction between two nodes. */
   function collectPairProfiles(a: string, b: string): PairProfileEntry[] {
     const result: PairProfileEntry[] = [];
@@ -475,7 +543,10 @@
       const posB = positionById[entry.b];
       if (!posA || !posB) return;
 
-      // Base dashed line
+      // Base dashed line - left as the panel's uniform neutral grey; the
+      // transport is signalled by the grey text label below, not by
+      // recolouring the structural line.
+      const pairType = connectionTypeForPair(entry);
       linksGroup
         .append("line")
         .attr("x1", posA.x)
@@ -563,6 +634,10 @@
       const labelFontSize = isMinimized ? 9 : 11;
       const bwColor = "rgba(255,215,0,0.95)";
       const latColor = "rgba(74,222,128,0.95)";
+      // Transport reads as tertiary context, so it takes the link's own grey
+      // at reduced alpha - deliberately dimmer than the bandwidth (yellow)
+      // and latency (green) numbers, and never a data colour of its own.
+      const transportLabelColor = "rgba(179,179,179,0.7)";
 
       // Place labels along a strip parallel to the edge, on its outer side.
       //   [A→B]   [latency]   [B→A]
@@ -613,6 +688,26 @@
           formatLatencyMs(minLat / 2),
           latColor,
         );
+      }
+
+      // Transport tag on the edge itself. The tooltip already says all of
+      // this, but only one edge at a time and only while hovered; in a
+      // cluster of more than three or four nodes the question is usually
+      // "which link is which", and that reads better off the picture than
+      // out of six successive hovers.
+      //
+      // Drawn as one more of the panel's own borderless floating labels
+      // (same monospace, same placeLabel helper as bandwidth and latency),
+      // in a muted grey so it stays subordinate to the coloured
+      // measurements rather than competing with them. It sits on the inner
+      // side of the edge, opposite the bandwidth/latency strip, so the two
+      // never overlap. The negotiated and supported speeds stay in the
+      // tooltip's Link/Max columns; the edge carries the transport plus its
+      // negotiated rate, e.g. "ETH 1G".
+      if (pairType && pairType.badge) {
+        const bx = mx - px * perpOffset * awayFromCenter;
+        const by = my - py * perpOffset * awayFromCenter;
+        placeLabel(bx, by, badgeText(pairType), transportLabelColor);
       }
 
       // Wide invisible hit target for hover, even when no profiles exist —
@@ -1532,6 +1627,8 @@
           <tr>
             <th>Direction</th>
             <th>Type</th>
+            <th>Link</th>
+            <th>Max</th>
             <th>↑ Upload</th>
             <th>↓ Download</th>
             <th>RTT/2</th>
@@ -1546,6 +1643,12 @@
                 <span class="detail">{profile.detail}</span>
               </td>
               <td class="type">{profile.type.label}</td>
+              <td class="nominal"
+                >{formatBandwidthMbps(profile.type.activeSpeedMbps)}</td
+              >
+              <td class="nominal"
+                >{formatBandwidthMbps(profile.type.supportedSpeedMbps)}</td
+              >
               <td class="bandwidth"
                 >{formatBandwidthMbps(profile.uploadMbps)}</td
               >
@@ -1594,6 +1697,7 @@
     opacity: 0.8;
     animation: flowAnimation 0.75s linear infinite;
   }
+
   @keyframes flowAnimation {
     from {
       stroke-dashoffset: 0;
@@ -1676,6 +1780,13 @@
 
   .link-tooltip .bandwidth {
     color: rgba(255, 215, 0, 0.95);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Nominal rate, dimmer than measured throughput: it is context for the
+     numbers next to it, not the measurement itself. */
+  .link-tooltip .nominal {
+    color: rgba(255, 255, 255, 0.55);
     font-variant-numeric: tabular-nums;
   }
 

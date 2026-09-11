@@ -120,6 +120,10 @@ interface RawNetworkInterfaceInfo {
   ipAddresses?: string[];
   ips?: string[];
   interfaceType?: RawInterfaceType;
+  /** Negotiated link speed in Mbps; absent or 0 when the OS exposes none. */
+  activeSpeedMbps?: number | null;
+  /** Fastest speed the hardware supports, in Mbps; wired interfaces only. */
+  supportedSpeedMbps?: number | null;
 }
 
 interface RawNodeNetworkInfo {
