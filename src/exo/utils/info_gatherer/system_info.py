@@ -1,7 +1,9 @@
 import platform
 import socket
 import sys
+from collections.abc import Mapping
 from subprocess import CalledProcessError
+from typing import Protocol
 
 import psutil
 from anyio import run_process
@@ -90,6 +92,34 @@ async def _get_interface_types_from_networksetup() -> dict[str, InterfaceType]:
     return types
 
 
+class _HasSpeed(Protocol):
+    """The one field we need from psutil's per-interface stats - narrowed to
+    a Protocol so the parsing logic below can be tested without going
+    through psutil at all. Read-only to match psutil's NamedTuple result."""
+
+    @property
+    def speed(self) -> int: ...
+
+
+def _active_speeds_from_stats(stats: Mapping[str, _HasSpeed]) -> dict[str, int]:
+    """Currently negotiated link speed per interface, in Mbps.
+
+    Pure function over psutil's stats (injected rather than fetched here)
+    so it's testable without a live network stack. psutil reports 0 when
+    the OS doesn't expose a speed for that interface - common for Wi-Fi,
+    especially on macOS - and we treat that the same as not knowing it.
+    """
+    return {iface: stat.speed for iface, stat in stats.items() if stat.speed > 0}
+
+
+def _get_active_speeds_mbps() -> dict[str, int]:
+    try:
+        stats = psutil.net_if_stats()
+    except OSError:
+        return {}
+    return _active_speeds_from_stats(stats)
+
+
 async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     """
     Retrieves detailed network interface information on macOS.
@@ -99,6 +129,7 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     """
     interfaces_info: list[NetworkInterfaceInfo] = []
     interface_types = await _get_interface_types_from_networksetup()
+    active_speeds = _get_active_speeds_mbps()
 
     for iface, services in psutil.net_if_addrs().items():
         for service in services:
@@ -109,6 +140,7 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
                             name=iface,
                             ip_address=service.address,
                             interface_type=interface_types.get(iface, "unknown"),
+                            active_speed_mbps=active_speeds.get(iface),
                         )
                     )
                 case _:

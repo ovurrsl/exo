@@ -73,6 +73,10 @@ class NetworkInterfaceInfo(FrozenModel):
     name: str
     ip_address: str
     interface_type: InterfaceType = "unknown"
+    active_speed_mbps: int | None = None
+    """Currently negotiated link speed, in megabits/second. ``None`` when it
+    could not be determined - this is common for Wi-Fi, especially on
+    macOS, where the OS often doesn't expose a negotiated rate at all."""
 
 
 class NodeIdentity(FrozenModel):
