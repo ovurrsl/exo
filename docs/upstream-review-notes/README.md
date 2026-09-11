@@ -1,0 +1,86 @@
+# Upstream review notes
+
+Review drafts for open pull requests on `exo-explore/exo`, written to be pasted
+as review comments. Each one records the exact commands run and their output, so
+a maintainer can re-run them rather than take the claim on trust.
+
+Every draft ends with the Claude Code attribution footer. Keep it when pasting.
+
+## Drafts
+
+| PR | Subject | Verified how | Headline |
+|---|---|---|---|
+| [#2289](2289-test-suite-repair.md) | repair the test suite on `main` | collection counts, both refs | Claim holds and is bigger than stated: 278 → 346 tests. The PR says CI is broken; CI is fine, the *documented local* command is what breaks. |
+| [#2250](2250-prune-node-state.md) | prune stale node state on timeout | test fails on `main`, passes on head | Closes an invariant: all 11 node-keyed `State` maps are now pruned, was 9. |
+| [#2252](2252-prefer-accelerators.md) | prefer accelerators in placement | test fails on `main`, passes on head | Works, but ranks accelerators *above* already-downloaded weights. That is a policy choice presented as a bug fix. |
+| [#2249](2249-orphaned-downloads.md) | GC orphaned downloads | test fails on `main`, passes on head | Sound and consistent with its neighbouring loop. Reuses `NodeTimedOut` for a node that never timed out. |
+| [#2291](2291-cuda-home.md) | auto-detect `CUDA_HOME` | tests pass; real bug not reproducible here | 4 tests pass. No CUDA device on hand, so the end-to-end failure is unverified and the draft says so. |
+| [#2290](2290-loguru-diagnose.md) | `diagnose=False` on log sinks | standalone loguru reproduction | Mechanism confirmed. All three real sinks covered. Also a privacy fix, which the PR does not claim. |
+| [#2201](2201-claude-system-role.md) | accept system-role messages | 5 new tests fail on `main` | Unblocks issue #2193. Deliberately more lenient than the Anthropic API, which should be stated. |
+| [#2126](2126-telemetry-privacy.md) | runner log telemetry | tests pass; payload reviewed | Opt-in and identifier-free presign, both good. Uploaded stderr is unredacted; should depend on #2290. |
+
+## Other drafts in this directory
+
+Not review comments, but the same evidence-first rule applies.
+
+| File | What it is | Where it goes |
+|---|---|---|
+| [issue-linux-cpu-mlx-broken.md](issue-linux-cpu-mlx-broken.md) | The README's Linux setup installs an ABI-incompatible mlx pair, so `import mlx.core` fails. Five-combination matrix, symbol-level evidence, and the 467-test green run that fixing it unlocks. | https://github.com/exo-explore/exo/issues/new |
+| [2010-offer-badge-and-speeds.md](2010-offer-badge-and-speeds.md) | An offer, not a review. Our dashboard work duplicates this PR, so rather than compete, offer the ~40-line delta it does not have. | https://github.com/exo-explore/exo/pull/2010 |
+
+PR #2010 is open and unmerged; its head is `alexcheema/profilers-dashboard` at
+`d1f4b24d`, last touched 3 May 2026, with no review since. It is **34 commits
+behind main and currently conflicts** with it in `src/exo/shared/apply.py` and
+`src/exo/utils/info_gatherer/info_gatherer.py`:
+
+    $ git merge-tree --write-tree upstream/main refs/pull/2010/head | grep ^CONFLICT
+    CONFLICT (content): Merge conflict in src/exo/shared/apply.py
+    CONFLICT (content): Merge conflict in src/exo/utils/info_gatherer/info_gatherer.py
+
+(GitHub still publishes a `refs/pull/2010/merge` ref, but that was computed
+against an older main and is stale — do not read it as "mergeable".)
+
+That is why nothing of ours should *depend* on this PR. Post the offer, but
+keep our own branches based on `main` so they can merge whether or not #2010
+ever moves.
+
+## Environment these were run in
+
+Ubuntu, x86_64, Python 3.13, `uv sync --all-packages --extra mlx-cpu`.
+
+Two limits that apply to every draft, and are disclosed in each:
+
+- **No Apple Silicon.** Metal, Thunderbolt, RDMA and the macOS-specific
+  information gathering cannot be exercised here at all.
+- **The x86_64 MLX wheel is broken on this machine.** Every import fails with
+  `undefined symbol: _ZN3mlx4core6linalg3det...`, which accounts for the 13
+  residual collection errors quoted in the #2289 draft. Anything requiring
+  inference was not run.
+
+## A harness trap, recorded so it is not repeated
+
+Reviewing a PR in a `git worktree` that shares the main checkout's `.venv` gives
+**silently wrong results**. The editable install writes an `exo.pth` pointing at
+the original checkout's `src`, and depending on how many files pytest collects,
+`import exo` resolves to the *original* tree rather than the worktree.
+
+This produced a false failure — PR #2201's own tests appearing to fail on its own
+head — before it was caught. Set the path explicitly:
+
+```bash
+PYTHONPATH=<worktree>/src uv run --no-sync pytest ...
+```
+
+Confirm it took effect before trusting any number:
+
+```python
+import exo.api.types.claude_api as m; print(m.__file__)
+```
+
+A second trap: `git fetch upstream pull/N/head:upstream-pr/N` will not move a
+branch that already exists and is not a fast-forward, and `-q` hides the refusal.
+One branch here silently pointed at `main` while its remote-tracking ref held the
+real PR head. Verify with `git for-each-ref` before measuring.
+
+---
+_Generated by [Claude Code](https://claude.ai/code)_
