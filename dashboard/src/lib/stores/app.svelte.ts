@@ -51,9 +51,17 @@ export interface NodeInfo {
     name?: string;
     addresses?: string[];
     interface_type?: InterfaceType;
+    /** Currently negotiated link speed, in Mbps. Undefined when unknown -
+     * common for Wi-Fi, especially on macOS. */
+    active_speed_mbps?: number;
+    /** Fastest speed the interface's hardware supports, in Mbps. Only
+     * populated for wired interfaces today. */
+    supported_speed_mbps?: number;
   }>;
   ip_to_interface?: Record<string, string>;
   ip_to_interface_type?: Record<string, InterfaceType>;
+  ip_to_active_speed_mbps?: Record<string, number>;
+  ip_to_supported_speed_mbps?: Record<string, number>;
   macmon_info?: {
     memory?: {
       ram_usage: number;
@@ -131,6 +139,8 @@ interface RawNetworkInterfaceInfo {
   ipv6?: string;
   ipAddresses?: string[];
   ips?: string[];
+  activeSpeedMbps?: number;
+  supportedSpeedMbps?: number;
 }
 
 interface RawNodeNetworkInfo {
@@ -402,10 +412,18 @@ function normalizeInterfaceType(raw: string | undefined): InterfaceType {
     : "unknown";
 }
 
+function normalizePositiveInt(raw: number | undefined): number | undefined {
+  return typeof raw === "number" && Number.isFinite(raw) && raw > 0
+    ? raw
+    : undefined;
+}
+
 function transformNetworkInterface(iface: RawNetworkInterfaceInfo): {
   name?: string;
   addresses: string[];
   interface_type: InterfaceType;
+  active_speed_mbps?: number;
+  supported_speed_mbps?: number;
 } {
   const addresses: string[] = [];
   if (iface.ipAddress && typeof iface.ipAddress === "string") {
@@ -435,6 +453,8 @@ function transformNetworkInterface(iface: RawNetworkInterfaceInfo): {
     name: iface.name,
     addresses: Array.from(new Set(addresses)),
     interface_type: normalizeInterfaceType(iface.interfaceType),
+    active_speed_mbps: normalizePositiveInt(iface.activeSpeedMbps),
+    supported_speed_mbps: normalizePositiveInt(iface.supportedSpeedMbps),
   };
 }
 
@@ -463,10 +483,18 @@ function transformTopology(
 
     const ipToInterface: Record<string, string> = {};
     const ipToInterfaceType: Record<string, InterfaceType> = {};
+    const ipToActiveSpeedMbps: Record<string, number> = {};
+    const ipToSupportedSpeedMbps: Record<string, number> = {};
     for (const iface of networkInterfaces) {
       for (const addr of iface.addresses || []) {
         ipToInterface[addr] = iface.name ?? "";
         ipToInterfaceType[addr] = iface.interface_type;
+        if (iface.active_speed_mbps !== undefined) {
+          ipToActiveSpeedMbps[addr] = iface.active_speed_mbps;
+        }
+        if (iface.supported_speed_mbps !== undefined) {
+          ipToSupportedSpeedMbps[addr] = iface.supported_speed_mbps;
+        }
       }
     }
 
@@ -479,6 +507,8 @@ function transformTopology(
       network_interfaces: networkInterfaces,
       ip_to_interface: ipToInterface,
       ip_to_interface_type: ipToInterfaceType,
+      ip_to_active_speed_mbps: ipToActiveSpeedMbps,
+      ip_to_supported_speed_mbps: ipToSupportedSpeedMbps,
       macmon_info: {
         memory: {
           ram_usage: ramUsage,
