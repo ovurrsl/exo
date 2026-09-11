@@ -123,9 +123,10 @@
   }
 
   /**
-   * What goes inside the badge: transport, and the negotiated rate when the
-   * OS gave us one. "ETH 1G" next to "ETH 10G" is the whole point - a link
-   * that negotiated down is invisible until its own speed is on the picture.
+   * The on-edge transport label: transport keyword plus the negotiated rate
+   * when the OS gave us one, e.g. "ETH 1G" / "TB5" / "Wi-Fi". The supported
+   * ceiling that reveals a mis-negotiated link (1G on a 10G card) lives in
+   * the tooltip's Max column, not here.
    */
   function badgeText(type: ConnectionType): string {
     const speed = formatNominalSpeed(type.activeSpeedMbps);
@@ -542,18 +543,17 @@
       const posB = positionById[entry.b];
       if (!posA || !posB) return;
 
-      // Base dashed line
+      // Base dashed line - left as the panel's uniform neutral grey; the
+      // transport is signalled by the grey text label below, not by
+      // recolouring the structural line.
       const pairType = connectionTypeForPair(entry);
-      const linkClass = pairType
-        ? `graph-link graph-link--${pairType.kind}`
-        : "graph-link";
       linksGroup
         .append("line")
         .attr("x1", posA.x)
         .attr("y1", posA.y)
         .attr("x2", posB.x)
         .attr("y2", posB.y)
-        .attr("class", linkClass);
+        .attr("class", "graph-link");
 
       // Calculate midpoint and direction for arrows
       const dx = posB.x - posA.x;
@@ -634,6 +634,10 @@
       const labelFontSize = isMinimized ? 9 : 11;
       const bwColor = "rgba(255,215,0,0.95)";
       const latColor = "rgba(74,222,128,0.95)";
+      // Transport reads as tertiary context, so it takes the link's own grey
+      // at reduced alpha - deliberately dimmer than the bandwidth (yellow)
+      // and latency (green) numbers, and never a data colour of its own.
+      const transportLabelColor = "rgba(179,179,179,0.7)";
 
       // Place labels along a strip parallel to the edge, on its outer side.
       //   [A→B]   [latency]   [B→A]
@@ -686,38 +690,24 @@
         );
       }
 
-      // Transport badge on the edge itself. The tooltip already says all of
+      // Transport tag on the edge itself. The tooltip already says all of
       // this, but only one edge at a time and only while hovered; in a
       // cluster of more than three or four nodes the question is usually
-      // "which link is the slow one", and that reads better off the picture
-      // than out of six successive hovers.
+      // "which link is which", and that reads better off the picture than
+      // out of six successive hovers.
       //
-      // Placed on the *inner* side of the edge, opposite the bandwidth and
-      // latency strip above, so the two never overlap.
+      // Drawn as one more of the panel's own borderless floating labels
+      // (same monospace, same placeLabel helper as bandwidth and latency),
+      // in a muted grey so it stays subordinate to the coloured
+      // measurements rather than competing with them. It sits on the inner
+      // side of the edge, opposite the bandwidth/latency strip, so the two
+      // never overlap. The negotiated and supported speeds stay in the
+      // tooltip's Link/Max columns; the edge carries the transport plus its
+      // negotiated rate, e.g. "ETH 1G".
       if (pairType && pairType.badge) {
-        const badgeLabel = badgeText(pairType);
-        const badgeWidth = 14 + badgeLabel.length * 5.5;
-        const badgeHeight = 14;
-        const badgeOffset = perpOffset + badgeHeight / 2;
-        const bx = mx - px * badgeOffset * awayFromCenter;
-        const by = my - py * badgeOffset * awayFromCenter;
-        const badgeGroup = linksGroup
-          .append("g")
-          .attr("class", `link-type-badge link-type-badge--${pairType.kind}`);
-        badgeGroup
-          .append("rect")
-          .attr("x", bx - badgeWidth / 2)
-          .attr("y", by - badgeHeight / 2)
-          .attr("width", badgeWidth)
-          .attr("height", badgeHeight)
-          .attr("rx", 3);
-        badgeGroup
-          .append("text")
-          .attr("x", bx)
-          .attr("y", by)
-          .attr("text-anchor", "middle")
-          .attr("dominant-baseline", "central")
-          .text(badgeLabel);
+        const bx = mx - px * perpOffset * awayFromCenter;
+        const by = my - py * perpOffset * awayFromCenter;
+        placeLabel(bx, by, badgeText(pairType), transportLabelColor);
       }
 
       // Wide invisible hit target for hover, even when no profiles exist —
@@ -1708,42 +1698,6 @@
     animation: flowAnimation 0.75s linear infinite;
   }
 
-  /* Transport colouring. Thunderbolt is the fast path, so it gets the
-     accent; Wi-Fi is the one you usually want to notice and avoid, so it
-     recedes. Ethernet keeps the neutral default. */
-  :global(.graph-link--thunderbolt) {
-    stroke: var(--exo-yellow, #ffd700);
-    opacity: 0.9;
-  }
-
-  :global(.graph-link--wifi) {
-    opacity: 0.5;
-  }
-
-  :global(.link-type-badge rect) {
-    fill: rgba(0, 0, 0, 0.72);
-    stroke: var(--exo-light-gray, #b3b3b3);
-    stroke-width: 0.5px;
-  }
-
-  :global(.link-type-badge text) {
-    fill: var(--exo-light-gray, #b3b3b3);
-    font-size: 8px;
-    font-family: inherit;
-    letter-spacing: 0.02em;
-    /* The badge sits on top of a moving dashed line; without this a click
-       near the edge would land on the label instead of the link. */
-    pointer-events: none;
-    user-select: none;
-  }
-
-  :global(.link-type-badge--thunderbolt rect) {
-    stroke: var(--exo-yellow, #ffd700);
-  }
-
-  :global(.link-type-badge--thunderbolt text) {
-    fill: var(--exo-yellow, #ffd700);
-  }
   @keyframes flowAnimation {
     from {
       stroke-dashoffset: 0;
