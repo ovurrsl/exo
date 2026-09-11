@@ -77,6 +77,11 @@ class NetworkInterfaceInfo(FrozenModel):
     """Currently negotiated link speed, in megabits/second. ``None`` when it
     could not be determined - this is common for Wi-Fi, especially on
     macOS, where the OS often doesn't expose a negotiated rate at all."""
+    supported_speed_mbps: int | None = None
+    """Fastest speed the interface's hardware supports, in megabits/second.
+    Only populated for wired interfaces today - deriving a Wi-Fi adapter's
+    maximum rate needs additional platform tooling this hasn't been built
+    against real hardware for."""
 
 
 class NodeIdentity(FrozenModel):
