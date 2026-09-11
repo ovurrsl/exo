@@ -76,12 +76,23 @@
     return node?.friendly_name || nodeId.slice(0, 8);
   }
 
-  type InterfaceMatch = { name: string; interfaceType: InterfaceType };
+  type InterfaceMatch = {
+    name: string;
+    interfaceType: InterfaceType;
+    activeSpeedMbps?: number;
+    supportedSpeedMbps?: number;
+  };
 
   function getInterfaceInfo(
     nodeId: string,
     ip?: string,
-  ): { label: string; missing: boolean; interfaceType: InterfaceType } {
+  ): {
+    label: string;
+    missing: boolean;
+    interfaceType: InterfaceType;
+    activeSpeedMbps?: number;
+    supportedSpeedMbps?: number;
+  } {
     if (!ip) return { label: "?", missing: true, interfaceType: "unknown" };
 
     // Strip port if present (e.g., "192.168.1.1:8080" -> "192.168.1.1")
@@ -99,6 +110,8 @@
         return {
           name: matchFromInterfaces.name,
           interfaceType: matchFromInterfaces.interface_type ?? "unknown",
+          activeSpeedMbps: matchFromInterfaces.active_speed_mbps,
+          supportedSpeedMbps: matchFromInterfaces.supported_speed_mbps,
         };
       }
 
@@ -113,6 +126,12 @@
               node.ip_to_interface_type?.[cleanIp] ??
               (ip ? node.ip_to_interface_type?.[ip] : undefined) ??
               "unknown",
+            activeSpeedMbps:
+              node.ip_to_active_speed_mbps?.[cleanIp] ??
+              (ip ? node.ip_to_active_speed_mbps?.[ip] : undefined),
+            supportedSpeedMbps:
+              node.ip_to_supported_speed_mbps?.[cleanIp] ??
+              (ip ? node.ip_to_supported_speed_mbps?.[ip] : undefined),
           };
         }
       }
@@ -126,6 +145,8 @@
         label: result.name,
         missing: false,
         interfaceType: result.interfaceType,
+        activeSpeedMbps: result.activeSpeedMbps,
+        supportedSpeedMbps: result.supportedSpeedMbps,
       };
 
     // Fallback: search all nodes for this IP
@@ -136,6 +157,8 @@
           label: otherResult.name,
           missing: false,
           interfaceType: otherResult.interfaceType,
+          activeSpeedMbps: otherResult.activeSpeedMbps,
+          supportedSpeedMbps: otherResult.supportedSpeedMbps,
         };
     }
 
@@ -155,6 +178,43 @@
       (iface) => iface.rdmaInterface === rdmaInterface,
     );
     return match?.linkSpeed ?? "";
+  }
+
+  function formatMbps(mbps: number): string {
+    if (mbps >= 1000) {
+      const gbps = mbps / 1000;
+      const rounded = Math.round(gbps * 10) / 10;
+      return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)} Gbps`;
+    }
+    return `${mbps} Mbps`;
+  }
+
+  /**
+   * A speed label for an ethernet/wifi/maybe_ethernet link: the negotiated
+   * speed it's actually running at, plus how much faster the hardware could
+   * go if that differs from what's negotiated. Thunderbolt links don't go
+   * through here - the backend already reports a single negotiated speed
+   * for those (see getThunderboltLinkSpeed).
+   */
+  function formatEthernetLikeSpeed(
+    activeSpeedMbps?: number,
+    supportedSpeedMbps?: number,
+  ): { badge: string; tooltip: string } {
+    const active = activeSpeedMbps ? formatMbps(activeSpeedMbps) : undefined;
+    const supportsMore =
+      supportedSpeedMbps !== undefined &&
+      (activeSpeedMbps === undefined || supportedSpeedMbps > activeSpeedMbps);
+    const supported = supportsMore ? formatMbps(supportedSpeedMbps) : undefined;
+
+    if (active && supported) {
+      return { badge: active, tooltip: `${active} (up to ${supported})` };
+    }
+    if (active) return { badge: active, tooltip: active };
+    // Link is known to support a speed but isn't reporting what it's
+    // actually running at right now (e.g. active speed wasn't determined).
+    if (supported)
+      return { badge: `up to ${supported}`, tooltip: `up to ${supported}` };
+    return { badge: "", tooltip: "" };
   }
 
   function wrapLine(text: string, maxLen: number): string[] {
@@ -377,7 +437,11 @@
       ifaceLabel: string;
       missingIface: boolean;
       interfaceType: InterfaceType;
+      // Short form for the badge and debug labels (e.g. "1 Gbps").
       linkSpeed: string;
+      // Fuller form for the hover tooltip, where there's room to also say
+      // how much faster the hardware supports (e.g. "1 Gbps (up to 2.5 Gbps)").
+      linkSpeedTooltip: string;
     };
     type PairEntry = {
       a: string;
@@ -418,6 +482,7 @@
       let missingIface: boolean;
       let interfaceType: InterfaceType;
       let linkSpeed: string;
+      let linkSpeedTooltip: string;
 
       if (edge.sourceRdmaIface || edge.sinkRdmaIface) {
         ip = "RDMA";
@@ -426,13 +491,19 @@
         // RDMA only runs over Thunderbolt, so the link type needs no lookup.
         interfaceType = "thunderbolt";
         linkSpeed = getThunderboltLinkSpeed(edge.source, edge.sourceRdmaIface);
+        linkSpeedTooltip = linkSpeed;
       } else {
         ip = edge.sendBackIp || "?";
         const ifaceInfo = getInterfaceInfo(edge.source, ip);
         ifaceLabel = ifaceInfo.label;
         missingIface = ifaceInfo.missing;
         interfaceType = ifaceInfo.interfaceType;
-        linkSpeed = "";
+        const speed = formatEthernetLikeSpeed(
+          ifaceInfo.activeSpeedMbps,
+          ifaceInfo.supportedSpeedMbps,
+        );
+        linkSpeed = speed.badge;
+        linkSpeedTooltip = speed.tooltip;
       }
 
       entry.connections.push({
@@ -443,6 +514,7 @@
         missingIface,
         interfaceType,
         linkSpeed,
+        linkSpeedTooltip,
       });
       pairMap.set(key, entry);
     });
@@ -467,11 +539,12 @@
       );
       const primaryType: InterfaceType =
         primaryConnection?.interfaceType ?? "unknown";
-      const linkSpeed =
-        entry.connections.find(
-          (connection) =>
-            connection.interfaceType === primaryType && connection.linkSpeed,
-        )?.linkSpeed ?? "";
+      const primaryTypeConnection = entry.connections.find(
+        (connection) =>
+          connection.interfaceType === primaryType && connection.linkSpeed,
+      );
+      const linkSpeed = primaryTypeConnection?.linkSpeed ?? "";
+      const linkSpeedTooltip = primaryTypeConnection?.linkSpeedTooltip ?? "";
 
       // Base dashed line
       const link = linksGroup
@@ -526,22 +599,30 @@
       link
         .append("title")
         .text(
-          linkSpeed
-            ? `${INTERFACE_TYPE_NAMES[primaryType]} · ${linkSpeed}`
+          linkSpeedTooltip
+            ? `${INTERFACE_TYPE_NAMES[primaryType]} · ${linkSpeedTooltip}`
             : INTERFACE_TYPE_NAMES[primaryType],
         );
 
       // Link type badge. Offset perpendicular to the line so it clears the
       // direction arrows that sit on the midpoint. Hidden when minimized,
-      // where there isn't room for it.
-      const badgeText = INTERFACE_TYPE_LABELS[primaryType];
-      if (!isMinimized && badgeText) {
+      // where there isn't room for it. Speed is folded into the badge
+      // itself (not just the tooltip) whenever we have it — today that's
+      // Thunderbolt/RDMA only, since that's the only link type the backend
+      // reports a negotiated speed for.
+      const badgeLabel = INTERFACE_TYPE_LABELS[primaryType];
+      const badgeText = linkSpeed ? `${badgeLabel} · ${linkSpeed}` : badgeLabel;
+      if (!isMinimized && badgeLabel) {
         const badgeFontSize = 9;
         // SF Mono advance width is ~0.6em; measuring each label would force a
         // layout pass per edge for a box that only needs to look right.
         const badgeWidth = badgeText.length * badgeFontSize * 0.6 + 8;
         const badgeHeight = badgeFontSize + 6;
-        const badgeOffset = 12;
+        // A bare type label ("TB") clears the node stat panels with 12px of
+        // clearance; a label carrying a speed ("TB · 80 Gb/s") is wide
+        // enough to reach back into them on tightly-packed layouts, so scale
+        // the offset with how much wider than that baseline the badge is.
+        const badgeOffset = 12 + Math.max(0, badgeWidth - 20) * 0.5;
         const badgeX = mx - uy * badgeOffset;
         const badgeY = my + ux * badgeOffset;
 
