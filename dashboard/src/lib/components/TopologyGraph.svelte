@@ -6,9 +6,11 @@
     isTopologyMinimized,
     debugMode,
     nodeThunderboltBridge,
+    nodeThunderbolt,
     nodeRdmaCtl,
     nodeIdentities,
     type NodeInfo,
+    type InterfaceType,
   } from "$lib/stores/app.svelte";
 
   interface Props {
@@ -33,33 +35,71 @@
   const data = $derived(topologyData());
   const debugEnabled = $derived(debugMode());
   const tbBridgeData = $derived(nodeThunderboltBridge());
+  const thunderboltData = $derived(nodeThunderbolt());
   const rdmaCtlData = $derived(nodeRdmaCtl());
   const identitiesData = $derived(nodeIdentities());
+
+  // Short labels for the link badge drawn on each edge. "unknown" is left out
+  // on purpose: an unlabelled link reads better than a link labelled "?".
+  const INTERFACE_TYPE_LABELS: Record<InterfaceType, string> = {
+    thunderbolt: "TB",
+    ethernet: "ETH",
+    maybe_ethernet: "ETH?",
+    wifi: "Wi-Fi",
+    unknown: "",
+  };
+
+  // Spelled out for the hover tooltip, where there is room for it.
+  const INTERFACE_TYPE_NAMES: Record<InterfaceType, string> = {
+    thunderbolt: "Thunderbolt",
+    ethernet: "Ethernet",
+    maybe_ethernet: "Ethernet (unconfirmed)",
+    wifi: "Wi-Fi",
+    unknown: "Unknown link type",
+  };
+
+  // Ordering for picking which link to show when two nodes are connected over
+  // several interfaces at once - we surface the fastest physical path, so
+  // Thunderbolt wins. This is display-only and deliberately separate from the
+  // coordinator priority in placement_utils.py, which optimises for something
+  // else entirely.
+  const INTERFACE_TYPE_DISPLAY_PRIORITY: Record<InterfaceType, number> = {
+    thunderbolt: 0,
+    ethernet: 1,
+    maybe_ethernet: 2,
+    wifi: 3,
+    unknown: 4,
+  };
 
   function getNodeLabel(nodeId: string): string {
     const node = data?.nodes?.[nodeId];
     return node?.friendly_name || nodeId.slice(0, 8);
   }
 
-  function getInterfaceLabel(
+  type InterfaceMatch = { name: string; interfaceType: InterfaceType };
+
+  function getInterfaceInfo(
     nodeId: string,
     ip?: string,
-  ): { label: string; missing: boolean } {
-    if (!ip) return { label: "?", missing: true };
+  ): { label: string; missing: boolean; interfaceType: InterfaceType } {
+    if (!ip) return { label: "?", missing: true, interfaceType: "unknown" };
 
     // Strip port if present (e.g., "192.168.1.1:8080" -> "192.168.1.1")
     const cleanIp =
       ip.includes(":") && !ip.includes("[") ? ip.split(":")[0] : ip;
 
     // Helper to check a node's interfaces
-    function checkNode(node: NodeInfo | undefined): string | null {
+    function checkNode(node: NodeInfo | undefined): InterfaceMatch | null {
       if (!node) return null;
 
       const matchFromInterfaces = node.network_interfaces?.find((iface) =>
         (iface.addresses || []).some((addr) => addr === cleanIp || addr === ip),
       );
       if (matchFromInterfaces?.name) {
-        return matchFromInterfaces.name;
+        return {
+          name: matchFromInterfaces.name,
+          interfaceType: matchFromInterfaces.interface_type ?? "unknown",
+        };
       }
 
       if (node.ip_to_interface) {
@@ -67,7 +107,13 @@
           node.ip_to_interface[cleanIp] ||
           (ip ? node.ip_to_interface[ip] : undefined);
         if (mapped && mapped.trim().length > 0) {
-          return mapped;
+          return {
+            name: mapped,
+            interfaceType:
+              node.ip_to_interface_type?.[cleanIp] ??
+              (ip ? node.ip_to_interface_type?.[ip] : undefined) ??
+              "unknown",
+          };
         }
       }
       return null;
@@ -75,15 +121,40 @@
 
     // Try specified node first
     const result = checkNode(data?.nodes?.[nodeId]);
-    if (result) return { label: result, missing: false };
+    if (result)
+      return {
+        label: result.name,
+        missing: false,
+        interfaceType: result.interfaceType,
+      };
 
     // Fallback: search all nodes for this IP
     for (const [, otherNode] of Object.entries(data?.nodes || {})) {
       const otherResult = checkNode(otherNode);
-      if (otherResult) return { label: otherResult, missing: false };
+      if (otherResult)
+        return {
+          label: otherResult.name,
+          missing: false,
+          interfaceType: otherResult.interfaceType,
+        };
     }
 
-    return { label: "?", missing: true };
+    return { label: "?", missing: true, interfaceType: "unknown" };
+  }
+
+  /**
+   * Link speed as reported by the Thunderbolt receptacle (e.g. "40 Gb/s"),
+   * so an RDMA link can show what it actually negotiated rather than just "TB".
+   */
+  function getThunderboltLinkSpeed(
+    nodeId: string,
+    rdmaInterface?: string,
+  ): string {
+    if (!rdmaInterface) return "";
+    const match = thunderboltData[nodeId]?.interfaces?.find(
+      (iface) => iface.rdmaInterface === rdmaInterface,
+    );
+    return match?.linkSpeed ?? "";
   }
 
   function wrapLine(text: string, maxLen: number): string[] {
@@ -294,6 +365,9 @@
     // Draw edges
     const linksGroup = svg.append("g").attr("class", "links-group");
     const arrowsGroup = svg.append("g").attr("class", "arrows-group");
+    const linkTypeLabelsGroup = svg
+      .append("g")
+      .attr("class", "link-type-labels");
     const debugLabelsGroup = svg.append("g").attr("class", "debug-edge-labels");
 
     type ConnectionInfo = {
@@ -302,6 +376,8 @@
       ip: string;
       ifaceLabel: string;
       missingIface: boolean;
+      interfaceType: InterfaceType;
+      linkSpeed: string;
     };
     type PairEntry = {
       a: string;
@@ -340,16 +416,23 @@
       let ip: string;
       let ifaceLabel: string;
       let missingIface: boolean;
+      let interfaceType: InterfaceType;
+      let linkSpeed: string;
 
       if (edge.sourceRdmaIface || edge.sinkRdmaIface) {
         ip = "RDMA";
         ifaceLabel = `${edge.sourceRdmaIface || "?"} \u2192 ${edge.sinkRdmaIface || "?"}`;
         missingIface = false;
+        // RDMA only runs over Thunderbolt, so the link type needs no lookup.
+        interfaceType = "thunderbolt";
+        linkSpeed = getThunderboltLinkSpeed(edge.source, edge.sourceRdmaIface);
       } else {
         ip = edge.sendBackIp || "?";
-        const ifaceInfo = getInterfaceLabel(edge.source, ip);
+        const ifaceInfo = getInterfaceInfo(edge.source, ip);
         ifaceLabel = ifaceInfo.label;
         missingIface = ifaceInfo.missing;
+        interfaceType = ifaceInfo.interfaceType;
+        linkSpeed = "";
       }
 
       entry.connections.push({
@@ -358,6 +441,8 @@
         ip,
         ifaceLabel,
         missingIface,
+        interfaceType,
+        linkSpeed,
       });
       pairMap.set(key, entry);
     });
@@ -367,14 +452,35 @@
       const posB = positionById[entry.b];
       if (!posA || !posB) return;
 
+      // Two nodes can be linked over several interfaces at once; the edge
+      // represents the fastest of them.
+      const primaryConnection = entry.connections.reduce<
+        ConnectionInfo | undefined
+      >(
+        (best, connection) =>
+          best === undefined ||
+          INTERFACE_TYPE_DISPLAY_PRIORITY[connection.interfaceType] <
+            INTERFACE_TYPE_DISPLAY_PRIORITY[best.interfaceType]
+            ? connection
+            : best,
+        undefined,
+      );
+      const primaryType: InterfaceType =
+        primaryConnection?.interfaceType ?? "unknown";
+      const linkSpeed =
+        entry.connections.find(
+          (connection) =>
+            connection.interfaceType === primaryType && connection.linkSpeed,
+        )?.linkSpeed ?? "";
+
       // Base dashed line
-      linksGroup
+      const link = linksGroup
         .append("line")
         .attr("x1", posA.x)
         .attr("y1", posA.y)
         .attr("x2", posB.x)
         .attr("y2", posB.y)
-        .attr("class", "graph-link");
+        .attr("class", `graph-link graph-link--${primaryType}`);
 
       // Calculate midpoint and direction for arrows
       const dx = posB.x - posA.x;
@@ -415,6 +521,51 @@
           .attr("stroke", "none")
           .attr("fill", "none")
           .attr("marker-end", "url(#arrowhead)");
+      }
+
+      link
+        .append("title")
+        .text(
+          linkSpeed
+            ? `${INTERFACE_TYPE_NAMES[primaryType]} · ${linkSpeed}`
+            : INTERFACE_TYPE_NAMES[primaryType],
+        );
+
+      // Link type badge. Offset perpendicular to the line so it clears the
+      // direction arrows that sit on the midpoint. Hidden when minimized,
+      // where there isn't room for it.
+      const badgeText = INTERFACE_TYPE_LABELS[primaryType];
+      if (!isMinimized && badgeText) {
+        const badgeFontSize = 9;
+        // SF Mono advance width is ~0.6em; measuring each label would force a
+        // layout pass per edge for a box that only needs to look right.
+        const badgeWidth = badgeText.length * badgeFontSize * 0.6 + 8;
+        const badgeHeight = badgeFontSize + 6;
+        const badgeOffset = 12;
+        const badgeX = mx - uy * badgeOffset;
+        const badgeY = my + ux * badgeOffset;
+
+        const badge = linkTypeLabelsGroup
+          .append("g")
+          .attr("class", `link-type-badge link-type-badge--${primaryType}`);
+
+        badge
+          .append("rect")
+          .attr("x", badgeX - badgeWidth / 2)
+          .attr("y", badgeY - badgeHeight / 2)
+          .attr("width", badgeWidth)
+          .attr("height", badgeHeight)
+          .attr("rx", 3);
+
+        badge
+          .append("text")
+          .attr("x", badgeX)
+          .attr("y", badgeY)
+          .attr("text-anchor", "middle")
+          .attr("dominant-baseline", "central")
+          .attr("font-size", badgeFontSize)
+          .attr("font-family", "SF Mono, monospace")
+          .text(badgeText);
       }
 
       // Collect debug labels for later positioning at edges
@@ -493,7 +644,13 @@
         quadrantEdges.forEach((edge) => {
           edge.connections.forEach((conn) => {
             const arrow = getArrow(conn.from, conn.to);
-            const label = `${arrow} ${conn.ip} ${conn.ifaceLabel}`;
+            const linkType = [
+              INTERFACE_TYPE_LABELS[conn.interfaceType] || "?",
+              conn.linkSpeed,
+            ]
+              .filter(Boolean)
+              .join(" ");
+            const label = `${arrow} ${conn.ip} ${conn.ifaceLabel} [${linkType}]`;
             debugLabelsGroup
               .append("text")
               .attr("x", baseX)
@@ -1239,6 +1396,15 @@
     opacity: 0.8;
     animation: flowAnimation 0.75s linear infinite;
   }
+  /* Thunderbolt is the fast path, so it gets the accent colour; every other
+     link type keeps the neutral default. */
+  :global(.graph-link--thunderbolt) {
+    stroke: var(--exo-yellow, #f5c542);
+    opacity: 1;
+  }
+  :global(.graph-link--wifi) {
+    opacity: 0.5;
+  }
   @keyframes flowAnimation {
     from {
       stroke-dashoffset: 0;
@@ -1246,5 +1412,24 @@
     to {
       stroke-dashoffset: -10;
     }
+  }
+
+  :global(.link-type-badge rect) {
+    fill: var(--exo-black, #0a0a0a);
+    fill-opacity: 0.75;
+    stroke: var(--exo-light-gray, #b3b3b3);
+    stroke-opacity: 0.4;
+    stroke-width: 0.5px;
+  }
+  :global(.link-type-badge text) {
+    fill: var(--exo-light-gray, #b3b3b3);
+    letter-spacing: 0.04em;
+  }
+  :global(.link-type-badge--thunderbolt rect) {
+    stroke: var(--exo-yellow, #f5c542);
+    stroke-opacity: 0.6;
+  }
+  :global(.link-type-badge--thunderbolt text) {
+    fill: var(--exo-yellow, #f5c542);
   }
 </style>

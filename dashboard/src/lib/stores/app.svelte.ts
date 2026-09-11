@@ -25,6 +25,22 @@ function generateUUID(): string {
   });
 }
 
+/** Mirrors InterfaceType in src/exo/shared/types/profiling.py. */
+export type InterfaceType =
+  | "wifi"
+  | "ethernet"
+  | "maybe_ethernet"
+  | "thunderbolt"
+  | "unknown";
+
+const INTERFACE_TYPES: readonly string[] = [
+  "wifi",
+  "ethernet",
+  "maybe_ethernet",
+  "thunderbolt",
+  "unknown",
+];
+
 export interface NodeInfo {
   system_info?: {
     model_id?: string;
@@ -34,8 +50,10 @@ export interface NodeInfo {
   network_interfaces?: Array<{
     name?: string;
     addresses?: string[];
+    interface_type?: InterfaceType;
   }>;
   ip_to_interface?: Record<string, string>;
+  ip_to_interface_type?: Record<string, InterfaceType>;
   macmon_info?: {
     memory?: {
       ram_usage: number;
@@ -106,6 +124,7 @@ interface RawSystemPerformanceProfile {
 
 interface RawNetworkInterfaceInfo {
   name?: string;
+  interfaceType?: string;
   ipAddress?: string;
   addresses?: Array<{ address?: string } | string>;
   ipv4?: string;
@@ -377,9 +396,16 @@ interface GranularNodeState {
   nodeNetwork?: Record<string, RawNodeNetworkInfo>;
 }
 
+function normalizeInterfaceType(raw: string | undefined): InterfaceType {
+  return raw !== undefined && INTERFACE_TYPES.includes(raw)
+    ? (raw as InterfaceType)
+    : "unknown";
+}
+
 function transformNetworkInterface(iface: RawNetworkInterfaceInfo): {
   name?: string;
   addresses: string[];
+  interface_type: InterfaceType;
 } {
   const addresses: string[] = [];
   if (iface.ipAddress && typeof iface.ipAddress === "string") {
@@ -408,6 +434,7 @@ function transformNetworkInterface(iface: RawNetworkInterfaceInfo): {
   return {
     name: iface.name,
     addresses: Array.from(new Set(addresses)),
+    interface_type: normalizeInterfaceType(iface.interfaceType),
   };
 }
 
@@ -435,9 +462,11 @@ function transformTopology(
     const networkInterfaces = rawInterfaces.map(transformNetworkInterface);
 
     const ipToInterface: Record<string, string> = {};
+    const ipToInterfaceType: Record<string, InterfaceType> = {};
     for (const iface of networkInterfaces) {
       for (const addr of iface.addresses || []) {
         ipToInterface[addr] = iface.name ?? "";
+        ipToInterfaceType[addr] = iface.interface_type;
       }
     }
 
@@ -449,6 +478,7 @@ function transformTopology(
       },
       network_interfaces: networkInterfaces,
       ip_to_interface: ipToInterface,
+      ip_to_interface_type: ipToInterfaceType,
       macmon_info: {
         memory: {
           ram_usage: ramUsage,
