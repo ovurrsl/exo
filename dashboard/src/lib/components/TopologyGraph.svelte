@@ -533,15 +533,23 @@
 
       // Link type badge. Offset perpendicular to the line so it clears the
       // direction arrows that sit on the midpoint. Hidden when minimized,
-      // where there isn't room for it.
-      const badgeText = INTERFACE_TYPE_LABELS[primaryType];
-      if (!isMinimized && badgeText) {
+      // where there isn't room for it. Speed is folded into the badge
+      // itself (not just the tooltip) whenever we have it — today that's
+      // Thunderbolt/RDMA only, since that's the only link type the backend
+      // reports a negotiated speed for.
+      const badgeLabel = INTERFACE_TYPE_LABELS[primaryType];
+      const badgeText = linkSpeed ? `${badgeLabel} · ${linkSpeed}` : badgeLabel;
+      if (!isMinimized && badgeLabel) {
         const badgeFontSize = 9;
         // SF Mono advance width is ~0.6em; measuring each label would force a
         // layout pass per edge for a box that only needs to look right.
         const badgeWidth = badgeText.length * badgeFontSize * 0.6 + 8;
         const badgeHeight = badgeFontSize + 6;
-        const badgeOffset = 12;
+        // A bare type label ("TB") clears the node stat panels with 12px of
+        // clearance; a label carrying a speed ("TB · 80 Gb/s") is wide
+        // enough to reach back into them on tightly-packed layouts, so scale
+        // the offset with how much wider than that baseline the badge is.
+        const badgeOffset = 12 + Math.max(0, badgeWidth - 20) * 0.5;
         const badgeX = mx - uy * badgeOffset;
         const badgeY = my + ux * badgeOffset;
 
