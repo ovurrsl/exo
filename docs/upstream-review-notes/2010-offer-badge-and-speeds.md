@@ -6,7 +6,17 @@ Branch: `alexcheema/profilers-dashboard`
 **Not a review.** This is an offer of work, on the one open PR that already
 solved the problem we independently solved in our fork. Posting it only makes
 sense if the maintainer is still interested in the PR — it has had no review
-since May.
+since May, is 34 commits behind main, and currently conflicts with main in
+`apply.py` and `info_gatherer.py`.
+
+**Scope: the dashboard work only.** Our two dashboard branches genuinely
+conflict with this PR in `TopologyGraph.svelte` and `app.svelte.ts`, so they
+cannot be stacked on it mechanically — they would have to be rewritten on top
+of its `connection-type.ts`, which is what this offer proposes. Our Python
+branch (`NetworkInterfaceInfo.active_speed_mbps` / `supported_speed_mbps`) is a
+separate matter: it merges cleanly onto `main` today and does not conflict with
+this PR either, so it goes to `main` on its own and must not be made to wait on
+this one.
 
 ---
 

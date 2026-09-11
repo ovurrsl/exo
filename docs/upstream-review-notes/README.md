@@ -28,10 +28,21 @@ Not review comments, but the same evidence-first rule applies.
 | [issue-linux-cpu-mlx-broken.md](issue-linux-cpu-mlx-broken.md) | The README's Linux setup installs an ABI-incompatible mlx pair, so `import mlx.core` fails. Five-combination matrix, symbol-level evidence, and the 467-test green run that fixing it unlocks. | https://github.com/exo-explore/exo/issues/new |
 | [2010-offer-badge-and-speeds.md](2010-offer-badge-and-speeds.md) | An offer, not a review. Our dashboard work duplicates this PR, so rather than compete, offer the ~40-line delta it does not have. | https://github.com/exo-explore/exo/pull/2010 |
 
-PR #2010 is open, unmerged and conflict-free as of this writing; its head is
-`alexcheema/profilers-dashboard` at `d1f4b24d`, last touched 3 May 2026. It has
-had no review since. Post the offer only if that is still true when you get
-there — an offer of work on an abandoned PR helps nobody.
+PR #2010 is open and unmerged; its head is `alexcheema/profilers-dashboard` at
+`d1f4b24d`, last touched 3 May 2026, with no review since. It is **34 commits
+behind main and currently conflicts** with it in `src/exo/shared/apply.py` and
+`src/exo/utils/info_gatherer/info_gatherer.py`:
+
+    $ git merge-tree --write-tree upstream/main refs/pull/2010/head | grep ^CONFLICT
+    CONFLICT (content): Merge conflict in src/exo/shared/apply.py
+    CONFLICT (content): Merge conflict in src/exo/utils/info_gatherer/info_gatherer.py
+
+(GitHub still publishes a `refs/pull/2010/merge` ref, but that was computed
+against an older main and is stale — do not read it as "mergeable".)
+
+That is why nothing of ours should *depend* on this PR. Post the offer, but
+keep our own branches based on `main` so they can merge whether or not #2010
+ever moves.
 
 ## Environment these were run in
 
