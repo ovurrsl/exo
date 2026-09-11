@@ -19,6 +19,20 @@ Every draft ends with the Claude Code attribution footer. Keep it when pasting.
 | [#2201](2201-claude-system-role.md) | accept system-role messages | 5 new tests fail on `main` | Unblocks issue #2193. Deliberately more lenient than the Anthropic API, which should be stated. |
 | [#2126](2126-telemetry-privacy.md) | runner log telemetry | tests pass; payload reviewed | Opt-in and identifier-free presign, both good. Uploaded stderr is unredacted; should depend on #2290. |
 
+## Other drafts in this directory
+
+Not review comments, but the same evidence-first rule applies.
+
+| File | What it is | Where it goes |
+|---|---|---|
+| [issue-linux-cpu-mlx-broken.md](issue-linux-cpu-mlx-broken.md) | The README's Linux setup installs an ABI-incompatible mlx pair, so `import mlx.core` fails. Five-combination matrix, symbol-level evidence, and the 467-test green run that fixing it unlocks. | https://github.com/exo-explore/exo/issues/new |
+| [2010-offer-badge-and-speeds.md](2010-offer-badge-and-speeds.md) | An offer, not a review. Our dashboard work duplicates this PR, so rather than compete, offer the ~40-line delta it does not have. | https://github.com/exo-explore/exo/pull/2010 |
+
+PR #2010 is open, unmerged and conflict-free as of this writing; its head is
+`alexcheema/profilers-dashboard` at `d1f4b24d`, last touched 3 May 2026. It has
+had no review since. Post the offer only if that is still true when you get
+there — an offer of work on an abandoned PR helps nobody.
+
 ## Environment these were run in
 
 Ubuntu, x86_64, Python 3.13, `uv sync --all-packages --extra mlx-cpu`.

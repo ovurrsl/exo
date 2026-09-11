@@ -1,5 +1,8 @@
 # Comment draft — exo-explore/exo#2010 "profilers dashboard"
 
+PR: https://github.com/exo-explore/exo/pull/2010
+Branch: `alexcheema/profilers-dashboard`
+
 **Not a review.** This is an offer of work, on the one open PR that already
 solved the problem we independently solved in our fork. Posting it only makes
 sense if the maintainer is still interested in the PR — it has had no review
