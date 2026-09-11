@@ -82,6 +82,73 @@
     detail: string;
   }
 
+  /**
+   * One representative connection type for a node pair, for drawing on the
+   * edge itself.
+   *
+   * Measured profiles are preferred because they name the transport that is
+   * actually carrying traffic, but they only appear once the profiler has
+   * run. Until then the topology edge's own IP is enough to classify the
+   * link, so the badge shows up immediately rather than after the first
+   * probe round.
+   */
+  function connectionTypeForPair(entry: {
+    a: string;
+    b: string;
+    connections: { from: string; ip: string }[];
+  }): ConnectionType | null {
+    const ctx = {
+      nodeNetwork: nodeNetworkData,
+      nodeThunderbolt: nodeThunderboltData,
+    };
+    const profiled = collectPairProfiles(entry.a, entry.b);
+    // RDMA outranks TCP-over-Thunderbolt, which outranks anything else: the
+    // fastest path between the pair is the one worth labelling.
+    const ranked = [...profiled].sort(
+      (left, right) => typeRank(right.type) - typeRank(left.type),
+    );
+    const best = ranked.find((candidate) => candidate.type.kind !== "unknown");
+    if (best) return best.type;
+
+    for (const connection of entry.connections) {
+      if (connection.ip === "RDMA" || connection.ip === "?") continue;
+      const inferred = inferSocketConnectionType(
+        connection.from,
+        connection.ip,
+        ctx,
+      );
+      if (inferred.kind !== "unknown") return inferred;
+    }
+    return null;
+  }
+
+  /**
+   * What goes inside the badge: transport, and the negotiated rate when the
+   * OS gave us one. "ETH 1G" next to "ETH 10G" is the whole point - a link
+   * that negotiated down is invisible until its own speed is on the picture.
+   */
+  function badgeText(type: ConnectionType): string {
+    const speed = formatNominalSpeed(type.activeSpeedMbps);
+    return speed ? `${type.badge} ${speed}` : type.badge;
+  }
+
+  /** Compact Mbps for the badge: "1G", "10G", "100M". Empty when unknown. */
+  function formatNominalSpeed(mbps: number | undefined): string {
+    if (mbps == null || !isFinite(mbps) || mbps <= 0) return "";
+    if (mbps >= 1000) {
+      const gbps = mbps / 1000;
+      return Number.isInteger(gbps) ? `${gbps}G` : `${gbps.toFixed(1)}G`;
+    }
+    return `${Math.round(mbps)}M`;
+  }
+
+  function typeRank(type: ConnectionType): number {
+    if (type.isRdma) return 3;
+    if (type.kind === "thunderbolt") return 2;
+    if (type.kind === "ethernet") return 1;
+    return 0;
+  }
+
   /** Collect every measured profile in either direction between two nodes. */
   function collectPairProfiles(a: string, b: string): PairProfileEntry[] {
     const result: PairProfileEntry[] = [];
@@ -476,13 +543,17 @@
       if (!posA || !posB) return;
 
       // Base dashed line
+      const pairType = connectionTypeForPair(entry);
+      const linkClass = pairType
+        ? `graph-link graph-link--${pairType.kind}`
+        : "graph-link";
       linksGroup
         .append("line")
         .attr("x1", posA.x)
         .attr("y1", posA.y)
         .attr("x2", posB.x)
         .attr("y2", posB.y)
-        .attr("class", "graph-link");
+        .attr("class", linkClass);
 
       // Calculate midpoint and direction for arrows
       const dx = posB.x - posA.x;
@@ -613,6 +684,40 @@
           formatLatencyMs(minLat / 2),
           latColor,
         );
+      }
+
+      // Transport badge on the edge itself. The tooltip already says all of
+      // this, but only one edge at a time and only while hovered; in a
+      // cluster of more than three or four nodes the question is usually
+      // "which link is the slow one", and that reads better off the picture
+      // than out of six successive hovers.
+      //
+      // Placed on the *inner* side of the edge, opposite the bandwidth and
+      // latency strip above, so the two never overlap.
+      if (pairType && pairType.badge) {
+        const badgeLabel = badgeText(pairType);
+        const badgeWidth = 14 + badgeLabel.length * 5.5;
+        const badgeHeight = 14;
+        const badgeOffset = perpOffset + badgeHeight / 2;
+        const bx = mx - px * badgeOffset * awayFromCenter;
+        const by = my - py * badgeOffset * awayFromCenter;
+        const badgeGroup = linksGroup
+          .append("g")
+          .attr("class", `link-type-badge link-type-badge--${pairType.kind}`);
+        badgeGroup
+          .append("rect")
+          .attr("x", bx - badgeWidth / 2)
+          .attr("y", by - badgeHeight / 2)
+          .attr("width", badgeWidth)
+          .attr("height", badgeHeight)
+          .attr("rx", 3);
+        badgeGroup
+          .append("text")
+          .attr("x", bx)
+          .attr("y", by)
+          .attr("text-anchor", "middle")
+          .attr("dominant-baseline", "central")
+          .text(badgeLabel);
       }
 
       // Wide invisible hit target for hover, even when no profiles exist —
@@ -1532,6 +1637,8 @@
           <tr>
             <th>Direction</th>
             <th>Type</th>
+            <th>Link</th>
+            <th>Max</th>
             <th>↑ Upload</th>
             <th>↓ Download</th>
             <th>RTT/2</th>
@@ -1546,6 +1653,12 @@
                 <span class="detail">{profile.detail}</span>
               </td>
               <td class="type">{profile.type.label}</td>
+              <td class="nominal"
+                >{formatBandwidthMbps(profile.type.activeSpeedMbps)}</td
+              >
+              <td class="nominal"
+                >{formatBandwidthMbps(profile.type.supportedSpeedMbps)}</td
+              >
               <td class="bandwidth"
                 >{formatBandwidthMbps(profile.uploadMbps)}</td
               >
@@ -1593,6 +1706,43 @@
     stroke-dasharray: 4, 4;
     opacity: 0.8;
     animation: flowAnimation 0.75s linear infinite;
+  }
+
+  /* Transport colouring. Thunderbolt is the fast path, so it gets the
+     accent; Wi-Fi is the one you usually want to notice and avoid, so it
+     recedes. Ethernet keeps the neutral default. */
+  :global(.graph-link--thunderbolt) {
+    stroke: var(--exo-yellow, #ffd700);
+    opacity: 0.9;
+  }
+
+  :global(.graph-link--wifi) {
+    opacity: 0.5;
+  }
+
+  :global(.link-type-badge rect) {
+    fill: rgba(0, 0, 0, 0.72);
+    stroke: var(--exo-light-gray, #b3b3b3);
+    stroke-width: 0.5px;
+  }
+
+  :global(.link-type-badge text) {
+    fill: var(--exo-light-gray, #b3b3b3);
+    font-size: 8px;
+    font-family: inherit;
+    letter-spacing: 0.02em;
+    /* The badge sits on top of a moving dashed line; without this a click
+       near the edge would land on the label instead of the link. */
+    pointer-events: none;
+    user-select: none;
+  }
+
+  :global(.link-type-badge--thunderbolt rect) {
+    stroke: var(--exo-yellow, #ffd700);
+  }
+
+  :global(.link-type-badge--thunderbolt text) {
+    fill: var(--exo-yellow, #ffd700);
   }
   @keyframes flowAnimation {
     from {
@@ -1676,6 +1826,13 @@
 
   .link-tooltip .bandwidth {
     color: rgba(255, 215, 0, 0.95);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Nominal rate, dimmer than measured throughput: it is context for the
+     numbers next to it, not the measurement itself. */
+  .link-tooltip .nominal {
+    color: rgba(255, 255, 255, 0.55);
     font-variant-numeric: tabular-nums;
   }
 

@@ -25,6 +25,12 @@ export type ConnectionKind =
 export interface ConnectionType {
   /** Display label, e.g. "Thunderbolt 5 (RDMA)" or "Wi‑Fi". */
   label: string;
+  /**
+   * Very short form for drawing on the edge itself, e.g. "TB5" / "ETH" /
+   * "Wi-Fi". Empty string when the kind is unknown, so the caller can render
+   * nothing rather than a shrug. `label` stays the long form for tooltips.
+   */
+  badge: string;
   kind: ConnectionKind;
   /** "4" / "5" / undefined; only set for Thunderbolt. */
   thunderboltGeneration?: "3" | "4" | "5";
@@ -32,6 +38,20 @@ export interface ConnectionType {
   isRdma: boolean;
   /** The matched linkSpeed string (e.g. "Up to 40 Gb/s x1"), if any. */
   linkSpeedHint?: string;
+  /**
+   * Link speed the sink interface has actually negotiated, in Mbps, from
+   * `NetworkInterfaceInfo.active_speed_mbps`. Undefined when the OS does not
+   * expose one - common for Wi-Fi, and for every interface on macOS.
+   *
+   * This is the nominal rate of the pipe, not measured throughput: the
+   * profiler's upload/download figures say what the link is doing, these two
+   * say what it could do. A node negotiated at 1 Gb on a 10 Gb card looks
+   * fine in a throughput column and is obviously wrong beside its own
+   * supported speed.
+   */
+  activeSpeedMbps?: number;
+  /** Fastest speed the sink interface's hardware supports, in Mbps. */
+  supportedSpeedMbps?: number;
 }
 
 interface RawNetworkInterface {
@@ -48,6 +68,8 @@ interface RawNetworkInterface {
     | "maybe_ethernet"
     | "thunderbolt"
     | "unknown";
+  activeSpeedMbps?: number | null;
+  supportedSpeedMbps?: number | null;
 }
 
 interface RawNodeNetwork {
@@ -83,6 +105,37 @@ export function thunderboltGenerationFromLinkSpeed(
   if (gbps >= 40) return "4";
   if (gbps >= 20) return "3";
   return undefined;
+}
+
+/** Short form drawn on the edge itself. Empty when there is nothing to say. */
+function badgeFor(
+  kind: ConnectionKind,
+  thunderboltGeneration: ConnectionType["thunderboltGeneration"],
+): string {
+  switch (kind) {
+    case "thunderbolt":
+      return thunderboltGeneration ? `TB${thunderboltGeneration}` : "TB";
+    case "ethernet":
+      return "ETH";
+    case "wifi":
+      return "Wi-Fi";
+    case "loopback":
+      return "LO";
+    case "unknown":
+      return "";
+  }
+}
+
+/**
+ * A speed of 0 means "the OS did not tell us", not "this link is 0 Mbps" -
+ * psutil reports 0 for an interface whose rate it cannot read. Fold that in
+ * with null and absent so callers only ever see a real number or nothing.
+ */
+function positiveSpeed(value: number | null | undefined): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+  return value;
 }
 
 function findNetworkInterface(
@@ -132,6 +185,7 @@ export function inferRdmaConnectionType(
     : "Thunderbolt (RDMA)";
   return {
     label,
+    badge: badgeFor("thunderbolt", generation),
     kind: "thunderbolt",
     thunderboltGeneration: generation,
     isRdma: true,
@@ -176,6 +230,12 @@ function _inferSocketConnectionTypeFresh(
 ): ConnectionType {
   const iface = findNetworkInterface(context.nodeNetwork[sinkNodeId], sinkIp);
   const ifType = iface?.interfaceType;
+  // Read from the interface the IP actually matched, so the speeds always
+  // describe the link this edge runs over rather than the node's fastest NIC.
+  const speeds = {
+    activeSpeedMbps: positiveSpeed(iface?.activeSpeedMbps),
+    supportedSpeedMbps: positiveSpeed(iface?.supportedSpeedMbps),
+  };
 
   if (ifType === "thunderbolt") {
     // For TCP-over-Thunderbolt we don't have a direct linkSpeed mapping —
@@ -194,23 +254,40 @@ function _inferSocketConnectionTypeFresh(
     }
     return {
       label: bestGen ? `Thunderbolt ${bestGen} (TCP)` : "Thunderbolt (TCP)",
+      badge: badgeFor("thunderbolt", bestGen),
       kind: "thunderbolt",
       thunderboltGeneration: bestGen,
       isRdma: false,
       linkSpeedHint: bestSpeed,
+      ...speeds,
     };
   }
 
   if (ifType === "wifi") {
-    return { label: "Wi‑Fi", kind: "wifi", isRdma: false };
+    return {
+      label: "Wi‑Fi",
+      badge: badgeFor("wifi", undefined),
+      kind: "wifi",
+      isRdma: false,
+      ...speeds,
+    };
   }
-  if (ifType === "ethernet") {
-    return { label: "Ethernet", kind: "ethernet", isRdma: false };
-  }
-  if (ifType === "maybe_ethernet") {
-    return { label: "Ethernet", kind: "ethernet", isRdma: false };
+  if (ifType === "ethernet" || ifType === "maybe_ethernet") {
+    return {
+      label: "Ethernet",
+      badge: badgeFor("ethernet", undefined),
+      kind: "ethernet",
+      isRdma: false,
+      ...speeds,
+    };
   }
   // Loopback IPs (Tailscale CGNAT 100.64.0.0/10, link-local, etc.) — surface
   // generically rather than guessing.
-  return { label: "Unknown", kind: "unknown", isRdma: false };
+  return {
+    label: "Unknown",
+    badge: badgeFor("unknown", undefined),
+    kind: "unknown",
+    isRdma: false,
+    ...speeds,
+  };
 }
