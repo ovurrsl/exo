@@ -1,12 +1,16 @@
 import argparse
 import multiprocessing as mp
 import os
+import shutil
 import signal
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Self
 
 import anyio
+from anyio import to_thread
 from anyio.lowlevel import checkpoint as anyio_checkpoint
 from exo_rs import Pidfile, PidfileError
 from loguru import logger
@@ -20,16 +24,26 @@ from exo.download.impl_shard_downloader import exo_shard_downloader
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
 from exo.routing.router import Router, get_node_zid
-from exo.shared.constants import EXO_DEFAULT_MODELS_DIR, EXO_LOG, EXO_PID_FILE
+from exo.shared.constants import (
+    EXO_DEFAULT_MODELS_DIR,
+    EXO_EVENT_LOG_DIR,
+    EXO_LOG,
+    EXO_PID_FILE,
+)
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_setup
 from exo.shared.types.common import NodeId, SessionId
+from exo.shared.types.state import State
 from exo.utils import STDIO_FDS
 from exo.utils.channels import Receiver, channel
+from exo.utils.exit_guard import exit_if_shutdown_hangs
 from exo.utils.pydantic_ext import FrozenModel
 from exo.utils.rlimits import raise_nofile_limit
 from exo.utils.task_group import TaskGroup
 from exo.worker.main import Worker
+
+# Where the master used to keep every event of a session; removed when a node starts
+_OLD_MASTER_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "master"
 
 
 @dataclass
@@ -60,6 +74,7 @@ class Node:
         )
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
+        await router.register_topic(topics.STATE_SNAPSHOTS)
         await router.register_topic(topics.COMMANDS)
         await router.register_topic(topics.ELECTION_MESSAGES)
         await router.register_topic(topics.CONNECTION_MESSAGES)
@@ -69,6 +84,7 @@ class Node:
             command_sender=router.sender(topics.COMMANDS),
             external_outbound=router.sender(topics.LOCAL_EVENTS),
             external_inbound=router.receiver(topics.GLOBAL_EVENTS),
+            snapshot_inbound=router.receiver(topics.STATE_SNAPSHOTS),
         )
 
         logger.info(f"Starting node {node_id}")
@@ -118,6 +134,7 @@ class Node:
             session_id,
             event_sender=event_router.sender(),
             global_event_sender=router.sender(topics.GLOBAL_EVENTS),
+            snapshot_sender=router.sender(topics.STATE_SNAPSHOTS),
             local_event_receiver=router.receiver(topics.LOCAL_EVENTS),
             command_receiver=router.receiver(topics.COMMANDS),
             download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
@@ -152,6 +169,9 @@ class Node:
         )
 
     async def run(self):
+        await to_thread.run_sync(
+            partial(shutil.rmtree, _OLD_MASTER_EVENT_LOG_DIR, ignore_errors=True)
+        )
         async with self._tg as tg:
             signal.signal(signal.SIGINT, lambda _, __: self.shutdown())
             signal.signal(signal.SIGTERM, lambda _, __: self.shutdown())
@@ -179,6 +199,14 @@ class Node:
             sys.exit(1)
         self._tg.cancel_tasks()
 
+    def _cluster_state(self) -> State | None:
+        """The cluster state as this node last knew it, for a master it starts to carry on from."""
+        if self.worker:
+            return self.worker.state
+        if self.api:
+            return self.api.state
+        return None
+
     async def _elect_loop(self):
         with self.election_result_receiver as results:
             async for result in results:
@@ -191,18 +219,16 @@ class Node:
                 # Ok:
                 # On new master:
                 # - Elect master locally if necessary
-                # - Shutdown and re-create the worker
-                # - Shut down and re-create the API
+                # - Follow it, keeping the worker's runners and the API's state
 
                 if result.is_new_master:
                     await anyio_checkpoint()
-                    self.event_router.shutdown()
-                    self.event_router = EventRouter(
-                        result.session_id,
-                        self.router.sender(topics.COMMANDS),
-                        self.router.receiver(topics.GLOBAL_EVENTS),
-                        self.router.sender(topics.LOCAL_EVENTS),
-                    )
+                    # Follow the new master without tearing anything down: it carries on from
+                    # the cluster's state, so runners and model instances keep going
+                    self.event_router.switch_session(result.session_id)
+                    if self.worker:
+                        # Before anything from the new master can reach the worker
+                        self.worker.follow_new_master(result.session_id)
 
                 if (
                     result.session_id.master_node_id == self.node_id
@@ -222,11 +248,13 @@ class Node:
                         result.session_id,
                         event_sender=self.event_router.sender(),
                         global_event_sender=self.router.sender(topics.GLOBAL_EVENTS),
+                        snapshot_sender=self.router.sender(topics.STATE_SNAPSHOTS),
                         local_event_receiver=self.router.receiver(topics.LOCAL_EVENTS),
                         command_receiver=self.router.receiver(topics.COMMANDS),
                         download_command_sender=self.router.sender(
                             topics.DOWNLOAD_COMMANDS
                         ),
+                        initial_state=self._cluster_state(),
                     )
                     self._tg.start_soon(self.master.run)
                 elif (
@@ -256,22 +284,9 @@ class Node:
                         )
                         self._tg.start_soon(self.download_coordinator.run)
                     if self.worker:
-                        await self.worker.shutdown()
-                        # TODO: add profiling etc to resource monitor
-                        self.worker = Worker(
-                            self.node_id,
-                            event_receiver=self.event_router.receiver(),
-                            event_sender=self.event_router.sender(),
-                            command_sender=self.router.sender(topics.COMMANDS),
-                            download_command_sender=self.router.sender(
-                                topics.DOWNLOAD_COMMANDS
-                            ),
-                            api_port=self._api_port,
-                        )
-                        self._tg.start_soon(self.worker.run)
+                        await self.worker.announce_to_master()
                     if self.api:
-                        self.api.reset(result.won_clock, self.event_router.receiver())
-                    self._tg.start_soon(self.event_router.run)
+                        self.api.follow_new_master(result.won_clock)
                 else:
                     if self.api:
                         self.api.unpause(result.won_clock)
@@ -347,10 +362,10 @@ def main_inner(args: "Args"):
 
     logger.info(f"pid = {os.getpid()}")
     if os.getenv("EXO_LIBP2P_NAMESPACE"):
-        raise ValueError(
-            "EXO_LIBP2P_NAMESPACE has been removed - use EXO_ZENOH_NAMESPACE instead"
+        logger.warning(
+            "EXO_LIBP2P_NAMESPACE is deprecated - use EXO_ZENOH_NAMESPACE instead"
         )
-    logger.info(f"EXO_ZENOH_NAMESPACE: {os.getenv('EXO_ZENOH_NAMESPACE')}")
+    logger.info(f"Discovery namespace: {args.namespace}")
 
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
@@ -381,6 +396,20 @@ def main_inner(args: "Args"):
     finally:
         logger.info("EXO Shutdown complete")
         logger_cleanup()
+        exit_if_shutdown_hangs(EXO_LOG)
+
+
+def default_namespace(environ: Mapping[str, str]) -> str:
+    """Namespace used when --namespace isn't given.
+
+    EXO_LIBP2P_NAMESPACE is still honoured (with a deprecation warning at
+    startup) so clusters isolated before the zenoh migration stay isolated.
+    """
+    return (
+        environ.get("EXO_ZENOH_NAMESPACE")
+        or environ.get("EXO_LIBP2P_NAMESPACE")
+        or __version__
+    )
 
 
 class Args(FrozenModel):
@@ -473,9 +502,10 @@ class Args(FrozenModel):
         parser.add_argument(
             "--namespace",
             type=str,
-            default=__version__,
+            default=default_namespace(os.environ),
             dest="namespace",
-            help="Discovery namespace, nodes with different namespaces will not connect.",
+            help="Discovery namespace, nodes with different namespaces will not connect "
+            "(env: EXO_ZENOH_NAMESPACE, defaults to the exo version).",
         )
         parser.add_argument(
             "--zenoh-port",
@@ -497,7 +527,7 @@ class Args(FrozenModel):
             action="store_true",
             dest="fast_synch",
             default=None,
-            help="Force MLX FAST_SYNCH on (for JACCL backend)",
+            help="Force MLX FAST_SYNCH on (by default only RDMA/JACCL instances use it)",
         )
         fast_synch_group.add_argument(
             "--no-fast-synch",

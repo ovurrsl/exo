@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 
 /// Native macOS Settings window following Apple HIG.
@@ -21,6 +22,10 @@ struct SettingsView: View {
     @State private var pendingReadOnlyModelsDirs: String = ""
     @State private var pendingCustomEnvironmentVariables: [CustomEnvironmentVariable] = []
     @State private var needsRestart = false
+    @State private var launchAtLoginStatus: SMAppService.Status = .notRegistered
+    @State private var launchAtLoginError: String?
+    @AppStorage(StartupPreferences.openDashboardOnStartupKey)
+    private var openDashboardOnStartup = StartupPreferences.openDashboardOnStartupDefault
     @State private var uninstallInProgress = false
 
     var body: some View {
@@ -47,6 +52,12 @@ struct SettingsView: View {
                 }
         }
         .frame(width: 640, height: 560)
+        .onReceive(
+            NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+        ) { _ in
+            // Pick up changes made in System Settings → Login Items.
+            launchAtLoginStatus = LaunchAtLoginHelper.status
+        }
         .onAppear {
             pendingNamespace = controller.customNamespace
             pendingHFToken = controller.hfToken
@@ -58,6 +69,7 @@ struct SettingsView: View {
             pendingAdditionalModelsDirs = controller.additionalModelsDirs
             pendingReadOnlyModelsDirs = controller.readOnlyModelsDirs
             pendingCustomEnvironmentVariables = controller.customEnvironmentVariables
+            launchAtLoginStatus = LaunchAtLoginHelper.status
             needsRestart = false
         }
     }
@@ -115,9 +127,63 @@ struct SettingsView: View {
                     .disabled(!hasGeneralChanges)
                 }
             }
+
+            Section("Startup") {
+                Text("These apply immediately, without Save & Restart.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Toggle("Launch at login", isOn: launchAtLoginBinding)
+                Text("Start EXO automatically when you log in to this Mac.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                if let launchAtLoginError {
+                    Text(launchAtLoginError)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                } else if launchAtLoginStatus == .requiresApproval {
+                    HStack {
+                        Text("Allow EXO in System Settings → General → Login Items.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                        Spacer()
+                        Button("Open Login Items") {
+                            SMAppService.openSystemSettingsLoginItems()
+                        }
+                    }
+                }
+
+                Toggle("Open dashboard on startup", isOn: $openDashboardOnStartup)
+                Text("Open the web dashboard in your browser when EXO starts.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
         }
         .formStyle(.grouped)
         .padding()
+    }
+
+    /// Reflects the login item's actual state in System Settings rather than a
+    /// stored copy, so it stays right if the user changes it there.
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(
+            get: {
+                launchAtLoginStatus == .enabled || launchAtLoginStatus == .requiresApproval
+            },
+            set: { enabled in
+                // The user has decided, so startup no longer changes it.
+                StartupPreferences().markLaunchAtLoginDefaultApplied()
+                do {
+                    try LaunchAtLoginHelper.setEnabled(enabled)
+                    launchAtLoginError = nil
+                } catch {
+                    launchAtLoginError =
+                        "Couldn't \(enabled ? "turn on" : "turn off") launch at login: "
+                        + error.localizedDescription
+                }
+                launchAtLoginStatus = LaunchAtLoginHelper.status
+            }
+        )
     }
 
     // MARK: - Model Tab
@@ -281,17 +347,29 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 } else {
-                    ForEach($pendingCustomEnvironmentVariables) { $variable in
+                    // Rows bind to their variable by id rather than by array
+                    // index (as `ForEach($pendingCustomEnvironmentVariables)`
+                    // would), so nothing can read or write through a stale
+                    // index after a row is removed.
+                    ForEach(pendingCustomEnvironmentVariables) { variable in
                         HStack(alignment: .center, spacing: 8) {
                             VStack(spacing: 4) {
-                                TextField("key", text: $variable.key)
-                                    .labelsHidden()
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(.system(.body, design: .monospaced))
-                                TextField("value", text: $variable.value)
-                                    .labelsHidden()
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(.system(.body, design: .monospaced))
+                                TextField(
+                                    "key",
+                                    text: $pendingCustomEnvironmentVariables.field(
+                                        \.key, of: variable.id)
+                                )
+                                .labelsHidden()
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(.body, design: .monospaced))
+                                TextField(
+                                    "value",
+                                    text: $pendingCustomEnvironmentVariables.field(
+                                        \.value, of: variable.id)
+                                )
+                                .labelsHidden()
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(.body, design: .monospaced))
                             }
                             VStack(spacing: 4) {
                                 Button {
@@ -303,7 +381,7 @@ struct SettingsView: View {
                                 }
                                 .buttonStyle(.borderless)
                                 .help("Remove variable")
-                                if !isValidEnvironmentVariableName(variable.key) {
+                                if variable.hasInvalidName {
                                     Image(systemName: "exclamationmark.triangle.fill")
                                         .foregroundColor(.orange)
                                         .help(
@@ -314,6 +392,12 @@ struct SettingsView: View {
                             }
                         }
                     }
+                }
+
+                if let invalidNamesHint {
+                    Text(invalidNamesHint)
+                        .font(.caption)
+                        .foregroundColor(.orange)
                 }
 
                 HStack {
@@ -334,7 +418,8 @@ struct SettingsView: View {
                     Button("Save & Restart") {
                         applyEnvironmentSettings()
                     }
-                    .disabled(!hasEnvironmentChanges)
+                    .disabled(
+                        !hasEnvironmentChanges || !invalidCustomEnvironmentVariableNames.isEmpty)
                 }
             }
         }
@@ -551,6 +636,7 @@ struct SettingsView: View {
 
                 DispatchQueue.main.async {
                     LaunchAtLoginHelper.disable()
+                    StartupPreferences().resetForUninstall()
                     self.moveAppToTrash()
 
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -620,6 +706,22 @@ struct SettingsView: View {
             || pendingCustomEnvironmentVariables != controller.customEnvironmentVariables
     }
 
+    private var invalidCustomEnvironmentVariableNames: [String] {
+        pendingCustomEnvironmentVariables.filter(\.hasInvalidName).map(\.trimmedKey)
+    }
+
+    /// Names the rows that block saving, since a variable saved by an older
+    /// version can block saving the unrelated fields in this tab too.
+    private var invalidNamesHint: String? {
+        let names = invalidCustomEnvironmentVariableNames
+        guard !names.isEmpty else { return nil }
+        let list = names.map { "\"\($0)\"" }.joined(separator: ", ")
+        let one = names.count == 1
+        return "Invalid variable name\(one ? "" : "s"): \(list). "
+            + "Fix or remove \(one ? "it" : "them") to save this tab. "
+            + "Names must match [A-Za-z_][A-Za-z0-9_]*."
+    }
+
     private func applyGeneralSettings() {
         controller.customNamespace = pendingNamespace
         controller.hfToken = pendingHFToken
@@ -650,56 +752,15 @@ struct SettingsView: View {
         pendingAdditionalModelsDirs = controller.additionalModelsDirs
         pendingReadOnlyModelsDirs = controller.readOnlyModelsDirs
 
-        // Trim whitespace from keys and drop empty ones so that the stored
-        // form matches what is actually injected into the child process and
+        // Store exactly what is injected into the child process (trimmed
+        // keys, no blank or invalid rows, last duplicate wins) so that
         // hasEnvironmentChanges doesn't show a stale diff after save.
-        let trimmed: [CustomEnvironmentVariable] =
-            pendingCustomEnvironmentVariables.compactMap { variable in
-                let key = variable.key.trimmingCharacters(in: .whitespaces)
-                guard !key.isEmpty else { return nil }
-                return CustomEnvironmentVariable(
-                    id: variable.id, key: key, value: variable.value
-                )
-            }
-
-        // De-duplicate keys, keeping the last occurrence. This matches the
-        // effective semantics of the dictionary assignment in
-        // ExoProcessController.makeEnvironment and avoids silently losing
-        // visible rows after save.
-        var seenKeys = Set<String>()
-        var deduplicatedReversed: [CustomEnvironmentVariable] = []
-        for variable in trimmed.reversed() {
-            if seenKeys.insert(variable.key).inserted {
-                deduplicatedReversed.append(variable)
-            }
-        }
-        let sanitized = Array(deduplicatedReversed.reversed())
+        let sanitized = CustomEnvironmentVariable.sanitized(pendingCustomEnvironmentVariables)
 
         pendingCustomEnvironmentVariables = sanitized
         controller.customEnvironmentVariables = sanitized
 
         restartIfRunning()
-    }
-
-    /// Validates a POSIX-style environment variable name:
-    /// `[A-Za-z_][A-Za-z0-9_]*`. Uses an ASCII-only charset so that
-    /// Unicode letters (e.g. `ñ`, Cyrillic) are rejected in line with what
-    /// the help tooltip advertises. Empty strings are treated as valid
-    /// here so that a freshly added blank row does not immediately look
-    /// broken; the save step filters empty keys out instead.
-    private func isValidEnvironmentVariableName(_ key: String) -> Bool {
-        if key.isEmpty { return true }
-        let headAllowed = CharacterSet(
-            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
-        )
-        let tailAllowed = headAllowed.union(CharacterSet(charactersIn: "0123456789"))
-        guard let first = key.unicodeScalars.first, headAllowed.contains(first) else {
-            return false
-        }
-        for scalar in key.unicodeScalars.dropFirst() {
-            if !tailAllowed.contains(scalar) { return false }
-        }
-        return true
     }
 
     private func restartIfRunning() {

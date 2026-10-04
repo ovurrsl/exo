@@ -41,7 +41,14 @@ from exo.shared.types.profiling import (
     ThunderboltBridgeStatus,
 )
 from exo.shared.types.state import State
-from exo.shared.types.tasks import Task, TaskId, TaskStatus
+from exo.shared.types.tasks import (
+    ImageEdits,
+    ImageGeneration,
+    Task,
+    TaskId,
+    TaskStatus,
+    TextGeneration,
+)
 from exo.shared.types.topology import Connection, RDMAConnection
 from exo.shared.types.worker.downloads import DownloadProgress
 from exo.shared.types.worker.instances import Instance, InstanceId
@@ -180,10 +187,24 @@ def apply_task_deleted(event: TaskDeleted, state: State) -> State:
     return state.model_copy(update={"tasks": new_tasks})
 
 
+def _is_generation(task: Task) -> bool:
+    return isinstance(task, (TextGeneration, ImageGeneration, ImageEdits))
+
+
 def apply_task_status_updated(event: TaskStatusUpdated, state: State) -> State:
     if event.task_id not in state.tasks:
         # maybe should raise
         return state
+
+    task = state.tasks[event.task_id]
+    if event.task_status == TaskStatus.Complete and not _is_generation(task):
+        # A worker's own bookkeeping task (creating, loading or warming up a runner,
+        # cancelling a request...) is of no further use once it completes, and nothing
+        # else removes it. Generation tasks stay until their request is finished.
+        new_tasks: Mapping[TaskId, Task] = {
+            tid: t for tid, t in state.tasks.items() if tid != event.task_id
+        }
+        return state.model_copy(update={"tasks": new_tasks})
 
     update: dict[str, TaskStatus | None] = {
         "task_status": event.task_status,
@@ -192,8 +213,8 @@ def apply_task_status_updated(event: TaskStatusUpdated, state: State) -> State:
         update["error_type"] = None
         update["error_message"] = None
 
-    updated_task = state.tasks[event.task_id].model_copy(update=update)
-    new_tasks: Mapping[TaskId, Task] = {**state.tasks, event.task_id: updated_task}
+    updated_task = task.model_copy(update=update)
+    new_tasks = {**state.tasks, event.task_id: updated_task}
     return state.model_copy(update={"tasks": new_tasks})
 
 
@@ -222,6 +243,18 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
     new_instances: Mapping[InstanceId, Instance] = {
         iid: inst for iid, inst in state.instances.items() if iid != event.instance_id
     }
+    # The instance's runners go with it: a runner being shut down rarely gets to report
+    # that it has, and one on a node that died never will
+    deleted = state.instances.get(event.instance_id)
+    gone: set[RunnerId] = (
+        set(deleted.shard_assignments.runner_to_shard) if deleted is not None else set()
+    )
+    new_runners: Mapping[RunnerId, RunnerStatus] = {
+        rid: rs for rid, rs in state.runners.items() if rid not in gone
+    }
+    new_ports: Mapping[RunnerId, int] = {
+        rid: p for rid, p in state.prefill_server_ports.items() if rid not in gone
+    }
     new_links: dict[InstanceLinkId, InstanceLink] = {}
     for link_id, link in state.instance_links.items():
         prefill = [i for i in link.prefill_instances if i != event.instance_id]
@@ -236,8 +269,21 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
             new_links[link_id] = link.model_copy(
                 update={"prefill_instances": prefill, "decode_instances": decode}
             )
+    # The instance's bookkeeping tasks (e.g. a runner that failed to load) are of no use once
+    # it's gone. Its generation tasks stay: the API still looks them up to end their requests.
+    new_tasks: Mapping[TaskId, Task] = {
+        tid: task
+        for tid, task in state.tasks.items()
+        if task.instance_id != event.instance_id or _is_generation(task)
+    }
     return state.model_copy(
-        update={"instances": new_instances, "instance_links": new_links}
+        update={
+            "instances": new_instances,
+            "instance_links": new_links,
+            "tasks": new_tasks,
+            "runners": new_runners,
+            "prefill_server_ports": new_ports,
+        }
     )
 
 
@@ -269,6 +315,13 @@ def apply_runner_status_updated(event: RunnerStatusUpdated, state: State) -> Sta
         return state.model_copy(
             update={"runners": new_runners, "prefill_server_ports": new_ports}
         )
+    if not any(
+        event.runner_id in instance.shard_assignments.runner_to_shard
+        for instance in state.instances.values()
+    ):
+        # A runner of an instance that has been deleted, reporting as it shuts down: the
+        # state only keeps the runners of the instances it has
+        return state
     new_runners = {
         **state.runners,
         event.runner_id: event.runner_status,

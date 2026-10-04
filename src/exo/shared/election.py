@@ -1,3 +1,5 @@
+import math
+from collections import Counter
 from typing import Self
 
 import anyio
@@ -16,6 +18,18 @@ from exo.utils.pydantic_ext import FrozenModel
 from exo.utils.task_group import TaskGroup
 
 DEFAULT_ELECTION_TIMEOUT = 3.0
+# How often a master re-announces itself, so a node that ended up following a different
+# master (its election messages were delayed or dropped) finds out and re-runs the election
+HEARTBEAT_INTERVAL = 5.0
+# A follower that hasn't heard from its master for this long assumes it is gone and runs an
+# election. zenoh liveliness usually reports a lost master sooner, but not always: when a node
+# crashes in a cluster of three or more, the others can keep seeing its token indefinitely.
+MASTER_SILENCE_TIMEOUT = 30.0
+# Elections started by a heartbeat or a silent master are retried with a growing gap, from the
+# first to the second value. They can't settle anything while a node hears a master that
+# doesn't hear it back, and every election pauses the whole cluster for a moment.
+RETRY_MIN_DELAY = 15.0
+RETRY_MAX_DELAY = 300.0
 
 
 class ElectionMessage(FrozenModel):
@@ -23,6 +37,10 @@ class ElectionMessage(FrozenModel):
     seniority: int
     proposed_session: SessionId
     commands_seen: int
+    # A master re-announcing itself between elections, not a vote in one
+    heartbeat: bool = False
+    # The session the sender is in, so an election can keep the master most nodes follow
+    following: SessionId | None = None
 
     # Could eventually include a list of neighbour nodes for centrality
     def __lt__(self, other: Self) -> bool:
@@ -37,6 +55,37 @@ class ElectionMessage(FrozenModel):
                 self.proposed_session.master_node_id
                 < other.proposed_session.master_node_id
             )
+
+    def rank(self) -> tuple[int, int, NodeId]:
+        """How the proposed master compares to others in an election, whatever the round."""
+        return (
+            self.seniority,
+            self.commands_seen,
+            self.proposed_session.master_node_id,
+        )
+
+
+def choose_master(candidates: list[ElectionMessage]) -> ElectionMessage:
+    """The winner of an election round.
+
+    Changing master resets the whole cluster: every instance is stopped and every running
+    request fails. So if most of the round's candidates follow a master that is standing in
+    it, that master stays. Without this a master that comes back from sleep, a freeze or a
+    partition takes over again from the one elected while it was gone, because it is more
+    senior, and the cluster is reset a second time. Otherwise the most senior candidate wins.
+    """
+    # Every candidate proposes its own node as master, so this is each node's latest message
+    latest = {c.proposed_session.master_node_id: c for c in candidates}
+    followed = Counter(c.following for c in latest.values() if c.following is not None)
+    for session, followers in followed.most_common(1):
+        master = latest.get(session.master_node_id)
+        if (
+            2 * followers > len(latest)
+            and master is not None
+            and master.proposed_session == session
+        ):
+            return master
+    return max(candidates)
 
 
 class ElectionResult(FrozenModel):
@@ -77,6 +126,14 @@ class Election:
         self._cm_receiver = connection_message_receiver
         self._co_receiver = command_receiver
 
+        # The latest word from the master we follow: its winning message, then its heartbeats
+        self._master_status: ElectionMessage = self._election_status()
+        # When we last heard from the master we follow (set when we start running)
+        self._master_last_heard = 0.0
+        # When a heartbeat or a silent master may next start an election, and the gap after that
+        self._retry_at = -math.inf
+        self._retry_delay = RETRY_MIN_DELAY
+
         # Campaign state
         self._candidates: list[ElectionMessage] = []
         self._campaign_cancel_scope: CancelScope | None = None
@@ -85,6 +142,7 @@ class Election:
 
     async def run(self):
         logger.info("Starting Election")
+        self._master_last_heard = anyio.current_time()
         try:
             async with self._tg as tg:
                 tg.start_soon(self._election_receiver)
@@ -112,6 +170,7 @@ class Election:
         logger.debug(f"Electing: {em}")
         is_new_master = em.proposed_session != self.current_session
         self.current_session = em.proposed_session
+        self._master_last_heard = anyio.current_time()
         logger.debug(f"Current session: {self.current_session}")
         await self._er_sender.send(
             ElectionResult(
@@ -124,13 +183,95 @@ class Election:
     async def shutdown(self) -> None:
         self._tg.cancel_tasks()
 
+    async def _heartbeat(self) -> None:
+        while True:
+            await anyio.sleep(HEARTBEAT_INTERVAL)
+            if self._campaign_cancel_scope is not None:
+                continue
+            if self.current_session.master_node_id == self.node_id:
+                await self._em_sender.send(
+                    self._election_status().model_copy(update={"heartbeat": True})
+                )
+            elif (
+                silence := anyio.current_time() - self._master_last_heard
+            ) > MASTER_SILENCE_TIMEOUT and self._may_retry():
+                logger.warning(
+                    f"No heartbeat from master {self.current_session.master_node_id} "
+                    f"for {silence:.0f}s; starting a new election"
+                )
+                self._master_last_heard = anyio.current_time()
+                self.clock += 1
+                candidates: list[ElectionMessage] = []
+                self._candidates = candidates
+                self._tg.start_soon(
+                    self._campaign, candidates, DEFAULT_ELECTION_TIMEOUT
+                )
+
+    def _on_heartbeat(self, message: ElectionMessage) -> None:
+        if message.proposed_session == self.current_session:
+            # Our own master: nothing to decide, just keep up with its clock
+            self.clock = max(self.clock, message.clock)
+            self._master_last_heard = anyio.current_time()
+            self._master_status = message
+            return
+        if self._campaign_cancel_scope is not None:
+            # A round is already running and will settle who is master
+            return
+        our_master = (
+            self._election_status()
+            if self.current_session.master_node_id == self.node_id
+            else self._master_status
+        )
+        if message.rank() < our_master.rank():
+            # Our master would win a new election anyway. The other master joins us once it
+            # hears our master's heartbeat; if it can't, a new election wouldn't reach it either.
+            return
+        if not self._may_retry():
+            return
+        # Two masters: this node's election missed the other one's messages. Run the
+        # election again so every node settles on the same master.
+        logger.info(
+            f"Heard from master {message.proposed_session.master_node_id} while following "
+            f"{self.current_session.master_node_id}; starting a new election"
+        )
+        self.clock = max(self.clock, message.clock) + 1
+        candidates: list[ElectionMessage] = []
+        self._candidates = candidates
+        self._tg.start_soon(self._campaign, candidates, DEFAULT_ELECTION_TIMEOUT)
+
+    def _may_retry(self) -> bool:
+        """Whether a heartbeat or a silent master may start an election now.
+
+        While such elections keep being needed, each one waits twice as long as the last (up
+        to RETRY_MAX_DELAY); after a quiet spell the wait starts over.
+        """
+        now = anyio.current_time()
+        if now < self._retry_at:
+            return False
+        if now - self._retry_at > RETRY_MAX_DELAY:
+            self._retry_delay = RETRY_MIN_DELAY
+        else:
+            self._retry_delay = min(self._retry_delay * 2, RETRY_MAX_DELAY)
+        self._retry_at = now + self._retry_delay
+        return True
+
     async def _election_receiver(self) -> None:
+        # Heartbeats stop with the election message stream
+        async with anyio.create_task_group() as heartbeats:
+            heartbeats.start_soon(self._heartbeat)
+            await self._receive_election_messages()
+            heartbeats.cancel_scope.cancel()
+
+    async def _receive_election_messages(self) -> None:
         with self._em_receiver as election_messages:
             async for message in election_messages:
                 logger.debug(f"Election message received: {message}")
                 if message.proposed_session.master_node_id == self.node_id:
                     logger.debug("Dropping message from ourselves")
                     # Drop messages from us (See exo.routing.router)
+                    continue
+                if message.heartbeat:
+                    self._on_heartbeat(message)
                     continue
                 # If a new round is starting, we participate
                 if message.clock > self.clock:
@@ -219,7 +360,7 @@ class Election:
                 await anyio.sleep(0)
 
                 # Election finished!
-                elected = max(candidates)
+                elected = choose_master(candidates)
                 logger.debug(f"Election queue {candidates}")
                 logger.debug(f"Elected: {elected}")
                 if (
@@ -235,6 +376,7 @@ class Election:
                     logger.debug(
                         f"Node is not a candidate or seniority is not {self.seniority}"
                     )
+                self._master_status = elected
                 logger.debug(
                     f"Election finished, new SessionId({elected.proposed_session}) with queue {candidates}"
                 )
@@ -262,4 +404,5 @@ class Election:
             clock=c,
             seniority=self.seniority,
             commands_seen=self.commands_seen,
+            following=self.current_session,
         )

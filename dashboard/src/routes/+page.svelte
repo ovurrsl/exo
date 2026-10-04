@@ -69,12 +69,15 @@
     type PlacementPreview,
   } from "$lib/stores/app.svelte";
   import { addToast, dismissByMessage } from "$lib/stores/toast.svelte";
+  import { readApiErrorMessage } from "$lib/utils/api_errors";
   import HeaderNav from "$lib/components/HeaderNav.svelte";
   import DeviceIcon from "$lib/components/DeviceIcon.svelte";
   import { fade, fly, slide } from "svelte/transition";
   import { tweened } from "svelte/motion";
   import { cubicInOut, cubicOut } from "svelte/easing";
   import { onMount } from "svelte";
+  import { getNodesWithModelDownloaded } from "$lib/utils/downloads";
+  import type { ChatUploadedFile } from "$lib/types/files";
 
   const chatStarted = $derived(hasStartedChat());
   const minimized = $derived(isTopologyMinimized());
@@ -494,7 +497,7 @@
     }
   });
 
-  // ── Step 4: "A device disconnects... exo self-heals" — full disconnect+heal sequence ──
+  // ── Step 4: "A device disconnects... relaunch on the remaining devices" ──
   $effect(() => {
     if (onboardingStep === 4) {
       showContinueButton = false;
@@ -520,15 +523,16 @@
         connectionOpacity.set(0);
         disconnectXOpacity.set(0);
         combinedLabelOpacity.set(0);
+        modelBlockOpacity.set(0.25); // The model stops with the device
       }, 1600);
 
-      // Phase 2: Self-heal — crossfade title + subtitle
+      // Phase 2: Relaunch on what is left — crossfade title + subtitle
       const t4 = setTimeout(() => {
         titleOpacity.set(0, { duration: 250 });
         subtitleOpacity.set(0, { duration: 250 });
       }, 2550);
       const t4b = setTimeout(() => {
-        stepTitle = "exo self-heals";
+        stepTitle = "Relaunch on the remaining devices";
         titleOpacity.set(1, { duration: 400 });
         subtitleOpacity.set(1, { duration: 400 });
       }, 2800);
@@ -539,6 +543,7 @@
       const t6 = setTimeout(() => {
         modelSplitProgress.set(0);
         modelBlockY.set(20); // Lift up while merging
+        modelBlockOpacity.set(1); // Relaunched on the remaining device
         connectionIsRed.set(0);
       }, 3700);
       const t7 = setTimeout(() => {
@@ -690,10 +695,104 @@
   });
 
   let onboardingError = $state<string | null>(null);
+  // The instance launched from onboarding, so a failure can send the user back
+  let onboardingInstanceId = $state<string | null>(null);
+  let onboardingInstanceSeen = $state(false);
+  // Shown while the worker retries a failed runner (it retries with backoff
+  // and removes the instance after EXO_MAX_INSTANCE_RETRIES attempts)
+  let onboardingRetryNote = $state<string | null>(null);
+  let onboardingLastFailure: string | null = null;
+  let onboardingFailedSince: number | null = null;
+  // Launched but never appeared in time; removed if it shows up later
+  let abandonedOnboardingInstanceId = $state<string | null>(null);
+  const ONBOARDING_LAUNCH_TIMEOUT_MS = 30_000;
+  // Safety net: normally the worker removes the instance first (its retries
+  // take ~25-30 s when every attempt fails)
+  const ONBOARDING_FAILED_GIVE_UP_MS = 45_000;
+
+  function getOnboardingModelName(): string {
+    return onboardingModelId?.split("/").pop() ?? onboardingModelId ?? "Model";
+  }
+
+  function resetOnboardingLaunchTracking() {
+    onboardingInstanceId = null;
+    onboardingInstanceSeen = false;
+    onboardingRetryNote = null;
+    onboardingLastFailure = null;
+    onboardingFailedSince = null;
+  }
+
+  // Return to the model list with the reason instead of waiting forever
+  function failOnboardingLaunch(message: string, removeInstance: boolean) {
+    const instanceId = onboardingInstanceId;
+    resetOnboardingLaunchTracking();
+    onboardingError = message;
+    onboardingStep = 6;
+    // Don't leave behind an instance that can't start
+    if (removeInstance && instanceId && instanceData[instanceId]) {
+      void requestInstanceDeletion(instanceId);
+    }
+  }
+
+  $effect(() => {
+    if (onboardingStep !== 7 && onboardingStep !== 8) return;
+    if (!onboardingInstanceId) return;
+    const inst = instanceData[onboardingInstanceId];
+    if (!inst) {
+      // Gone after being seen: the worker gave up after retrying (the last
+      // failure is only kept while it was failing), or e.g. a device left
+      if (onboardingInstanceSeen) {
+        failOnboardingLaunch(
+          onboardingLastFailure ??
+            `${getOnboardingModelName()} stopped before it was ready. Try again.`,
+          false,
+        );
+      }
+      return;
+    }
+    onboardingInstanceSeen = true;
+    const status = getInstanceDownloadStatus(onboardingInstanceId, inst);
+    if (!status.isFailed) {
+      // Not failing (any more), e.g. the worker's retry is loading: drop the
+      // note, and don't blame a later disappearance on the old failure
+      onboardingFailedSince = null;
+      onboardingRetryNote = null;
+      onboardingLastFailure = null;
+      return;
+    }
+    if (deriveInstanceStatus(inst).statusText !== "FAILED") {
+      // Failed downloads aren't retried by the worker
+      failOnboardingLaunch(
+        `${getOnboardingModelName()} failed to download: ${status.errorMessage ?? "unknown error"}`,
+        true,
+      );
+      return;
+    }
+    // The runner failed; the worker will retry it
+    const reason = status.errorMessage
+      ? summarizeFailureReason(status.errorMessage)
+      : "the runner stopped unexpectedly";
+    onboardingLastFailure = `${getOnboardingModelName()} failed to start: ${reason}`;
+    onboardingRetryNote = `${onboardingLastFailure}. Retrying…`;
+    onboardingFailedSince ??= Date.now();
+    if (Date.now() - onboardingFailedSince >= ONBOARDING_FAILED_GIVE_UP_MS) {
+      failOnboardingLaunch(onboardingLastFailure, true);
+    }
+  });
+
+  $effect(() => {
+    const instances = instanceData;
+    const abandonedId = abandonedOnboardingInstanceId;
+    if (abandonedId && instances[abandonedId]) {
+      abandonedOnboardingInstanceId = null;
+      void requestInstanceDeletion(abandonedId);
+    }
+  });
 
   async function onboardingLaunchModel(modelId: string) {
     onboardingModelId = modelId;
     onboardingError = null;
+    resetOnboardingLaunchTracking();
     selectPreviewModel(modelId);
     onboardingStep = 7;
     // Launch via standard placement API (same as main dashboard)
@@ -708,7 +807,7 @@
         `/instance/placement?model_id=${encodeURIComponent(modelId)}&sharding=${sharding}&instance_meta=${instanceType}&min_nodes=1`,
       );
       if (!placementResponse.ok) {
-        const errorText = await placementResponse.text();
+        const errorText = await readApiErrorMessage(placementResponse);
         onboardingError = `Failed to get placement: ${errorText}`;
         onboardingStep = 6;
         return;
@@ -720,10 +819,29 @@
         body: JSON.stringify({ instance: instanceData }),
       });
       if (!response.ok) {
-        const errorText = await response.text();
+        const errorText = await readApiErrorMessage(response);
         onboardingError = `Failed to launch: ${errorText}`;
         onboardingStep = 6;
         return;
+      }
+      const [, placed] = getTagged(instanceData);
+      const launchedId =
+        (placed as { instanceId?: string } | null)?.instanceId ?? null;
+      onboardingInstanceId = launchedId;
+      if (launchedId) {
+        setTimeout(() => {
+          if (
+            onboardingStep === 7 &&
+            onboardingInstanceId === launchedId &&
+            !onboardingInstanceSeen
+          ) {
+            abandonedOnboardingInstanceId = launchedId;
+            failOnboardingLaunch(
+              `${getOnboardingModelName()} didn't start after 30 seconds. Try again or pick another model.`,
+              false,
+            );
+          }
+        }, ONBOARDING_LAUNCH_TIMEOUT_MS);
       }
       setSelectedChatModel(modelId);
       recordRecentLaunch(modelId);
@@ -737,6 +855,7 @@
   const onboardingDownloadProgress = $derived.by(() => {
     if (instanceCount === 0) return null;
     for (const [id, inst] of Object.entries(instanceData)) {
+      if (getInstanceModelId(inst) !== onboardingModelId) continue;
       const status = getInstanceDownloadStatus(id, inst);
       if (status.isDownloading && status.progress) {
         return status.progress;
@@ -1168,6 +1287,55 @@
     );
   }
 
+  // Same labels as the Interconnect options under Advanced Options
+  const RUNTIME_LABELS: Record<InstanceMeta, string> = {
+    MlxRing: "TCP/IP",
+    MlxJaccl: "RDMA (Fast)",
+  };
+
+  // Plain-language version of a placement error reported by the backend.
+  // Matches the ValueError messages raised by place_instance in
+  // src/exo/master/placement.py; anything else is shown as-is.
+  function describePlacementError(
+    error: string,
+    modelId: string,
+    onSelectedDevices = false,
+  ): string {
+    if (error.startsWith("No cycles found with sufficient memory")) {
+      const model = models.find((m) => m.id === modelId);
+      const sizeGB = model ? getModelSizeGB(model) : 0;
+      const where = onSelectedDevices
+        ? "on the selected devices"
+        : "on your devices";
+      return sizeGB > 0
+        ? `Not enough free memory ${where} (needs ${Math.ceil(sizeGB)} GB)`
+        : `Not enough free memory ${where}`;
+    }
+    if (error.startsWith("Requested RDMA")) {
+      return "RDMA needs devices connected over Thunderbolt 5 with RDMA enabled";
+    }
+    if (error.startsWith("Requested Tensor sharding but this model does not")) {
+      return "This model doesn't support Tensor sharding";
+    }
+    return error;
+  }
+
+  // Why none of these previews can launch. Prefers the Pipeline · TCP/IP
+  // error, since that is the least restrictive combination.
+  function getPlacementFailureReason(
+    previews: PlacementPreview[],
+    modelId: string,
+  ): string | null {
+    const failed = previews.filter((p) => p.error);
+    const preferred =
+      failed.find(
+        (p) => p.sharding === "Pipeline" && p.instance_meta === "MlxRing",
+      ) ?? failed[0];
+    return preferred?.error
+      ? describePlacementError(preferred.error, modelId)
+      : null;
+  }
+
   // Helper to get model size in GB (from megabytes)
   function getModelSizeGB(model: {
     id: string;
@@ -1451,7 +1619,7 @@
       }
 
       if (!response.ok) {
-        const errorText = await response.text();
+        const errorText = await readApiErrorMessage(response);
         console.error("Failed to launch instance:", errorText);
         addToast({
           type: "error",
@@ -1798,7 +1966,7 @@
       return {
         isDownloading: false,
         isFailed: statusInfo.statusText === "FAILED",
-        errorMessage: null,
+        errorMessage: statusInfo.errorMessage ?? null,
         progress: null,
         statusText: statusInfo.statusText,
         perNode: [],
@@ -1834,7 +2002,7 @@
       return {
         isDownloading: false,
         isFailed: statusInfo.statusText === "FAILED",
-        errorMessage: null,
+        errorMessage: statusInfo.errorMessage ?? null,
         progress: null,
         statusText: statusInfo.statusText,
         perNode: result.perNode,
@@ -1876,9 +2044,49 @@
     }
   }
 
+  // Why an instance's runners failed: known diagnostics first (they name the
+  // root cause, e.g. a Metal GPU timeout), then the runner's error message.
+  function getRunnerFailureMessage(runnerIds: string[]): string | undefined {
+    const reasons = new Set<string>();
+    for (const rid of runnerIds) {
+      const [kind, payload] = getTagged(runnersData[rid]);
+      if (kind !== "RunnerFailed" || !payload || typeof payload !== "object")
+        continue;
+      const failed = payload as {
+        errorMessage?: string | null;
+        diagnostics?: unknown[];
+      };
+      for (const diagnostic of failed.diagnostics ?? []) {
+        const [, detail] = getTagged(diagnostic);
+        const message = (detail as { message?: unknown } | null)?.message;
+        if (typeof message === "string" && message) reasons.add(message);
+      }
+      if (failed.errorMessage) reasons.add(failed.errorMessage);
+    }
+    return reasons.size > 0 ? [...reasons].join("\n") : undefined;
+  }
+
+  // One readable line from a failure message. A runner that raised is
+  // reported as "Terminated (exitcode=1\nRunner error: <error>\n<traceback>)"
+  // (worker/runner/supervisor.py), so prefer the error over the bare exit
+  // status. Diagnostics and one-line reasons are returned as they are.
+  function summarizeFailureReason(message: string): string {
+    const lines = message
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const first = lines[0] ?? message;
+    if (!first.startsWith("Terminated (")) return first;
+    const runnerError = lines.find((line) => line.startsWith("Runner error:"));
+    return runnerError
+      ? runnerError.slice("Runner error:".length).trim()
+      : first;
+  }
+
   function deriveInstanceStatus(instanceWrapped: unknown): {
     statusText: string;
     statusClass: string;
+    errorMessage?: string;
     layersLoaded?: number;
     totalLayers?: number;
   } {
@@ -1917,7 +2125,12 @@
 
     if (statuses.length === 0)
       return { statusText: "PREPARING", statusClass: "inactive" };
-    if (has("Failed")) return { statusText: "FAILED", statusClass: "failed" };
+    if (has("Failed"))
+      return {
+        statusText: "FAILED",
+        statusClass: "failed",
+        errorMessage: getRunnerFailureMessage(runnerIds),
+      };
     if (has("Shutdown"))
       return { statusText: "SHUTDOWN", statusClass: "inactive" };
     if (has("Loading")) {
@@ -1979,49 +2192,69 @@
   }
 
   async function deleteInstance(instanceId: string) {
-    if (!confirm(`Delete instance ${instanceId.slice(0, 8)}...?`)) return;
-
     // Get the model ID of the instance being deleted before we delete it
     const deletedInstanceModelId = getInstanceModelId(instanceData[instanceId]);
+    const shortName =
+      deletedInstanceModelId.split("/").pop() ?? deletedInstanceModelId;
+    if (
+      !confirm(
+        `Delete the ${shortName} instance (${instanceId.slice(0, 8).toUpperCase()})?`,
+      )
+    )
+      return;
     const wasSelected = selectedChatModel() === deletedInstanceModelId;
 
+    if (!(await requestInstanceDeletion(instanceId))) {
+      addToast({ type: "error", message: "Failed to delete instance" });
+    } else if (wasSelected) {
+      // If we deleted the currently selected model, switch to another available model
+      // Find another instance that isn't the one we just deleted
+      const remainingInstances = Object.entries(instanceData).filter(
+        ([id]) => id !== instanceId,
+      );
+      if (remainingInstances.length > 0) {
+        // Select the last instance (most recently added, since objects preserve insertion order)
+        const [, lastInstance] =
+          remainingInstances[remainingInstances.length - 1];
+        const newModelId = getInstanceModelId(lastInstance);
+        if (
+          newModelId &&
+          newModelId !== "Unknown" &&
+          newModelId !== "Unknown Model"
+        ) {
+          setSelectedChatModel(newModelId);
+        } else {
+          // Clear selection if no valid model found
+          setSelectedChatModel("");
+        }
+      } else {
+        // No more instances, clear the selection
+        setSelectedChatModel("");
+      }
+    }
+  }
+
+  // Instances this dashboard asked to delete, so their disappearance isn't
+  // reported as unexpected. Every instance deletion must go through
+  // requestInstanceDeletion.
+  const userDeletedInstanceIds = new Set<string>();
+
+  async function requestInstanceDeletion(instanceId: string): Promise<boolean> {
+    userDeletedInstanceIds.add(instanceId);
     try {
       const response = await fetch(`/instance/${instanceId}`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
       });
-
       if (!response.ok) {
+        userDeletedInstanceIds.delete(instanceId);
         console.error("Failed to delete instance:", response.status);
-        addToast({ type: "error", message: "Failed to delete instance" });
-      } else if (wasSelected) {
-        // If we deleted the currently selected model, switch to another available model
-        // Find another instance that isn't the one we just deleted
-        const remainingInstances = Object.entries(instanceData).filter(
-          ([id]) => id !== instanceId,
-        );
-        if (remainingInstances.length > 0) {
-          // Select the last instance (most recently added, since objects preserve insertion order)
-          const [, lastInstance] =
-            remainingInstances[remainingInstances.length - 1];
-          const newModelId = getInstanceModelId(lastInstance);
-          if (
-            newModelId &&
-            newModelId !== "Unknown" &&
-            newModelId !== "Unknown Model"
-          ) {
-            setSelectedChatModel(newModelId);
-          } else {
-            // Clear selection if no valid model found
-            setSelectedChatModel("");
-          }
-        } else {
-          // No more instances, clear the selection
-          setSelectedChatModel("");
-        }
       }
+      return response.ok;
     } catch (error) {
+      userDeletedInstanceIds.delete(instanceId);
       console.error("Error deleting instance:", error);
+      return false;
     }
   }
 
@@ -2372,7 +2605,7 @@
     chatLaunchState = "idle";
     pendingChatModelId = null;
     selectedChatCategory = null;
-    pendingAutoMessage = null;
+    returnQueuedMessageToInput();
     userForcedIdle = true;
     setSelectedChatModel("");
     createConversation();
@@ -2382,7 +2615,7 @@
     chatLaunchState = "idle";
     pendingChatModelId = null;
     selectedChatCategory = null;
-    pendingAutoMessage = null;
+    returnQueuedMessageToInput();
     userForcedIdle = true;
     // Restore chat model from the sidebar preview selection so both selectors stay in sync
     setSelectedChatModel(selectedModelId ?? "");
@@ -2464,12 +2697,18 @@
   // ── Instance status transition toasts ──
   // Track previous statuses so we can detect meaningful transitions and fire toasts.
   let previousInstanceStatuses: Record<string, string> = {};
+  // Instances whose failure was already announced. The worker retries a failed
+  // runner several times, so the status flips in and out of FAILED; announce it
+  // once, until the model is ready to serve or the instance is gone.
+  const announcedFailures = new Set<string>();
 
   $effect(() => {
     const currentStatuses: Record<string, string> = {};
+    const failureReasons: Record<string, string | null> = {};
     for (const [id, inst] of Object.entries(instanceData)) {
       const dlStatus = getInstanceDownloadStatus(id, inst);
       currentStatuses[id] = dlStatus.statusText;
+      failureReasons[id] = dlStatus.errorMessage;
     }
 
     const prev = previousInstanceStatuses;
@@ -2507,9 +2746,26 @@
           addToast({ type: "success", message: `Model ready: ${shortName}` });
         }
 
+        if (currentStatus === "READY" || currentStatus === "RUNNING") {
+          announcedFailures.delete(id);
+        }
+
         // Any -> Failed
-        if (prevStatus !== "FAILED" && currentStatus === "FAILED") {
-          addToast({ type: "error", message: `Model failed: ${shortName}` });
+        if (
+          prevStatus !== "FAILED" &&
+          currentStatus === "FAILED" &&
+          !announcedFailures.has(id)
+        ) {
+          announcedFailures.add(id);
+          // One readable line; the instance card's tooltip has the full text
+          const failure = failureReasons[id];
+          const reason = failure ? summarizeFailureReason(failure) : undefined;
+          addToast({
+            type: "error",
+            message: reason
+              ? `Model failed: ${shortName} — ${reason}`
+              : `Model failed: ${shortName}`,
+          });
         }
 
         // Any -> Shutdown
@@ -2519,8 +2775,141 @@
       }
     }
 
+    for (const id of announcedFailures) {
+      if (!(id in currentStatuses)) announcedFailures.delete(id);
+    }
     previousInstanceStatuses = currentStatuses;
   });
+
+  // ── Instances that disappear without being deleted from this dashboard ──
+  // The master removes an instance when one of its devices leaves the cluster,
+  // and a worker removes it after its runner keeps failing (after retries).
+  // Nothing relaunches it, so say which happened.
+  let previousInstanceSnapshot: Record<
+    string,
+    {
+      modelId: string;
+      nodeIds: string[];
+      failed: boolean;
+      failureReason: string | null;
+    }
+  > = {};
+
+  $effect(() => {
+    const current: typeof previousInstanceSnapshot = {};
+    for (const [id, inst] of Object.entries(instanceData)) {
+      const status = getInstanceDownloadStatus(id, inst);
+      current[id] = {
+        modelId: getInstanceModelId(inst),
+        nodeIds: [...unwrapInstanceNodes(inst)],
+        failed: status.isFailed,
+        failureReason: status.errorMessage
+          ? summarizeFailureReason(status.errorMessage)
+          : null,
+      };
+    }
+    // A model that is back (relaunched from anywhere) no longer needs its
+    // "stopped" toasts, whose Relaunch would start a duplicate
+    for (const [id, instance] of Object.entries(current)) {
+      if (previousInstanceSnapshot[id]) continue;
+      const shortName = instance.modelId.split("/").pop() ?? instance.modelId;
+      dismissByMessage(lostInstanceMessage(shortName, true));
+      dismissByMessage(lostInstanceMessage(shortName, false));
+    }
+    const connectedNodeIds = new Set(Object.keys(data?.nodes ?? {}));
+    for (const [id, lost] of Object.entries(previousInstanceSnapshot)) {
+      if (current[id] || userDeletedInstanceIds.delete(id)) continue;
+      if (lost.modelId === "Unknown" || lost.modelId === "Unknown Model")
+        continue;
+      const shortName = lost.modelId.split("/").pop() ?? lost.modelId;
+      const deviceLeft =
+        connectedNodeIds.size > 0 &&
+        lost.nodeIds.some((nodeId) => !connectedNodeIds.has(nodeId));
+      if (!deviceLeft && lost.failed) {
+        // The worker gave up after retrying; relaunching would fail the same way
+        addToast({
+          type: "error",
+          message: lost.failureReason
+            ? `${shortName} failed and was removed — ${lost.failureReason}`
+            : `${shortName} failed and was removed`,
+        });
+        continue;
+      }
+      addToast({
+        type: "warning",
+        message: lostInstanceMessage(shortName, deviceLeft),
+        persistent: deviceLeft,
+        action: {
+          label: "Relaunch",
+          onClick: () => relaunchLostModel(lost.modelId),
+        },
+      });
+    }
+    previousInstanceSnapshot = current;
+  });
+
+  function lostInstanceMessage(shortName: string, deviceLeft: boolean) {
+    return deviceLeft
+      ? `${shortName} stopped — a device left the cluster`
+      : `${shortName} stopped`;
+  }
+
+  // Relaunch a lost model on the devices that are left. Only takes over the
+  // chat view when it's the model being chatted with.
+  async function relaunchLostModel(modelId: string) {
+    if (selectedChatModel() === modelId) {
+      launchModelForChat(modelId, "picker", true);
+      return;
+    }
+    const shortName = modelId.split("/").pop() ?? modelId;
+    // Already relaunched (from the picker, another tab or another toast)
+    if (hasExistingInstance(modelId)) {
+      addToast({ type: "info", message: `${shortName} is already launched` });
+      return;
+    }
+    try {
+      const res = await fetch(
+        `/instance/previews?model_id=${encodeURIComponent(modelId)}`,
+      );
+      if (!res.ok) {
+        addToast({
+          type: "error",
+          message: `Couldn't relaunch ${shortName} (HTTP ${res.status})`,
+        });
+        return;
+      }
+      const { previews } = (await res.json()) as {
+        previews: PlacementPreview[];
+      };
+      const placement = pickOptimalPlacement(previews);
+      if (!placement) {
+        addToast({
+          type: "error",
+          message: `Couldn't relaunch ${shortName}: it doesn't fit on the devices that are left`,
+        });
+        return;
+      }
+      const launchRes = await fetch("/instance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instance: placement.instance }),
+      });
+      if (!launchRes.ok) {
+        addToast({
+          type: "error",
+          message: `Couldn't relaunch ${shortName} (HTTP ${launchRes.status})`,
+        });
+        return;
+      }
+      recordRecentLaunch(modelId);
+      addToast({ type: "info", message: `Relaunching ${shortName}…` });
+    } catch (error) {
+      addToast({
+        type: "error",
+        message: `Couldn't relaunch ${shortName}: ${error}`,
+      });
+    }
+  }
 
   // ── Connection status toasts ──
   let previousConnectionStatus: boolean | null = null;
@@ -2696,6 +3085,32 @@
     return false;
   }
 
+  // Home screen chat input. Sending a message with a model selected that isn't
+  // running launches it (downloading it first if needed), so say that instead
+  // of asking the user to pick a model they already picked.
+  const homeChatPlaceholder = $derived(
+    selectedChatModel() ? "Ask anything" : "Choose a model to start chatting",
+  );
+  const homeChatHint = $derived.by((): string | null => {
+    const modelId = selectedChatModel();
+    if (!modelId) {
+      return instanceCount === 0 ? "Select a model to get started." : null;
+    }
+    if (hasExistingInstance(modelId)) return null;
+    const name = modelId.split("/").pop() ?? modelId;
+    const onDisk = getModelDownloadStatus(modelId).perNode.some(
+      (node) => node.status === "completed",
+    );
+    if (onDisk) return `Send a message to start ${name}.`;
+    const model = models.find((m) => m.id === modelId);
+    const sizeGB = model ? getModelSizeGB(model) : 0;
+    const size =
+      sizeGB > 0
+        ? ` (${sizeGB >= 1 ? sizeGB.toFixed(0) : sizeGB.toFixed(1)} GB)`
+        : "";
+    return `Send a message to download and start ${name}${size}.`;
+  });
+
   // Pick optimal placement from previews (frontend logic)
   // Rules: 1-node → Pipeline/Ring, multi-node with RDMA → Tensor/Jaccl (most nodes),
   //         multi-node without RDMA → 1-node Pipeline/Ring
@@ -2745,7 +3160,7 @@
     modelId: string,
     category: string,
     skipCreate = false,
-  ) {
+  ): Promise<boolean> {
     userForcedIdle = false;
     pendingChatModelId = modelId;
     selectedChatCategory = category;
@@ -2755,7 +3170,7 @@
       setSelectedChatModel(modelId);
       if (!skipCreate) createConversation();
       chatLaunchState = "ready";
-      return;
+      return true;
     }
 
     // Already has an instance (downloading/loading) — attach to its progress
@@ -2769,7 +3184,7 @@
       } else {
         chatLaunchState = "launching";
       }
-      return;
+      return true;
     }
 
     chatLaunchState = "launching";
@@ -2782,20 +3197,23 @@
       if (!res.ok) {
         addToast({
           type: "error",
-          message: `Failed to get placements: ${await res.text()}`,
+          message: `Failed to get placements: ${await readApiErrorMessage(res)}`,
         });
         chatLaunchState = "idle";
-        return;
+        return false;
       }
       const data: { previews: PlacementPreview[] } = await res.json();
       const placement = pickOptimalPlacement(data.previews);
       if (!placement) {
+        const reason = getPlacementFailureReason(data.previews, modelId);
         addToast({
           type: "error",
-          message: "No valid placement found for this model",
+          message: reason
+            ? `Can't launch ${modelId.split("/").pop() ?? modelId}: ${reason}`
+            : "No valid placement found for this model",
         });
         chatLaunchState = "idle";
-        return;
+        return false;
       }
 
       // Launch the instance
@@ -2807,48 +3225,42 @@
       if (!launchRes.ok) {
         addToast({
           type: "error",
-          message: `Failed to launch: ${await launchRes.text()}`,
+          message: `Failed to launch: ${await readApiErrorMessage(launchRes)}`,
         });
         chatLaunchState = "idle";
-        return;
+        return false;
       }
 
       setSelectedChatModel(modelId);
       recordRecentLaunch(modelId);
       if (!skipCreate) createConversation();
       chatLaunchState = "downloading";
+      return true;
     } catch (error) {
       addToast({ type: "error", message: `Network error: ${error}` });
       chatLaunchState = "idle";
+      return false;
     }
   }
 
   // Handle auto-send: user typed without selecting a model
   async function handleAutoSend(
     content: string,
-    files?: {
-      id: string;
-      name: string;
-      type: string;
-      textContent?: string;
-      preview?: string;
-    }[],
+    files?: ChatUploadedFile[],
+    // Set when the user picked an alternative in the download prompt
+    chosenModelId?: string,
   ) {
     // Clear forced-idle so restore effect resumes normal operation
     userForcedIdle = false;
 
-    // Find the best already-running model by tier
-    let bestRunning: { id: string; tierIndex: number } | null = null;
-    for (const [, inst] of Object.entries(instanceData)) {
-      const modelId = getInstanceModelId(inst);
-      if (modelId === "Unknown" || modelId === "Unknown Model") continue;
-      if (!hasRunningInstance(modelId)) continue;
-      const info = models.find((m) => m.id === modelId);
-      if (!info) continue;
-      const tierIndex = getAutoTierIndex(info.base_model ?? "");
-      if (!bestRunning || tierIndex < bestRunning.tierIndex) {
-        bestRunning = { id: modelId, tierIndex };
-      }
+    // The running model the chat bar shows gets the message: the user didn't
+    // ask for a different one, so don't start (and maybe download) another
+    const runningModelId = bestRunningModelId;
+    if (runningModelId && !chosenModelId) {
+      setSelectedChatModel(runningModelId);
+      if (!chatStarted) createConversation();
+      routeMessage(content, files);
+      return;
     }
 
     // Find the best auto model that fits in available memory
@@ -2862,27 +3274,18 @@
       family: m.family ?? "",
       quantization: m.quantization ?? "",
     }));
-    const autoModel = pickAutoModel(modelInfos, totalMem);
-
-    // Prefer running model unless auto-pick is a strictly better tier
-    if (bestRunning) {
-      const autoTier = autoModel
-        ? getAutoTierIndex(autoModel.base_model)
-        : Infinity;
-      if (autoTier >= bestRunning.tierIndex) {
-        // Running model is same or better tier — use it directly
-        setSelectedChatModel(bestRunning.id);
-        if (!chatStarted) createConversation();
-        routeMessage(content, files);
-        return;
-      }
-    }
+    const autoModel = chosenModelId
+      ? (modelInfos.find((m) => m.id === chosenModelId) ?? null)
+      : pickAutoModel(modelInfos, totalMem);
 
     if (!autoModel) {
       addToast({
         type: "error",
-        message: "No model fits in your available memory",
+        message: chosenModelId
+          ? `${chosenModelId.split("/").pop()} is no longer available`
+          : "No model fits in your available memory",
       });
+      restoreChatDraft(content, files);
       return;
     }
 
@@ -2900,7 +3303,7 @@
       setSelectedChatModel(autoModel.id);
       pendingChatModelId = autoModel.id;
       if (!chatStarted) createConversation();
-      pendingAutoMessage = { content, files };
+      queueMessage({ content, files, modelId: autoModel.id });
       const dlStatus = getModelDownloadStatus(autoModel.id);
       if (dlStatus.isDownloading) {
         chatLaunchState = "downloading";
@@ -2914,6 +3317,8 @@
     selectedChatCategory = "auto";
     pendingChatModelId = autoModel.id;
     chatLaunchState = "launching";
+    // Until the message is queued or handed on, give it back to the input
+    let handled = false;
 
     try {
       const res = await fetch(
@@ -2922,17 +3327,73 @@
       if (!res.ok) {
         addToast({
           type: "error",
-          message: `Failed to get placements: ${await res.text()}`,
+          message: `Failed to get placements: ${await readApiErrorMessage(res)}`,
         });
         chatLaunchState = "idle";
         return;
       }
       const data: { previews: PlacementPreview[] } = await res.json();
-      const placement = pickOptimalPlacement(data.previews);
+      // Prefer a placement on devices that already have the model
+      let placement =
+        pickOptimalPlacement(
+          data.previews.filter((p) => isPlacementDownloaded(autoModel.id, p)),
+        ) ?? pickOptimalPlacement(data.previews);
       if (!placement) {
-        addToast({ type: "error", message: "No valid placement found" });
+        const reason = getPlacementFailureReason(data.previews, autoModel.id);
+        addToast({
+          type: "error",
+          message: reason
+            ? `Can't launch ${autoModel.id.split("/").pop() ?? autoModel.id}: ${reason}`
+            : "No valid placement found",
+        });
         chatLaunchState = "idle";
         return;
+      }
+
+      // Ask before starting a download the user didn't choose, offering the
+      // running model or the best downloaded one instead
+      if (!isPlacementDownloaded(autoModel.id, placement)) {
+        const alternativeId =
+          runningModelId ??
+          pickAutoModel(
+            modelInfos.filter(
+              (m) =>
+                m.id !== autoModel.id &&
+                getNodesWithModelDownloaded(downloadsData, m.id).length > 0,
+            ),
+            totalMem,
+          )?.id ??
+          null;
+        const choice = await askDownloadChoice(
+          autoModel.id,
+          alternativeId,
+          alternativeId !== null && alternativeId === runningModelId,
+        );
+        if (choice === "cancel") {
+          chatLaunchState = "idle";
+          return;
+        }
+        if (choice === "alternative" && alternativeId) {
+          handled = true;
+          selectedChatCategory = null;
+          chatLaunchState = "idle";
+          await handleAutoSend(content, files, alternativeId);
+          return;
+        }
+        // The prompt may have been open a while: place with fresh previews
+        const freshRes = await fetch(
+          `/instance/previews?model_id=${encodeURIComponent(autoModel.id)}`,
+        );
+        const freshPreviews: PlacementPreview[] = freshRes.ok
+          ? ((await freshRes.json()) as { previews: PlacementPreview[] })
+              .previews
+          : [];
+        placement =
+          pickOptimalPlacement(
+            freshPreviews.filter((p) => isPlacementDownloaded(autoModel.id, p)),
+          ) ??
+          pickOptimalPlacement(freshPreviews) ??
+          placement;
       }
 
       const launchRes = await fetch("/instance", {
@@ -2943,7 +3404,7 @@
       if (!launchRes.ok) {
         addToast({
           type: "error",
-          message: `Failed to launch: ${await launchRes.text()}`,
+          message: `Failed to launch: ${await readApiErrorMessage(launchRes)}`,
         });
         chatLaunchState = "idle";
         return;
@@ -2955,40 +3416,162 @@
       chatLaunchState = "downloading";
 
       // Queue the message to send once model is ready
-      pendingAutoMessage = { content, files };
+      queueMessage({ content, files, modelId: autoModel.id });
+      handled = true;
     } catch (error) {
       addToast({ type: "error", message: `Network error: ${error}` });
       chatLaunchState = "idle";
+    } finally {
+      if (!handled) restoreChatDraft(content, files);
     }
   }
 
-  // Pending message to send after auto-launch completes
-  let pendingAutoMessage = $state<{
-    content: string;
-    files?: {
-      id: string;
-      name: string;
-      type: string;
-      textContent?: string;
-      preview?: string;
-    }[];
+  // Whether a placement's devices all have the model on disk already
+  function isPlacementDownloaded(
+    modelId: string,
+    preview: PlacementPreview,
+  ): boolean {
+    const nodeIds = [...unwrapInstanceNodes(preview.instance)];
+    const downloadedOn = new Set(
+      getNodesWithModelDownloaded(downloadsData, modelId),
+    );
+    return (
+      nodeIds.length > 0 && nodeIds.every((nodeId) => downloadedOn.has(nodeId))
+    );
+  }
+
+  // ── Download confirmation for auto-picked models ──
+  type DownloadChoice = "download" | "alternative" | "cancel";
+  let downloadChoicePrompt = $state<{
+    modelName: string;
+    sizeLabel: string;
+    partlyDownloaded: boolean;
+    alternativeName: string | null;
+    alternativeRunning: boolean;
+    autoPicked: boolean;
+    resolve: (choice: DownloadChoice) => void;
   } | null>(null);
 
-  // Best running model by tier (for auto-pick display)
+  function askDownloadChoice(
+    modelId: string,
+    alternativeId: string | null,
+    alternativeRunning: boolean,
+    // false when the user picked the model (e.g. a recommendation card)
+    autoPicked = true,
+  ): Promise<DownloadChoice> {
+    // Only one prompt at a time: an older one counts as cancelled
+    if (downloadChoicePrompt) answerDownloadChoice("cancel");
+    const model = models.find((m) => m.id === modelId);
+    const sizeGB = model ? getModelSizeGB(model) : 0;
+    // Furthest partial download of this model on any device
+    const partPercent = Math.max(
+      0,
+      ...getModelDownloadStatus(modelId)
+        .perNode.filter((node) => node.status !== "completed")
+        .map((node) => node.percentage),
+    );
+    const formatGB = (gb: number) =>
+      gb >= 10 ? `${Math.round(gb)}` : gb.toFixed(1);
+    const shortName = (id: string) => id.split("/").pop() ?? id;
+    return new Promise((resolve) => {
+      downloadChoicePrompt = {
+        modelName: shortName(modelId),
+        sizeLabel:
+          partPercent > 0
+            ? `${formatGB(sizeGB * (1 - partPercent / 100))} of ${formatGB(sizeGB)} GB left`
+            : `${formatGB(sizeGB)} GB`,
+        partlyDownloaded: partPercent > 0,
+        alternativeName: alternativeId ? shortName(alternativeId) : null,
+        alternativeRunning,
+        autoPicked,
+        resolve,
+      };
+    });
+  }
+
+  // Open the prompt as a modal (the rest of the page is inert, so nothing
+  // can be typed behind it) and focus the safe choice: the alternative if
+  // there is one, otherwise Cancel
+  function showDownloadChoiceDialog(dialog: HTMLDialogElement) {
+    dialog.showModal();
+    dialog.querySelector<HTMLButtonElement>("[data-default-choice]")?.focus();
+  }
+
+  function answerDownloadChoice(choice: DownloadChoice) {
+    const prompt = downloadChoicePrompt;
+    downloadChoicePrompt = null;
+    prompt?.resolve(choice);
+  }
+
+  // Pending message to send after auto-launch completes, and the model it waits for
+  type PendingMessage = {
+    content: string;
+    modelId: string;
+    files?: ChatUploadedFile[];
+  };
+  let pendingAutoMessage = $state<PendingMessage | null>(null);
+
+  // Text and attachments in the chat input. Kept here (not in ChatForm) so
+  // they survive the chat view switching layouts, and so an unsent message
+  // can be put back.
+  let chatDraft = $state("");
+  let chatDraftFiles = $state<ChatUploadedFile[]>([]);
+
+  function restoreChatDraft(content: string, files: ChatUploadedFile[] = []) {
+    chatDraft = chatDraft.trim() ? `${content}\n\n${chatDraft}` : content;
+    if (files.length > 0) chatDraftFiles = [...files, ...chatDraftFiles];
+  }
+
+  // Queue a message to send once its model is ready. A message already
+  // queued for something else goes back to the input rather than being lost.
+  function queueMessage(message: PendingMessage) {
+    if (pendingAutoMessage && pendingAutoMessage.content !== message.content) {
+      returnQueuedMessageToInput();
+    }
+    pendingAutoMessage = message;
+  }
+
+  // Give a queued message back to the input instead of dropping it
+  function returnQueuedMessageToInput() {
+    const queued = pendingAutoMessage;
+    if (!queued) return;
+    pendingAutoMessage = null;
+    restoreChatDraft(queued.content, queued.files);
+  }
+
+  // The running model a message goes to when none is selected, shown in the
+  // chat bar: the most recently launched from this browser, else the best by
+  // the auto-pick tiers, else the biggest. Image models can't take a chat.
   const bestRunningModelId = $derived.by(() => {
-    let best: { id: string; tierIndex: number } | null = null;
+    const candidates: {
+      id: string;
+      recentIndex: number;
+      tierIndex: number;
+      sizeMB: number;
+    }[] = [];
     for (const [, inst] of Object.entries(instanceData)) {
       const modelId = getInstanceModelId(inst);
       if (modelId === "Unknown" || modelId === "Unknown Model") continue;
+      if (candidates.some((candidate) => candidate.id === modelId)) continue;
       if (!hasRunningInstance(modelId)) continue;
+      if (modelSupportsImageGeneration(modelId)) continue;
       const info = models.find((m) => m.id === modelId);
       if (!info) continue;
-      const tierIndex = getAutoTierIndex(info.base_model ?? "");
-      if (!best || tierIndex < best.tierIndex) {
-        best = { id: modelId, tierIndex };
-      }
+      const recentIndex = recentModelIds.indexOf(modelId);
+      candidates.push({
+        id: modelId,
+        recentIndex: recentIndex === -1 ? Infinity : recentIndex,
+        tierIndex: getAutoTierIndex(info.base_model ?? ""),
+        sizeMB: info.storage_size_megabytes ?? 0,
+      });
     }
-    return best?.id ?? null;
+    candidates.sort(
+      (a, b) =>
+        (a.recentIndex === b.recentIndex ? 0 : a.recentIndex - b.recentIndex) ||
+        a.tierIndex - b.tierIndex ||
+        b.sizeMB - a.sizeMB,
+    );
+    return candidates[0]?.id ?? null;
   });
 
   // Track chat launch progress (download + loading)
@@ -3039,11 +3622,15 @@
     // Check if model is now ready
     if (hasRunningInstance(pendingChatModelId)) {
       chatLaunchState = "ready";
-      // Send pending auto message if any
+      // Send pending auto message if any (only to the model it was queued for)
       if (pendingAutoMessage) {
-        const msg = pendingAutoMessage;
-        pendingAutoMessage = null;
-        routeMessage(msg.content, msg.files);
+        if (pendingAutoMessage.modelId === pendingChatModelId) {
+          const msg = pendingAutoMessage;
+          pendingAutoMessage = null;
+          routeMessage(msg.content, msg.files);
+        } else {
+          returnQueuedMessageToInput();
+        }
       }
       return;
     }
@@ -3063,6 +3650,59 @@
     }
   });
 
+  // Give a queued message back to the input if the model it waits for is
+  // removed, its download fails, or its runner keeps failing (the worker
+  // retries failed runners, so a single failure isn't final)
+  // Safety net: normally the worker removes the instance first (its retries
+  // take ~25-30 s when every attempt fails)
+  const QUEUED_MESSAGE_FAILED_GIVE_UP_MS = 45_000;
+  let queuedMessageWatch: {
+    message: PendingMessage | null;
+    instanceSeen: boolean;
+    failedSince: number | null;
+  } = { message: null, instanceSeen: false, failedSince: null };
+
+  $effect(() => {
+    const queued = pendingAutoMessage;
+    const instances = Object.entries(instanceData);
+    if (!queued) return;
+    if (queuedMessageWatch.message !== queued) {
+      queuedMessageWatch = {
+        message: queued,
+        instanceSeen: false,
+        failedSince: null,
+      };
+    }
+    const forModel = instances.filter(
+      ([, inst]) => getInstanceModelId(inst) === queued.modelId,
+    );
+    if (forModel.length === 0) {
+      if (queuedMessageWatch.instanceSeen) returnQueuedMessageToInput();
+      return;
+    }
+    queuedMessageWatch.instanceSeen = true;
+    const statuses = forModel.map(([id, inst]) => ({
+      failed: getInstanceDownloadStatus(id, inst).isFailed,
+      runnerFailed: deriveInstanceStatus(inst).statusText === "FAILED",
+    }));
+    if (!statuses.every((status) => status.failed)) {
+      queuedMessageWatch.failedSince = null;
+      return;
+    }
+    // Failed downloads aren't retried; failed runners are
+    if (statuses.some((status) => !status.runnerFailed)) {
+      returnQueuedMessageToInput();
+      return;
+    }
+    queuedMessageWatch.failedSince ??= Date.now();
+    if (
+      Date.now() - queuedMessageWatch.failedSince >=
+      QUEUED_MESSAGE_FAILED_GIVE_UP_MS
+    ) {
+      returnQueuedMessageToInput();
+    }
+  });
+
   // Check if any instance is running (for showing model selector vs chat)
   const hasAnyRunningInstance = $derived(() => {
     for (const [, inst] of Object.entries(instanceData)) {
@@ -3078,9 +3718,67 @@
     return false;
   });
 
-  // Handle model selection from ChatModelSelector
-  function handleChatModelSelect(modelId: string, category: string) {
+  // Whether each model is running or on disk, for the New Chat
+  // recommendation cards
+  const chatModelStatus = $derived.by(() => {
+    const status: Record<string, "running" | "downloaded"> = {};
+    for (const model of models) {
+      if (hasRunningInstance(model.id)) status[model.id] = "running";
+      else if (getNodesWithModelDownloaded(downloadsData, model.id).length > 0)
+        status[model.id] = "downloaded";
+    }
+    return status;
+  });
+
+  // Downloads smaller than this start without asking
+  const CONFIRM_CARD_DOWNLOAD_ABOVE_GB = 1;
+
+  // Handle model selection from ChatModelSelector. A card launches its model
+  // in one click, so ask before that starts a large download, offering the
+  // running model (or the best downloaded one) instead.
+  async function handleChatModelSelect(modelId: string, category: string) {
+    const model = models.find((m) => m.id === modelId);
+    const needsDownload =
+      !hasExistingInstance(modelId) &&
+      getNodesWithModelDownloaded(downloadsData, modelId).length === 0 &&
+      (model ? getModelSizeGB(model) : 0) > CONFIRM_CARD_DOWNLOAD_ABOVE_GB;
+    if (needsDownload) {
+      const alternativeId =
+        bestRunningModelId ?? bestDownloadedModelId(modelId);
+      const choice = await askDownloadChoice(
+        modelId,
+        alternativeId,
+        alternativeId !== null && alternativeId === bestRunningModelId,
+        false,
+      );
+      if (choice === "cancel") return;
+      if (choice === "alternative" && alternativeId) {
+        launchModelForChat(alternativeId, category);
+        return;
+      }
+    }
     launchModelForChat(modelId, category);
+  }
+
+  // Best model (by the auto-pick tiers) that's on disk and fits, other than
+  // excludeId
+  function bestDownloadedModelId(excludeId: string): string | null {
+    const downloaded = models
+      .filter(
+        (m) =>
+          m.id !== excludeId &&
+          getNodesWithModelDownloaded(downloadsData, m.id).length > 0,
+      )
+      .map((m) => ({
+        id: m.id,
+        name: m.name ?? "",
+        base_model: m.base_model ?? "",
+        storage_size_megabytes: m.storage_size_megabytes ?? 0,
+        capabilities: m.capabilities ?? [],
+        family: m.family ?? "",
+        quantization: m.quantization ?? "",
+      }));
+    return pickAutoModel(downloaded, availableMemoryGB())?.id ?? null;
   }
 
   // Handle "+ Add Model" from ChatModelSelector
@@ -3107,16 +3805,7 @@
   }
 
   // Unified send handler: sends if model running, auto-launches if not
-  function handleChatSend(
-    content: string,
-    files?: {
-      id: string;
-      name: string;
-      type: string;
-      textContent?: string;
-      preview?: string;
-    }[],
-  ) {
+  function handleChatSend(content: string, files?: ChatUploadedFile[]) {
     const model = selectedChatModel();
 
     // Model is selected and running — send directly
@@ -3128,7 +3817,7 @@
 
     // Model is selected but NOT running — launch it, queue the message
     if (model) {
-      pendingAutoMessage = { content, files };
+      queueMessage({ content, files, modelId: model });
       userForcedIdle = false;
       // The selected model is already being placed or loaded; keep the queued
       // message and let the existing launch state effects send it once ready.
@@ -3139,7 +3828,13 @@
       ) {
         return;
       }
-      launchModelForChat(model, "picker", messages().length > 0);
+      launchModelForChat(model, "picker", messages().length > 0).then(
+        (launched) => {
+          if (!launched && pendingAutoMessage?.modelId === model) {
+            returnQueuedMessageToInput();
+          }
+        },
+      );
       return;
     }
 
@@ -3218,6 +3913,73 @@
 
   // Get the first filtered preview (for launch function compatibility)
   const filteredPreview = $derived(() => filteredPreviews()[0] ?? null);
+
+  // When the selected model can't launch with the current settings: why, and
+  // the closest sharding/interconnect combination that would work
+  const placementMismatch = $derived.by(() => {
+    if (!selectedModelId || previewsData.length === 0) return null;
+    if (filteredPreviews().length > 0) return null;
+    const errored = previewsData.find(
+      (p) =>
+        p.sharding === selectedSharding &&
+        matchesSelectedRuntime(p.instance_meta) &&
+        p.error,
+    );
+    const otherSharding: "Pipeline" | "Tensor" =
+      selectedSharding === "Pipeline" ? "Tensor" : "Pipeline";
+    const otherRuntime: InstanceMeta =
+      selectedInstanceType === "MlxRing" ? "MlxJaccl" : "MlxRing";
+    const alternative =
+      [
+        { sharding: selectedSharding, runtime: otherRuntime },
+        { sharding: otherSharding, runtime: selectedInstanceType },
+        { sharding: otherSharding, runtime: otherRuntime },
+      ].find(({ sharding, runtime }) =>
+        previewsData.some(
+          (p) =>
+            p.sharding === sharding &&
+            p.instance_meta === runtime &&
+            p.error === null &&
+            p.memory_delta_by_node !== null,
+        ),
+      ) ?? null;
+    return {
+      // Previews are limited to the node filter when one is active
+      reason: errored?.error
+        ? describePlacementError(
+            errored.error,
+            selectedModelId,
+            isFilterActive(),
+          )
+        : null,
+      alternative,
+    };
+  });
+
+  function useLaunchSettings(
+    sharding: "Pipeline" | "Tensor",
+    runtime: InstanceMeta,
+  ) {
+    selectedSharding = sharding;
+    selectedInstanceType = runtime;
+    saveLaunchDefaults();
+  }
+
+  // Remembered non-default launch settings, shown while Advanced Options is closed
+  const customLaunchSettingsLabel = $derived.by(() => {
+    if (
+      selectedSharding === "Pipeline" &&
+      selectedInstanceType === "MlxRing" &&
+      selectedMinNodes <= 1
+    )
+      return null;
+    const parts: string[] = [
+      selectedSharding,
+      RUNTIME_LABELS[selectedInstanceType],
+    ];
+    if (selectedMinNodes > 1) parts.push(`${selectedMinNodes}+ devices`);
+    return parts.join(" · ");
+  });
 
   // Auto-update selectedMinNodes when node count changes (default to 1 = show all placements)
   $effect(() => {
@@ -3906,8 +4668,8 @@
                 The model is automatically distributed. Each device handles a
                 piece.
               {:else if onboardingStep === 4}
-                {stepTitle === "exo self-heals"
-                  ? "exo automatically redistributes the model so inference continues without interruption."
+                {stepTitle === "Relaunch on the remaining devices"
+                  ? "Models using that device stop. You can relaunch them on the devices that are left."
                   : "Devices can leave anytime. Laptops close, machines restart."}
               {:else}
                 &nbsp;
@@ -4463,7 +5225,7 @@
             <h1
               class="text-xl font-sans font-light text-white/90 mb-2 tracking-wide"
             >
-              Downloading
+              {onboardingDownloadProgress ? "Downloading" : "Starting"}
             </h1>
             {#if onboardingModelId}
               <p class="text-sm text-white/40 font-sans">
@@ -4503,10 +5265,14 @@
                   class="absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-exo-yellow to-exo-yellow-darker rounded-full animate-pulse"
                 ></div>
               </div>
-              <p class="text-xs font-mono text-white/40 mt-4">
-                Preparing download...
-              </p>
+              <p class="text-xs font-mono text-white/40 mt-4">Preparing…</p>
             </div>
+          {/if}
+
+          {#if onboardingRetryNote}
+            <p class="text-xs font-mono text-yellow-400/80 mt-6">
+              {onboardingRetryNote}
+            </p>
           {/if}
 
           <p class="text-xs font-sans text-white/40 mt-8">
@@ -4572,6 +5338,12 @@
               ></div>
             </div>
             <p class="text-sm text-white/30 font-sans">Loading...</p>
+          {/if}
+
+          {#if onboardingRetryNote}
+            <p class="text-xs font-mono text-yellow-400/80 mt-6">
+              {onboardingRetryNote}
+            </p>
           {/if}
         </div>
       {:else if onboardingStep === 9}
@@ -4699,6 +5471,67 @@
     {/if}
   {/if}
 
+  {#if downloadChoicePrompt}
+    <!-- Asked before auto-pick starts a download. Modal: Escape cancels. -->
+    <dialog
+      use:showDownloadChoiceDialog
+      oncancel={(event) => {
+        event.preventDefault();
+        answerDownloadChoice("cancel");
+      }}
+      aria-labelledby="download-choice-title"
+      class="m-auto w-[calc(100%-2rem)] max-w-md bg-exo-dark-gray text-white border border-exo-yellow/20 rounded-lg shadow-2xl p-5 font-mono backdrop:bg-black/60"
+    >
+      <h3 id="download-choice-title" class="text-sm text-white mb-2">
+        Download {downloadChoicePrompt.modelName} ({downloadChoicePrompt.sizeLabel})?
+      </h3>
+      <p class="text-xs text-exo-light-gray/80 mb-5 leading-relaxed">
+        {#if downloadChoicePrompt.autoPicked}
+          It's the best model that fits, but it isn't {downloadChoicePrompt.partlyDownloaded
+            ? "fully "
+            : ""}downloaded yet. Your message will be sent when it's ready.
+        {:else}
+          It isn't {downloadChoicePrompt.partlyDownloaded
+            ? "fully "
+            : ""}downloaded yet, so you can chat once the download finishes and
+          it has loaded.
+        {/if}
+      </p>
+      <div class="flex flex-wrap justify-end gap-2">
+        <button
+          type="button"
+          onclick={() => answerDownloadChoice("cancel")}
+          data-default-choice={downloadChoicePrompt.alternativeName
+            ? undefined
+            : true}
+          class="px-3 py-1.5 text-xs text-exo-light-gray hover:text-white border border-exo-medium-gray/50 rounded cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-exo-yellow"
+        >
+          Cancel
+        </button>
+        {#if downloadChoicePrompt.alternativeName}
+          <button
+            type="button"
+            onclick={() => answerDownloadChoice("alternative")}
+            data-default-choice
+            class="px-3 py-1.5 text-xs text-exo-yellow border border-exo-yellow/40 hover:bg-exo-yellow/10 rounded cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-exo-yellow"
+          >
+            Use {downloadChoicePrompt.alternativeName}
+            ({downloadChoicePrompt.alternativeRunning
+              ? "running"
+              : "downloaded"})
+          </button>
+        {/if}
+        <button
+          type="button"
+          onclick={() => answerDownloadChoice("download")}
+          class="px-3 py-1.5 text-xs bg-exo-yellow text-exo-black hover:bg-exo-yellow/90 rounded cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-white"
+        >
+          Download
+        </button>
+      </div>
+    </dialog>
+  {/if}
+
   <!-- ═══════════════════════════════════════════════════════ -->
   <!-- MAIN DASHBOARD (always rendered, behind onboarding)    -->
   <!-- ═══════════════════════════════════════════════════════ -->
@@ -4737,7 +5570,7 @@
     <!-- Left: Conversation History Sidebar (hidden in topology-only mode, welcome state, or when toggled off) - Desktop only -->
     {#if !topologyOnlyEnabled && sidebarVisible}
       <div
-        class="hidden md:block w-80 flex-shrink-0 border-r border-exo-yellow/10"
+        class="hidden lg:block w-80 flex-shrink-0 border-r border-exo-yellow/10"
         role="complementary"
         aria-label="Conversation history"
       >
@@ -5027,16 +5860,18 @@
           <!-- Chat Input - Below topology, never overlaps -->
           <div class="px-4 pt-4 pb-6 flex-shrink-0">
             <div class="max-w-3xl mx-auto">
-              {#if instanceCount === 0}
+              {#if homeChatHint}
                 <div class="text-center mb-4">
                   <p class="text-sm text-white/50 font-sans">
-                    Select a model to get started.
+                    {homeChatHint}
                   </p>
                 </div>
               {/if}
               <ChatForm
+                bind:message={chatDraft}
+                bind:uploadedFiles={chatDraftFiles}
                 placeholder={instanceCount === 0
-                  ? "Choose a model to start chatting"
+                  ? homeChatPlaceholder
                   : "Ask anything"}
                 showHelperText={false}
                 showModelSelector={true}
@@ -5044,6 +5879,7 @@
                 modelCapabilities={modelCapabilities()}
                 onOpenModelPicker={openChatModelPicker}
                 onAutoSend={handleChatSend}
+                modelDisplayOverride={bestRunningModelId ?? undefined}
               />
             </div>
           </div>
@@ -5222,7 +6058,12 @@
                           >
                         </div>
                         <button
-                          onclick={() => deleteInstance(id)}
+                          onclick={(e) => {
+                            // Don't let the card's handlers select the model being deleted
+                            e.stopPropagation();
+                            deleteInstance(id);
+                          }}
+                          onkeydown={(e) => e.stopPropagation()}
                           class="text-xs px-2 py-1 font-mono tracking-wider uppercase border border-red-500/30 text-red-400 hover:bg-red-500/20 hover:text-red-400 hover:border-red-500/50 transition-all duration-200 cursor-pointer"
                         >
                           DELETE
@@ -5576,9 +6417,12 @@
                           </div>
                           {#if downloadInfo.isFailed && downloadInfo.errorMessage}
                             <div
-                              class="text-xs text-red-400/80 font-mono mt-1 break-words"
+                              class="text-xs text-red-400/80 font-mono mt-1 break-words whitespace-pre-line line-clamp-3"
+                              title={downloadInfo.errorMessage}
                             >
-                              {downloadInfo.errorMessage}
+                              {summarizeFailureReason(
+                                downloadInfo.errorMessage,
+                              )}
                             </div>
                           {/if}
                         {/if}
@@ -5697,7 +6541,7 @@
               <button
                 type="button"
                 onclick={() => (showAdvancedOptions = !showAdvancedOptions)}
-                class="flex items-center gap-2 text-xs text-white/50 hover:text-white/70 font-mono tracking-wider uppercase transition-colors cursor-pointer py-1"
+                class="flex flex-wrap items-center gap-2 text-xs text-white/50 hover:text-white/70 font-mono tracking-wider uppercase transition-colors cursor-pointer py-1"
                 aria-expanded={showAdvancedOptions}
               >
                 <svg
@@ -5715,7 +6559,15 @@
                     d="M9 5l7 7-7 7"
                   />
                 </svg>
-                Advanced Options
+                <span class="whitespace-nowrap">Advanced Options</span>
+                {#if !showAdvancedOptions && customLaunchSettingsLabel}
+                  <span
+                    class="normal-case tracking-normal text-left text-exo-yellow/80 border border-exo-yellow/30 rounded px-1.5 py-0.5"
+                    title="Remembered launch settings"
+                  >
+                    {customLaunchSettingsLabel}
+                  </span>
+                {/if}
               </button>
 
               {#if showAdvancedOptions}
@@ -5939,6 +6791,11 @@
                         <ModelCard
                           model={selectedModel}
                           isLaunching={launchingModelId === selectedModel.id}
+                          existingInstance={hasRunningInstance(selectedModel.id)
+                            ? "running"
+                            : hasExistingInstance(selectedModel.id)
+                              ? "starting"
+                              : null}
                           {downloadStatus}
                           nodes={data?.nodes ?? {}}
                           sharding={apiPreview.sharding}
@@ -5953,10 +6810,27 @@
                     {/each}
                   </div>
                 {:else if selectedModel}
-                  <div class="text-center py-4">
+                  <div class="text-center py-4 space-y-3">
                     <div class="text-xs text-white/50 font-mono">
-                      No valid configurations for current settings
+                      {placementMismatch?.reason ??
+                        "No valid configurations for current settings"}
                     </div>
+                    {#if placementMismatch?.alternative}
+                      {@const alternative = placementMismatch.alternative}
+                      <button
+                        type="button"
+                        onclick={() =>
+                          useLaunchSettings(
+                            alternative.sharding,
+                            alternative.runtime,
+                          )}
+                        class="text-xs font-mono px-3 py-1.5 border border-exo-yellow/40 text-exo-yellow rounded hover:bg-exo-yellow/10 transition-colors cursor-pointer"
+                      >
+                        Use {alternative.sharding} · {RUNTIME_LABELS[
+                          alternative.runtime
+                        ]}
+                      </button>
+                    {/if}
                   </div>
                 {/if}
               {/if}
@@ -6063,6 +6937,44 @@
                     </div>
                   </div>
                 {/if}
+
+                {#if pendingAutoMessage}
+                  {@const attachmentCount =
+                    pendingAutoMessage.files?.length ?? 0}
+                  <!-- Queued message, sent automatically once the model is ready -->
+                  <div class="w-full flex flex-col items-end gap-1.5">
+                    <div
+                      class="command-panel rounded-lg rounded-tr-sm px-4 py-3 max-w-full"
+                    >
+                      <p
+                        class="text-sm text-white/80 whitespace-pre-wrap break-words line-clamp-4"
+                      >
+                        {pendingAutoMessage.content}
+                      </p>
+                      {#if attachmentCount > 0}
+                        <p
+                          class="text-[10px] text-exo-light-gray/60 font-mono mt-1"
+                        >
+                          + {attachmentCount}
+                          {attachmentCount === 1 ? "attachment" : "attachments"}
+                        </p>
+                      {/if}
+                    </div>
+                    <div
+                      class="flex items-center gap-3 text-[10px] font-mono uppercase tracking-wider text-exo-light-gray/60"
+                    >
+                      <span>Sends when the model is ready</span>
+                      <button
+                        type="button"
+                        onclick={returnQueuedMessageToInput}
+                        class="uppercase text-exo-light-gray hover:text-exo-yellow transition-colors cursor-pointer"
+                        title="Put the message back in the input"
+                      >
+                        Don't send
+                      </button>
+                    </div>
+                  </div>
+                {/if}
               </div>
             </div>
             <div
@@ -6070,6 +6982,8 @@
             >
               <div class="max-w-7xl mx-auto">
                 <ChatForm
+                  bind:message={chatDraft}
+                  bind:uploadedFiles={chatDraftFiles}
                   placeholder="Ask anything"
                   showModelSelector={true}
                   modelTasks={modelTasks()}
@@ -6127,6 +7041,8 @@
             >
               <div class="max-w-7xl mx-auto">
                 <ChatForm
+                  bind:message={chatDraft}
+                  bind:uploadedFiles={chatDraftFiles}
                   placeholder="Ask anything"
                   showModelSelector={true}
                   modelTasks={modelTasks()}
@@ -6153,6 +7069,7 @@
                 }))}
                 clusterLabel={chatClusterLabel}
                 totalMemoryGB={availableMemoryGB()}
+                modelStatus={chatModelStatus}
                 onSelect={handleChatModelSelect}
                 onAddModel={handleChatAddModel}
               />
@@ -6162,12 +7079,16 @@
             >
               <div class="max-w-7xl mx-auto">
                 <ChatForm
-                  placeholder="Ask anything — we'll pick the best model automatically"
+                  bind:message={chatDraft}
+                  bind:uploadedFiles={chatDraftFiles}
+                  placeholder={bestRunningModelId
+                    ? "Ask anything"
+                    : "Ask anything — we'll pick the best model automatically"}
                   showModelSelector={!!bestRunningModelId}
                   modelDisplayOverride={bestRunningModelId ?? undefined}
                   modelTasks={modelTasks()}
                   modelCapabilities={modelCapabilities()}
-                  onAutoSend={handleAutoSend}
+                  onAutoSend={handleChatSend}
                   onOpenModelPicker={openChatModelPicker}
                 />
               </div>
@@ -6357,7 +7278,12 @@
                             >
                           </div>
                           <button
-                            onclick={() => deleteInstance(id)}
+                            onclick={(e) => {
+                              // Don't let the card's handlers select the model being deleted
+                              e.stopPropagation();
+                              deleteInstance(id);
+                            }}
+                            onkeydown={(e) => e.stopPropagation()}
                             class="text-xs px-2 py-1 font-mono tracking-wider uppercase border border-red-500/30 text-red-400 hover:bg-red-500/20 hover:text-red-400 hover:border-red-500/50 transition-all duration-200 cursor-pointer"
                           >
                             DELETE
@@ -6719,9 +7645,12 @@
                             </div>
                             {#if downloadInfo.isFailed && downloadInfo.errorMessage}
                               <div
-                                class="text-xs text-red-400/80 font-mono mt-1 break-words"
+                                class="text-xs text-red-400/80 font-mono mt-1 break-words whitespace-pre-line line-clamp-3"
+                                title={downloadInfo.errorMessage}
                               >
-                                {downloadInfo.errorMessage}
+                                {summarizeFailureReason(
+                                  downloadInfo.errorMessage,
+                                )}
                               </div>
                             {/if}
                           {/if}
