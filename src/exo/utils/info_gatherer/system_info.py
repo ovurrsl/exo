@@ -1,7 +1,9 @@
 import platform
 import socket
 import sys
+from collections.abc import Awaitable, Callable
 from subprocess import CalledProcessError
+from typing import final
 
 import psutil
 from anyio import run_process
@@ -138,6 +140,9 @@ _WINDOWS_VIRTUAL_ADAPTER_MARKERS = (
     "wireguard",
     "openvpn",
     "tap-",
+    # "Local Area Connection* N" are Wi-Fi Direct virtual adapters; a wired
+    # adapter's legacy name has no asterisk.
+    "local area connection*",
 )
 
 
@@ -207,7 +212,7 @@ async def get_model_and_chip() -> tuple[str, str]:
     return (model, chip)
 
 
-async def _windows_computer_model() -> str | None:
+async def _query_windows_computer_model() -> str | None:
     try:
         process = await run_process(
             [
@@ -226,7 +231,7 @@ async def _windows_computer_model() -> str | None:
     return model or None
 
 
-async def _windows_gpu_name() -> str | None:
+async def _query_windows_gpu_name() -> str | None:
     try:
         process = await run_process(
             [
@@ -246,3 +251,26 @@ async def _windows_gpu_name() -> str | None:
         if line.strip()
     ]
     return ", ".join(names) if names else None
+
+
+@final
+class _CachedLookup:
+    """Remember the first successful result of a lookup; retry failed ones.
+
+    Static node info is gathered again every minute, but the computer model and
+    GPU name cannot change while exo runs, so there is no need to start
+    powershell and nvidia-smi each time.
+    """
+
+    def __init__(self, lookup: Callable[[], Awaitable[str | None]]) -> None:
+        self._lookup = lookup
+        self._value: str | None = None
+
+    async def __call__(self) -> str | None:
+        if self._value is None:
+            self._value = await self._lookup()
+        return self._value
+
+
+_windows_computer_model = _CachedLookup(_query_windows_computer_model)
+_windows_gpu_name = _CachedLookup(_query_windows_gpu_name)
