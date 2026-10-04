@@ -751,7 +751,9 @@ async def _download_file(
         raise Exception(
             f"Downloaded file {target_dir / path} has hash {final_hash} but remote hash is {remote_hash}"
         )
-    await aios.rename(partial_path, target_dir / path)
+    # replace (not rename): on Windows rename raises FileExistsError when the
+    # target already exists, e.g. when re-downloading a corrupted file.
+    await aios.replace(partial_path, target_dir / path)
     on_progress(length, length, True)
     return target_dir / path
 
