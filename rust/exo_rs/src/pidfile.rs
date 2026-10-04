@@ -66,9 +66,10 @@ mod win {
         }
 
         pub fn write(&mut self) -> Result<(), PidfileError> {
-            let file = self.file.as_mut().ok_or_else(|| {
-                PidfileError::Io(io::Error::other("pidfile already closed"))
-            })?;
+            let file = self
+                .file
+                .as_mut()
+                .ok_or_else(|| PidfileError::Io(io::Error::other("pidfile already closed")))?;
             file.set_len(0).map_err(PidfileError::Io)?;
             file.seek(SeekFrom::Start(0)).map_err(PidfileError::Io)?;
             file.write_all(std::process::id().to_string().as_bytes())
