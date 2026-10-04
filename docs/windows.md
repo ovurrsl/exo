@@ -8,7 +8,8 @@ own GPU.
 Status: single-node GPU inference through the exo API works (Qwen3-0.6B-4bit, about
 260-280 tokens/s streaming on an RTX 5070), and the ring backend passes 2, 3 and
 4 rank tests on one Windows machine. **A real macOS + Windows ring has not been
-tested yet.**
+tested yet.** With the MLX wheel pinned today, only models whose files are all
+smaller than 2 GiB load (see Known limitations).
 
 ## How it works
 
@@ -120,6 +121,10 @@ netsh int ipv6 set dynamicport tcp start=52500 num=13036
   libraries from NVIDIA's pip wheels, no CUDA Toolkit needed) made processes that ran
   GPU work exit with code 2170; the patch now carries the fix, and the wheel will
   replace this one once it has been rebuilt and tested (see the MLX README).
+- The pinned wheel cannot load a model file larger than 2 GiB (MLX's file reader used
+  32-bit seeks on Windows before ml-explore/mlx#4456), so most models above roughly
+  3B parameters fail to load with `The JSON header is ... bytes long but the file is
+  only 8 bytes`. The files are not corrupt. A rebuilt wheel with that fix is planned.
 - Only NVIDIA GPUs are supported. MLX's CPU backend works on Windows but is far too
   slow on x86 to be useful (about 0.2 tokens/s for Qwen3-0.6B), and every extra
   installs the CUDA build of MLX.
