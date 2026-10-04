@@ -15,9 +15,9 @@ dependencies = [
   "huggingface-hub>=1.8.0",
   "psutil>=7.0.0",
   "loguru>=0.7.3",
-  "exo-rs",                          # rust bindings
+  "exo-rs",                                        # rust bindings
   "anyio==4.11.0",
-  "tiktoken>=0.12.0",                # required for kimi k2 tokenizer
+  "tiktoken>=0.12.0",                              # required for kimi k2 tokenizer
   "hypercorn>=0.18.0",
   "openai-harmony>=0.0.8",
   "httpx>=0.28.1",
@@ -100,7 +100,7 @@ mlx = [
   # Windows: the darwin source above (commit cc3f3e60) built with CUDA 13 and
   # the ring backend ported to Winsock2, which upstream MLX compiles out on
   # Windows. See scripts/windows/mlx/README.md.
-  { path = "vendor/windows/cuda13/mlx-0.32.0.dev20261003-cp313-cp313-win_amd64.whl", marker = "sys_platform == 'win32'" },
+  { url = "https://github.com/ovurrsl/exo/releases/download/mlx-windows-0.32.0.dev20261003/mlx-0.32.0.dev20261003-cp313-cp313-win_amd64.whl", marker = "sys_platform == 'win32'" },
 ]
 mlx-cuda-12 = [
   { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_12-0.32.0-py3-none-manylinux_2_35_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
