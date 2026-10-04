@@ -10,6 +10,7 @@ from anyio import EndOfStream, create_task_group, fail_after
 
 from exo.utils.async_process import (
     AsyncProcess,
+    _read_pipe_win32,  # pyright: ignore[reportPrivateUsage]
 )
 from exo.utils.channels import MpSender, Receiver, mp_channel
 
@@ -419,3 +420,21 @@ async def test_death(capsys: CaptureFixture[str]) -> None:
 
         print("CHILD out:", stdout.decode("utf-8", errors="replace"))
         print("CHILD err:", stderr.decode("utf-8", errors="replace"), "hello :)")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows pipe reader")
+async def test_read_pipe_win32_returns_data_then_eof() -> None:
+    read_fd, pipe_write_fd = os.pipe()
+    write_fd: int | None = pipe_write_fd
+    try:
+        os.write(pipe_write_fd, b"runner output")
+        with fail_after(5):
+            assert await _read_pipe_win32(read_fd) == b"runner output"
+        os.close(pipe_write_fd)
+        write_fd = None
+        with fail_after(5):
+            assert await _read_pipe_win32(read_fd) == b""
+    finally:
+        os.close(read_fd)
+        if write_fd is not None:
+            os.close(write_fd)
