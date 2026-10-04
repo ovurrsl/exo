@@ -58,9 +58,11 @@ mlx = [
   "torchaudio==2.10.0; sys_platform == 'linux'",
   "torchvision==0.25.0; sys_platform == 'darwin'",
   "torchvision==0.25.0; sys_platform == 'linux'",
-  # On Windows the mlx wheel from [tool.uv.sources] is one CUDA build (CPU and
-  # CUDA backends + ring) that loads the CUDA libraries from these wheels, so
-  # they belong to every extra. Same versions as the Linux resolution.
+  # On Windows the mlx wheel from [tool.uv.sources] is one CUDA 13 build (CPU
+  # and CUDA backends + ring), and every extra installs it, so the NVIDIA
+  # runtime wheels go here too. They are pinned to the versions the wheel was
+  # built and tested with (cuDNN 9.19), which can differ from the Linux
+  # mlx-cuda13 resolution.
   "nvidia-cublas==13.1.0.3; sys_platform == 'win32'",
   "nvidia-cuda-nvrtc==13.0.88; sys_platform == 'win32'",
   "nvidia-cuda-runtime==13.0.96; sys_platform == 'win32'",
@@ -95,9 +97,9 @@ mlx = [
   { git = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv.git", branch = "address-rdma-gpu-locks", marker = "sys_platform == 'darwin'" },
   { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx-0.32.0-cp313-cp313-manylinux_2_35_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
   { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx-0.32.0-cp313-cp313-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine != 'aarch64'" },
-  # Upstream MLX v0.32.3 (ring wire protocol identical to the darwin source),
-  # built for Windows with the ring backend ported to Winsock2 (upstream MLX
-  # compiles ring out on Windows). See vendor/windows/README.md.
+  # Windows: the darwin source above (commit cc3f3e60) built with CUDA 13 and
+  # the ring backend ported to Winsock2, which upstream MLX compiles out on
+  # Windows. See scripts/windows/README.md.
   { path = "vendor/windows/cuda13/mlx-0.32.0.dev20261003-cp313-cp313-win_amd64.whl", marker = "sys_platform == 'win32'" },
 ]
 mlx-cuda-12 = [
