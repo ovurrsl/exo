@@ -50,7 +50,7 @@ exactly this patch, builds one self-contained `mlx` wheel and prints its SHA-256
 
 | Wheel | MLX source | GPUs | Status |
 |---|---|---|---|
-| `mlx-0.32.0.dev20261003-cp313-cp313-win_amd64.whl`, sha256 `d7159f4cffa38608dffd17fd95a81fe184312a7a0ce158d4461e6d4a934be255` | cc3f3e60 + an earlier revision of this patch | RTX 50 (sm_120) | pinned by `pyproject.toml`; built and tested on one machine only |
+| `mlx-0.32.0.dev20261003-cp313-cp313-win_amd64.whl`, sha256 `d7159f4cffa38608dffd17fd95a81fe184312a7a0ce158d4461e6d4a934be255` | cc3f3e60 + an earlier revision of this patch | RTX 50 (sm_120a) | pinned by `pyproject.toml` from the [`mlx-windows-0.32.0.dev20261003`](https://github.com/ovurrsl/exo/releases/tag/mlx-windows-0.32.0.dev20261003) release; loads CUDA from the CUDA 13.0 Toolkit's default folder and cuDNN from a folder of the build machine; tested on that machine only |
 | `mlx-0.32.3.dev20261004-cp313-cp313-win_amd64.whl` | v0.32.3 + this patch | RTX 20-50 | not used: a process that ran GPU work exits with 2170 instead of its exit code |
 
 The earlier patch revision is not in this repository; it differs in the base commit,
