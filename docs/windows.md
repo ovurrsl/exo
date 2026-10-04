@@ -24,7 +24,12 @@ Everything else is Windows-only code behind `sys.platform == "win32"` or
 
 ## Requirements
 
-- Windows 10/11 x64 with an NVIDIA GPU and a driver that supports CUDA 13.
+- Windows 10/11 x64 with an NVIDIA GPU and a driver that supports CUDA 13: version
+  580.88 or newer. On RTX 50 with Windows 11 24H2, use 581.36 or newer: NVIDIA's
+  Nsight known issues list a system hang with earlier R576/R580 drivers there while
+  debugging CUDA with hardware-accelerated GPU scheduling on. Game Ready and Studio
+  drivers of the same version are the same driver as far as CUDA is concerned;
+  either works.
 - [uv](https://docs.astral.sh/uv/), Node.js (for the dashboard), Rust nightly
   (`rustup`), and Visual Studio Build Tools with the C++ workload (for the Rust
   bindings and MLX's CPU kernel compiler).
@@ -58,7 +63,10 @@ CUDA node it sets two variables unless you set them yourself:
 
 - `OVERRIDE_MEMORY_MB`: the GPU's free memory minus 2.5 GiB. exo otherwise reports
   system RAM, and Windows does not fail an over-full GPU: it silently spills into
-  shared system memory and generation becomes very slow.
+  shared system memory and generation becomes very slow. Whether CUDA may spill is
+  the driver's "CUDA - Sysmem Fallback Policy" (NVIDIA Control Panel, Manage 3D
+  settings, globally or for `python.exe`): "Prefer No Sysmem Fallback" makes an
+  allocation that does not fit fail instead.
 - `MLX_PTX_CACHE_DIR`: MLX compiles CUDA kernels on first use (the first request takes
   20-30 s) and caches them under `%TEMP%`, which Storage Sense cleans. The script keeps
   the cache under `%LOCALAPPDATA%\exo\mlx-kernel-cache\<mlx version>-sm<compute cap>`.

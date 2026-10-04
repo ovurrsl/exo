@@ -33,7 +33,8 @@ ml-explore/mlx v0.32.3 (`64ea011cb65f14d9ce2737e60db9a4ae91ed7441`), 10 files,
   asks it for the memory limit), and destroying it
   while the process unloads its DLLs is the likely cause of processes that allocated
   GPU memory exiting with code 2170 (or hanging); to be confirmed on the rebuilt
-  wheel.
+  wheel. 2170 is 0x87A, the facility code of DXGI's HRESULTs (`_FACDXGI`,
+  0x887Axxxx), and `wddm.cpp` is the only code in MLX that uses DXGI.
 
 The ring wire protocol of v0.32.3 is the same as that of the MLX commit exo installs
 on macOS (rltakashige/mlx-jaccl-fix-small-recv@cc3f3e60): packet and segment sizes are
@@ -52,6 +53,33 @@ $env:CMAKE_BUILD_PARALLEL_LEVEL = '8'
 
 It clones MLX next to the exo checkout if needed, checks that the tree is v0.32.3 with
 exactly this patch, builds one self-contained `mlx` wheel and prints its SHA-256.
+
+## Checking a wheel
+
+[`check-mlx-wheel.ps1`](check-mlx-wheel.ps1) checks the MLX of a Python
+environment (exo's `.venv` by default, or `-Python <path>`):
+
+- exit codes: `import mlx.core`, GPU work, and GPU work with output redirected to
+  files must each exit with the script's own code, `-Runs` times;
+- `-LargeFile <path>`: a safetensors file larger than 2 GiB must load;
+- the ring backend between 2, 3 and 4 processes on 127.0.0.1 (`-RingSizes`).
+
+A run that does not exit within `-TimeoutSeconds` is killed and counts as failed.
+
+```powershell
+.\scripts\windows\mlx\check-mlx-wheel.ps1 -LargeFile C:\path	o\model-00001-of-00002.safetensors
+```
+
+To tell whether a problem comes from this patch or from MLX itself, run the same
+script against upstream's own Windows CUDA wheel in a separate environment:
+
+```powershell
+uv venv C:	mp\mlx-official --python 3.13
+uv pip install --python C:	mp\mlx-official\Scripts\python.exe "mlx[cuda13]==0.32.3"
+.\scripts\windows\mlx\check-mlx-wheel.ps1 -Python C:	mp\mlx-official\Scripts\python.exe -RingSizes @()
+```
+
+(Upstream compiles ring out on Windows, hence `-RingSizes @()`.)
 
 ## Wheels
 
