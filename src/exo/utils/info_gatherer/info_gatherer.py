@@ -379,7 +379,10 @@ class NodeBackends(TaggedModel):
             backends.append(Backend.MlxMetal)
         if await to_thread.run_sync(_has_nvml_cuda):
             backends.append(Backend.MlxCuda)
-            backends.append(Backend.Vllm)
+            # vLLM has no native Windows build; advertising it would let the
+            # master place vLLM instances on a node that cannot run them.
+            if sys.platform != "win32":
+                backends.append(Backend.Vllm)
         return cls(backends=backends)
 
 
