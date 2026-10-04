@@ -1,7 +1,6 @@
 import argparse
 import multiprocessing as mp
 import os
-import resource
 import shutil
 import signal
 import sys
@@ -13,7 +12,6 @@ from typing import Self
 import anyio
 from anyio import to_thread
 from anyio.lowlevel import checkpoint as anyio_checkpoint
-from daemon import DaemonContext  # pyright: ignore[reportMissingTypeStubs]
 from exo_rs import Pidfile, PidfileError
 from loguru import logger
 from pydantic import PositiveInt
@@ -40,6 +38,7 @@ from exo.utils import STDIO_FDS
 from exo.utils.channels import Receiver, channel
 from exo.utils.exit_guard import exit_if_shutdown_hangs
 from exo.utils.pydantic_ext import FrozenModel
+from exo.utils.rlimits import raise_nofile_limit
 from exo.utils.task_group import TaskGroup
 from exo.worker.main import Worker
 
@@ -176,6 +175,9 @@ class Node:
         async with self._tg as tg:
             signal.signal(signal.SIGINT, lambda _, __: self.shutdown())
             signal.signal(signal.SIGTERM, lambda _, __: self.shutdown())
+            if sys.platform == "win32":
+                # Ctrl+Break / console close on Windows.
+                signal.signal(signal.SIGBREAK, lambda _, __: self.shutdown())
             tg.start_soon(self.router.run)
             tg.start_soon(self.event_router.run)
             tg.start_soon(self.election.run)
@@ -303,6 +305,12 @@ def main():
 
     try:
         if args.legacy_daemon:
+            if sys.platform == "win32":
+                print("--legacy-daemon is not supported on Windows", file=sys.stderr)
+                raise SystemExit(2)
+
+            from daemon import DaemonContext  # pyright: ignore[reportMissingTypeStubs]
+
             # keep stdio backed by explicit /dev/null streams. multiprocessing spawn expects
             # valid stdio FDs; letting DaemonContext close/reopen them can break runner startup.
             for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
@@ -345,9 +353,7 @@ def main():
 
 
 def main_inner(args: "Args"):
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    target = min(max(soft, 65535), hard)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    raise_nofile_limit(65535)
 
     mp.set_start_method("spawn", force=True)
 

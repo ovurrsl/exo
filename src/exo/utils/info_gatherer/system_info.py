@@ -1,7 +1,9 @@
 import platform
 import socket
 import sys
+from collections.abc import Awaitable, Callable
 from subprocess import CalledProcessError
+from typing import final
 
 import psutil
 from anyio import run_process
@@ -13,19 +15,27 @@ def get_os_version() -> str:
     """Return the OS version string for this node.
 
     On macOS this is the macOS version (e.g. ``"15.3"``).
+    On Windows this is ``"Windows 10"`` / ``"Windows 11"``.
     On other platforms it falls back to the platform name (e.g. ``"Linux"``).
     """
     if sys.platform == "darwin":
         version = platform.mac_ver()[0]
         return version if version else "Unknown"
+    if sys.platform == "win32":
+        release = platform.release()
+        return f"Windows {release}" if release else "Windows"
     return platform.system() or "Unknown"
 
 
 async def get_os_build_version() -> str:
-    """Return the macOS build version string (e.g. ``"24D5055b"``).
+    """Return the OS build version string (e.g. ``"24D5055b"`` on macOS).
 
-    On non-macOS platforms, returns ``"Unknown"``.
+    On Windows this is the kernel version (e.g. ``"10.0.19045"``).
+    On other non-macOS platforms, returns ``"Unknown"``.
     """
+    if sys.platform == "win32":
+        return platform.version() or "Unknown"
+
     if sys.platform != "darwin":
         return "Unknown"
 
@@ -101,6 +111,7 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     interface_types = await _get_interface_types_from_networksetup()
 
     for iface, services in psutil.net_if_addrs().items():
+        iface_type = interface_types.get(iface, _guess_windows_interface_type(iface))
         for service in services:
             match service.family:
                 case socket.AF_INET | socket.AF_INET6:
@@ -108,7 +119,7 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
                         NetworkInterfaceInfo(
                             name=iface,
                             ip_address=service.address,
-                            interface_type=interface_types.get(iface, "unknown"),
+                            interface_type=iface_type,
                         )
                     )
                 case _:
@@ -117,12 +128,63 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     return interfaces_info
 
 
+_WINDOWS_VIRTUAL_ADAPTER_MARKERS = (
+    "vethernet",
+    "hyper-v",
+    "virtualbox",
+    "vmware",
+    "loopback",
+    "bluetooth",
+    "tailscale",
+    "zerotier",
+    "wireguard",
+    "openvpn",
+    "tap-",
+    # "Local Area Connection* N" are Wi-Fi Direct virtual adapters; a wired
+    # adapter's legacy name has no asterisk.
+    "local area connection*",
+)
+
+
+def _guess_windows_interface_type(iface: str) -> InterfaceType:
+    """Best-effort interface type from a Windows adapter's friendly name.
+
+    Windows has no networksetup equivalent, so names such as "Ethernet 2" and
+    "Wi-Fi" are the only cheap signal. Virtual adapters (Hyper-V/WSL switches,
+    VPN tunnels, VM host-only networks) are reported as "unknown" so placement
+    never prefers them over physical links. Other platforms keep upstream
+    behaviour and report "unknown" for anything networksetup did not classify.
+    """
+    if sys.platform != "win32":
+        return "unknown"
+    lowered = iface.lower()
+    if any(marker in lowered for marker in _WINDOWS_VIRTUAL_ADAPTER_MARKERS):
+        return "unknown"
+    if "wi-fi" in lowered or "wireless" in lowered or "wlan" in lowered:
+        return "wifi"
+    if lowered.startswith("ethernet") or "local area connection" in lowered:
+        return "ethernet"
+    return "unknown"
+
+
 async def get_model_and_chip() -> tuple[str, str]:
-    """Get Mac system information using system_profiler."""
+    """Get machine model and accelerator/chip names."""
     model = "Unknown Model"
     chip = "Unknown Chip"
 
-    # TODO: better non mac support
+    if sys.platform == "win32":
+        uname = platform.uname()
+        model = (await _windows_computer_model()) or (
+            f"{uname.system} {uname.release}".strip() or "Windows PC"
+        )
+        chip = (
+            (await _windows_gpu_name())
+            or uname.processor
+            or uname.machine
+            or "Unknown Chip"
+        )
+        return (model, chip)
+
     if sys.platform != "darwin":
         return (model, chip)
 
@@ -148,3 +210,67 @@ async def get_model_and_chip() -> tuple[str, str]:
     chip = chip_line.split(": ")[1] if chip_line else "Unknown Chip"
 
     return (model, chip)
+
+
+async def _query_windows_computer_model() -> str | None:
+    try:
+        process = await run_process(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance -ClassName Win32_ComputerSystem).Model",
+            ],
+            check=False,
+        )
+    except OSError:
+        return None
+    if process.returncode != 0:
+        return None
+    model = process.stdout.decode("utf-8", errors="replace").strip()
+    return model or None
+
+
+async def _query_windows_gpu_name() -> str | None:
+    try:
+        process = await run_process(
+            [
+                "nvidia-smi",
+                "--query-gpu=name",
+                "--format=csv,noheader",
+            ],
+            check=False,
+        )
+    except OSError:
+        return None
+    if process.returncode != 0:
+        return None
+    names = [
+        line.strip()
+        for line in process.stdout.decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+    return ", ".join(names) if names else None
+
+
+@final
+class _CachedLookup:
+    """Remember the first successful result of a lookup; retry failed ones.
+
+    Static node info is gathered again every minute, but the computer model and
+    GPU name cannot change while exo runs, so there is no need to start
+    powershell and nvidia-smi each time.
+    """
+
+    def __init__(self, lookup: Callable[[], Awaitable[str | None]]) -> None:
+        self._lookup = lookup
+        self._value: str | None = None
+
+    async def __call__(self) -> str | None:
+        if self._value is None:
+            self._value = await self._lookup()
+        return self._value
+
+
+_windows_computer_model = _CachedLookup(_query_windows_computer_model)
+_windows_gpu_name = _CachedLookup(_query_windows_gpu_name)

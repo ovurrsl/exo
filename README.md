@@ -226,6 +226,10 @@ exo follows the [XDG Base Directory Specification](https://specifications.freede
 
 You can override these locations by setting the corresponding XDG environment variables.
 
+### Run from Source (Windows, experimental)
+
+Windows PCs with an NVIDIA GPU can run exo natively and join a cluster with macOS nodes. See [docs/windows.md](docs/windows.md).
+
 ### macOS App
 
 exo ships a macOS app that runs in the background on your Mac.
