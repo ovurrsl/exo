@@ -1,24 +1,40 @@
-# Allow inbound TCP/UDP so other LAN nodes can join this exo process.
-# PAIR's Windows installer does the equivalent for its proxy ports.
+# Allow inbound traffic so other LAN nodes (e.g. macOS nodes) can join this exo node.
 #
-# TCP 52414 = zenoh, TCP 52415 = API/dashboard
-# UDP 52413 = IPv4/IPv6 discovery (broadcast + multicast)
-# UDP 5353  = mDNS (_exo._tcp.local.)
+# UDP 52413   = peer discovery (IPv6 multicast ff12::e0a1:de89)
+# TCP 52414   = zenoh (cluster messaging)
+# TCP 52415   = API / dashboard (also used by peers to probe reachability)
+# TCP random  = MLX ring backend. The master picks a random port in 49152-65535 (utils/ports.py)
+#               per instance, so this is allowed per program: the base Python
+#               interpreter that the uv venv launcher (.venv\Scripts\python.exe)
+#               hands off to.
+#
+# Rules apply to Private and Domain networks only; mark your LAN as Private.
 
 #Requires -RunAsAdministrator
 
 $ErrorActionPreference = 'Stop'
-$RuleName = 'exo local cluster'
+$Root = Resolve-Path (Join-Path $PSScriptRoot '..\..')
+$TcpRuleName = 'exo local cluster TCP'
 $UdpRuleName = 'exo local cluster UDP'
+$RingRuleName = 'exo MLX ring (python)'
 
-foreach ($name in @($RuleName, $UdpRuleName)) {
+$VenvPython = Join-Path $Root '.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $VenvPython)) {
+    Write-Error "No venv at $VenvPython - run 'uv sync --extra mlx-cpu' first."
+}
+$BasePython = (& $VenvPython -c 'import sys; print(sys._base_executable)').Trim()
+
+foreach ($name in @($TcpRuleName, $UdpRuleName, $RingRuleName)) {
     if (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue) {
         Remove-NetFirewallRule -DisplayName $name
     }
 }
 
-New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Action Allow `
-    -Protocol TCP -LocalPort 52413,52414,52415 | Out-Null
+New-NetFirewallRule -DisplayName $TcpRuleName -Direction Inbound -Action Allow `
+    -Protocol TCP -LocalPort 52414,52415 -Profile Private,Domain | Out-Null
 New-NetFirewallRule -DisplayName $UdpRuleName -Direction Inbound -Action Allow `
-    -Protocol UDP -LocalPort 52413,5353 | Out-Null
-Write-Host "Firewall rules '$RuleName' allow TCP 52413-52415 and UDP 52413,5353 inbound."
+    -Protocol UDP -LocalPort 52413 -Profile Private,Domain | Out-Null
+New-NetFirewallRule -DisplayName $RingRuleName -Direction Inbound -Action Allow `
+    -Protocol TCP -LocalPort 49152-65535 -Program $BasePython -Profile Private,Domain | Out-Null
+
+Write-Host "Allowed inbound TCP 52414-52415, UDP 52413, and TCP 49152-65535 for $BasePython (Private/Domain)."

@@ -13,6 +13,10 @@ from exo.utils.async_process import (
 )
 from exo.utils.channels import MpSender, Receiver, mp_channel
 
+# os.abort() kills the child with SIGABRT on POSIX; on Windows the C runtime's
+# abort() exits with status 3 instead.
+_ABORT_EXITCODE = 3 if sys.platform == "win32" else -signal.SIGABRT
+
 
 def _write_to_stdio(prefix: str, *, stderr_suffix: str) -> None:
     print(f"{prefix}: python stdout")
@@ -318,7 +322,7 @@ async def test_repeated_bad_children_do_not_pollute_or_replace_parent_stdio(
             elif target is _abort_after_stdio_write:
                 assert b"abort-child: stdout before abort\n" in stdout
                 assert b"abort-child: stderr before abort\n" in stderr
-                assert exitcode == -signal.SIGABRT
+                assert exitcode == _ABORT_EXITCODE
             else:
                 assert stdout == b""
                 assert b"stderr before exception\n" in stderr

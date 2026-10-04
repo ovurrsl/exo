@@ -199,9 +199,8 @@ pub async fn create_swarm(
     listen_port: u16,
     discovery_service_port: u16,
 ) -> Result<Swarm> {
-    let session =
-        crate::open_with_listen_fallback(identity, namespace, listen_port, discovery_service_port)
-            .await?;
+    let cfg = crate::cfg(identity, listen_port)?;
+    let session = crate::open(cfg, namespace, listen_port, discovery_service_port).await?;
     Ok(Swarm {
         session,
         from_client,

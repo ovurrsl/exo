@@ -109,7 +109,7 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     interface_types = await _get_interface_types_from_networksetup()
 
     for iface, services in psutil.net_if_addrs().items():
-        iface_type = interface_types.get(iface, _guess_interface_type(iface))
+        iface_type = interface_types.get(iface, _guess_windows_interface_type(iface))
         for service in services:
             match service.family:
                 case socket.AF_INET | socket.AF_INET6:
@@ -126,12 +126,38 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     return interfaces_info
 
 
-def _guess_interface_type(iface: str) -> InterfaceType:
-    """Best-effort type from the adapter name (Windows/Linux, PAIR-style)."""
+_WINDOWS_VIRTUAL_ADAPTER_MARKERS = (
+    "vethernet",
+    "hyper-v",
+    "virtualbox",
+    "vmware",
+    "loopback",
+    "bluetooth",
+    "tailscale",
+    "zerotier",
+    "wireguard",
+    "openvpn",
+    "tap-",
+)
+
+
+def _guess_windows_interface_type(iface: str) -> InterfaceType:
+    """Best-effort interface type from a Windows adapter's friendly name.
+
+    Windows has no networksetup equivalent, so names such as "Ethernet 2" and
+    "Wi-Fi" are the only cheap signal. Virtual adapters (Hyper-V/WSL switches,
+    VPN tunnels, VM host-only networks) are reported as "unknown" so placement
+    never prefers them over physical links. Other platforms keep upstream
+    behaviour and report "unknown" for anything networksetup did not classify.
+    """
+    if sys.platform != "win32":
+        return "unknown"
     lowered = iface.lower()
-    if any(token in lowered for token in ("wi-fi", "wifi", "wlan", "wireless")):
+    if any(marker in lowered for marker in _WINDOWS_VIRTUAL_ADAPTER_MARKERS):
+        return "unknown"
+    if "wi-fi" in lowered or "wireless" in lowered or "wlan" in lowered:
         return "wifi"
-    if any(token in lowered for token in ("ethernet", "eth", "lan", "local area")):
+    if lowered.startswith("ethernet") or "local area connection" in lowered:
         return "ethernet"
     return "unknown"
 

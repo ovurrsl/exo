@@ -98,12 +98,8 @@ def test_macos_uses_traditional_paths():
 
 
 def test_windows_uses_localappdata():
-    """Windows stores config/data/cache under %LOCALAPPDATA%\\exo, like PAIR."""
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k != "EXO_HOME"
-    }
+    """Windows stores config/data/cache under %LOCALAPPDATA%\\exo."""
+    env = {k: v for k, v in os.environ.items() if k != "EXO_HOME"}
     env["LOCALAPPDATA"] = r"C:\Users\test\AppData\Local"
     with (
         mock.patch.dict(os.environ, env, clear=True),

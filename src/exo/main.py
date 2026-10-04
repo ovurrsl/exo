@@ -154,9 +154,9 @@ class Node:
     async def run(self):
         async with self._tg as tg:
             signal.signal(signal.SIGINT, lambda _, __: self.shutdown())
-            if hasattr(signal, "SIGTERM"):
-                signal.signal(signal.SIGTERM, lambda _, __: self.shutdown())
-            if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGTERM, lambda _, __: self.shutdown())
+            if sys.platform == "win32":
+                # Ctrl+Break / console close on Windows.
                 signal.signal(signal.SIGBREAK, lambda _, __: self.shutdown())
             tg.start_soon(self.router.run)
             tg.start_soon(self.event_router.run)
@@ -356,11 +356,7 @@ def main_inner(args: "Args"):
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
 
     if args.bootstrap_peers:
-        os.environ["EXO_BOOTSTRAP_PEERS"] = ",".join(args.bootstrap_peers)
-        logger.info(
-            "Bootstrap peers: {}",
-            ", ".join(args.bootstrap_peers),
-        )
+        raise ValueError("Bootstrap peers has been temporarily removed")
 
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
@@ -472,11 +468,7 @@ class Args(FrozenModel):
             if os.getenv("EXO_BOOTSTRAP_PEERS")
             else [],
             dest="bootstrap_peers",
-            help=(
-                "Comma-separated zenoh peers to dial on startup: "
-                "host, host:port, or tcp/host:port (env: EXO_BOOTSTRAP_PEERS). "
-                "Port defaults to --zenoh-port."
-            ),
+            help="Comma-separated libp2p multiaddrs to dial on startup (env: EXO_BOOTSTRAP_PEERS)",
         )
         parser.add_argument(
             "--namespace",
