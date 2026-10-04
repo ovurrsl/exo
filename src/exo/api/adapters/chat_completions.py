@@ -57,6 +57,10 @@ async def _resolve_host(host: str) -> Sequence[str]:
     return [str(info[4][0]) for info in infos]
 
 
+class ImageUrlRejectedError(ValueError):
+    """An image URL this node refuses to fetch; the API answers it with 400."""
+
+
 def _is_public_address(address: str) -> bool:
     ip = ipaddress.ip_address(address)
     return ip.is_global and not (
@@ -78,19 +82,24 @@ async def validate_image_url(
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"Unsupported image URL scheme: {parsed.scheme!r}")
+        raise ImageUrlRejectedError(f"Unsupported image URL scheme: {parsed.scheme!r}")
     host = parsed.hostname
     if not host:
-        raise ValueError("Image URL has no host")
+        raise ImageUrlRejectedError("Image URL has no host")
     try:
         addresses: Sequence[str] = [str(ipaddress.ip_address(host))]
     except ValueError:
-        addresses = await resolve(host)
+        try:
+            addresses = await resolve(host)
+        except OSError as e:  # socket.gaierror: the name does not resolve
+            raise ImageUrlRejectedError(
+                f"Image URL host {host!r} did not resolve"
+            ) from e
     if not addresses:
-        raise ValueError(f"Image URL host {host!r} did not resolve")
+        raise ImageUrlRejectedError(f"Image URL host {host!r} did not resolve")
     for address in addresses:
         if not _is_public_address(address):
-            raise ValueError(
+            raise ImageUrlRejectedError(
                 f"Refusing to fetch image from non-public address {address} ({host})"
             )
 
@@ -105,7 +114,9 @@ async def fetch_image_url(url: str) -> Base64Image:
         session.get(url, headers=headers, allow_redirects=False) as resp,
     ):
         if 300 <= resp.status < 400:
-            raise ValueError(f"Image URL redirected (HTTP {resp.status}); not followed")
+            raise ImageUrlRejectedError(
+                f"Image URL redirected (HTTP {resp.status}); not followed"
+            )
         resp.raise_for_status()
         data = await resp.read()
         return Base64Image(base64.b64encode(data).decode("ascii"))

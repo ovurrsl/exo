@@ -1,8 +1,18 @@
+import socket
 from collections.abc import Sequence
 
 import pytest
+from fastapi import Request
 
-from exo.api.adapters.chat_completions import fetch_image_url, validate_image_url
+from exo.api.adapters.chat_completions import (
+    ImageUrlRejectedError,
+    fetch_image_url,
+    validate_image_url,
+)
+from exo.api.adapters.claude import handle_image_block
+from exo.api.main import API
+from exo.api.types.api import ErrorResponse
+from exo.api.types.claude_api import ClaudeImageBlock, ClaudeImageSource
 
 
 async def _resolve_never(host: str) -> Sequence[str]:
@@ -63,8 +73,16 @@ async def test_rejects_hostname_with_mixed_public_and_private_records() -> None:
 
 
 async def test_rejects_unresolvable_hostname() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ImageUrlRejectedError):
         await validate_image_url("https://nowhere.example/x.png", resolve=_resolver({}))
+
+
+async def test_resolver_failure_is_a_rejection() -> None:
+    async def resolve(host: str) -> Sequence[str]:
+        raise socket.gaierror(f"Name or service not known: {host}")
+
+    with pytest.raises(ImageUrlRejectedError):
+        await validate_image_url("https://nowhere.example/x.png", resolve=resolve)
 
 
 async def test_accepts_public_hostname_and_literal() -> None:
@@ -79,3 +97,25 @@ async def test_fetch_image_url_refuses_before_any_network_call() -> None:
     # A literal loopback address never reaches the resolver or the socket.
     with pytest.raises(ValueError):
         await fetch_image_url("http://127.0.0.1:1/never-opened")
+
+
+async def test_claude_image_block_does_not_drop_a_rejected_url() -> None:
+    block = ClaudeImageBlock(
+        source=ClaudeImageSource(type="url", url="http://127.0.0.1:1/x.png")
+    )
+    with pytest.raises(ImageUrlRejectedError):
+        await handle_image_block(block)
+
+
+async def test_rejected_image_url_is_a_400() -> None:
+    api = object.__new__(API)
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
+
+    response = await api.image_url_rejected_handler(
+        request, ImageUrlRejectedError("Refusing to fetch image from 127.0.0.1")
+    )
+
+    assert response.status_code == 400
+    body = ErrorResponse.model_validate_json(bytes(response.body))
+    assert body.error.code == 400
+    assert "127.0.0.1" in body.error.message
