@@ -25,7 +25,7 @@ def test_active_speeds_from_stats_empty() -> None:
     assert _active_speeds_from_stats({}) == {}
 
 
-_IFCONFIG_VERBOSE_SAMPLE = """\
+_IFCONFIG_MEDIA_SAMPLE = """\
 lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
 	inet 127.0.0.1 netmask 0xff000000
 en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
@@ -53,13 +53,13 @@ awdl0: flags=8943<UP,BROADCAST,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1484
 
 
 def test_parse_supported_media_mbps_takes_the_fastest_recognised_media() -> None:
-    speeds = _parse_supported_media_mbps(_IFCONFIG_VERBOSE_SAMPLE)
+    speeds = _parse_supported_media_mbps(_IFCONFIG_MEDIA_SAMPLE)
 
     assert speeds == {"en0": 1000}
 
 
 def test_parse_supported_media_mbps_ignores_interfaces_without_the_block() -> None:
-    speeds = _parse_supported_media_mbps(_IFCONFIG_VERBOSE_SAMPLE)
+    speeds = _parse_supported_media_mbps(_IFCONFIG_MEDIA_SAMPLE)
 
     assert "lo0" not in speeds
     assert "en5" not in speeds
@@ -80,3 +80,30 @@ en9: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 """
 
     assert _parse_supported_media_mbps(output) == {}
+
+
+def test_parse_supported_media_mbps_reads_multi_gigabit_names() -> None:
+    # xnu's if_media.h spells these "2500Base-T", "5000Base-T" and "10GbaseT".
+    output = """\
+en7: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tmedia: autoselect (2500Base-T <full-duplex>)
+\tstatus: active
+\tsupported media:
+\t\tmedia autoselect
+\t\tmedia 1000baseT mediaopt full-duplex
+\t\tmedia 2500Base-T mediaopt full-duplex
+en8: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tsupported media:
+\t\tmedia 5000Base-T mediaopt full-duplex
+\t\tmedia 2500Base-T mediaopt full-duplex
+en9: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tsupported media:
+\t\tmedia 1000baseT mediaopt full-duplex
+\t\tmedia 10GbaseT mediaopt full-duplex
+"""
+
+    assert _parse_supported_media_mbps(output) == {
+        "en7": 2500,
+        "en8": 5000,
+        "en9": 10_000,
+    }

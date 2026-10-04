@@ -1,4 +1,5 @@
 import platform
+import re
 import socket
 import sys
 from collections.abc import Mapping
@@ -120,27 +121,23 @@ def _get_active_speeds_mbps() -> dict[str, int]:
     return _active_speeds_from_stats(stats)
 
 
-# Media type name (as ifconfig prints it, case-insensitive) -> its
-# theoretical maximum speed, in Mbps. Deliberately conservative: an
-# unrecognised media type is dropped rather than guessed at.
-_MEDIA_SPEED_MBPS: dict[str, int] = {
-    "10baset/utp": 10,
-    "10baset": 10,
-    "100basetx": 100,
-    "100baset4": 100,
-    "1000baset": 1000,
-    "1000basetx": 1000,
-    "1000basesx": 1000,
-    "2500baset": 2500,
-    "5000baset": 5000,
-    "10gbase-t": 10_000,
-    "25gbase-t": 25_000,
-    "40gbase-t": 40_000,
-}
+# An Ethernet media subtype name as ifconfig prints it starts with its speed:
+# "10baseT/UTP", "100baseTX", "1000baseT", "2500Base-T", "10GbaseT". xnu's
+# if_media.h is not consistent about case or hyphens, so only that prefix is
+# read. Anything else (autoselect, none, Wi-Fi subtypes) has no speed.
+_MEDIA_SPEED = re.compile(r"(\d+)(g?)base", re.IGNORECASE)
 
 
-def _parse_supported_media_mbps(ifconfig_verbose_output: str) -> dict[str, int]:
-    """Parse the "supported media" block `ifconfig -v` prints per wired
+def _media_speed_mbps(media_type: str) -> int | None:
+    match = _MEDIA_SPEED.match(media_type)
+    if match is None:
+        return None
+    speed = int(match.group(1))
+    return speed * 1000 if match.group(2) else speed
+
+
+def _parse_supported_media_mbps(ifconfig_media_output: str) -> dict[str, int]:
+    """Parse the "supported media" block `ifconfig -m` prints per wired
     interface into the fastest media type each interface's hardware can
     negotiate, in Mbps.
 
@@ -155,7 +152,7 @@ def _parse_supported_media_mbps(ifconfig_verbose_output: str) -> dict[str, int]:
     current_iface: str | None = None
     in_supported_media = False
 
-    for raw_line in ifconfig_verbose_output.splitlines():
+    for raw_line in ifconfig_media_output.splitlines():
         if raw_line and not raw_line[0].isspace():
             current_iface = raw_line.split(":", 1)[0].strip()
             in_supported_media = False
@@ -176,8 +173,7 @@ def _parse_supported_media_mbps(ifconfig_verbose_output: str) -> dict[str, int]:
             in_supported_media = False
             continue
 
-        media_type = line.split()[1].lower()
-        mbps = _MEDIA_SPEED_MBPS.get(media_type)
+        mbps = _media_speed_mbps(line.split()[1])
         if mbps is not None:
             speeds[current_iface] = max(speeds.get(current_iface, 0), mbps)
 
@@ -193,7 +189,9 @@ async def _get_supported_speeds_mbps() -> dict[str, int]:
         return {}
 
     try:
-        result = await run_process(["ifconfig", "-v"])
+        # macOS prints the supported media list only with -m (-v only raises
+        # verbosity).
+        result = await run_process(["ifconfig", "-m"])
     except CalledProcessError:
         return {}
 
