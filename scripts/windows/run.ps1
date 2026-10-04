@@ -1,7 +1,7 @@
 # Start exo on Windows from a source checkout.
 #
-# Prerequisites: `uv sync --extra mlx-cpu` (or `--extra mlx-cuda13` with the CUDA
-# MLX wheel) has been run, so .venv holds the Windows MLX build with the ring backend.
+# Prerequisites: `uv sync --extra mlx-cuda13` has been run, so .venv holds the
+# Windows MLX build (CUDA + ring backend) and the node advertises MlxCuda.
 #
 # Usage:
 #   .\scripts\windows\run.ps1
@@ -31,14 +31,19 @@ Set-Location $Root
 $exo = Join-Path $Root '.venv\Scripts\exo.exe'
 $python = Join-Path $Root '.venv\Scripts\python.exe'
 if (-not (Test-Path $exo)) {
-    Write-Error 'No .venv found. Run `uv sync --python 3.13 --extra mlx-cpu` (or --extra mlx-cuda13) first.'
+    Write-Error 'No .venv found. Run `uv sync --python 3.13 --extra mlx-cuda13` first.'
 }
 
 $GpuReserveMiB = 2560
 
 if ((-not $env:OVERRIDE_MEMORY_MB -or -not $env:MLX_PTX_CACHE_DIR) -and (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
+    # Windows PowerShell 5.1 turns a native command's stderr output into error
+    # records, which 'Stop' makes fatal even with 2>$null, and MLX may log there.
+    $ErrorActionPreference = 'Continue'
     $mlxInfo = & $python -c "import mlx.core as mx; print(mx.cuda.is_available(), mx.__version__)" 2>$null
-    if ($mlxInfo -match '^True (\S+)$') {
+    $mlxExitCode = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($mlxExitCode -eq 0 -and ($mlxInfo | Select-Object -Last 1) -match '^True (\S+)$') {
         $mlxVersion = $Matches[1]
         if (-not $env:OVERRIDE_MEMORY_MB) {
             $freeMiB = [int]((nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | Select-Object -First 1).Trim())
