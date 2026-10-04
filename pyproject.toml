@@ -99,7 +99,7 @@ mlx = [
   { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx-0.32.0-cp313-cp313-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine != 'aarch64'" },
   # Windows: the darwin source above (commit cc3f3e60) built with CUDA 13 and
   # the ring backend ported to Winsock2, which upstream MLX compiles out on
-  # Windows. See scripts/windows/README.md.
+  # Windows. See scripts/windows/mlx/README.md.
   { path = "vendor/windows/cuda13/mlx-0.32.0.dev20261003-cp313-cp313-win_amd64.whl", marker = "sys_platform == 'win32'" },
 ]
 mlx-cuda-12 = [

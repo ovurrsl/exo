@@ -1,4 +1,5 @@
 import platform
+import re
 import socket
 import sys
 from collections.abc import Awaitable, Callable
@@ -140,10 +141,12 @@ _WINDOWS_VIRTUAL_ADAPTER_MARKERS = (
     "wireguard",
     "openvpn",
     "tap-",
-    # "Local Area Connection* N" are Wi-Fi Direct virtual adapters; a wired
-    # adapter's legacy name has no asterisk.
-    "local area connection*",
 )
+
+# Wi-Fi Direct virtual adapters are named "<localized name>* <n>", e.g.
+# "Local Area Connection* 10" or "Yerel Ağ Bağlantısı* 3"; a wired adapter's
+# legacy name has no asterisk.
+_WINDOWS_WIFI_DIRECT_NAME = re.compile(r"\*\s*\d+$")
 
 
 def _guess_windows_interface_type(iface: str) -> InterfaceType:
@@ -158,7 +161,9 @@ def _guess_windows_interface_type(iface: str) -> InterfaceType:
     if sys.platform != "win32":
         return "unknown"
     lowered = iface.lower()
-    if any(marker in lowered for marker in _WINDOWS_VIRTUAL_ADAPTER_MARKERS):
+    if _WINDOWS_WIFI_DIRECT_NAME.search(iface) or any(
+        marker in lowered for marker in _WINDOWS_VIRTUAL_ADAPTER_MARKERS
+    ):
         return "unknown"
     if "wi-fi" in lowered or "wireless" in lowered or "wlan" in lowered:
         return "wifi"

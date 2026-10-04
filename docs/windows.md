@@ -65,6 +65,21 @@ CUDA node it sets two variables unless you set them yourself:
 Data, models and logs go to `%LOCALAPPDATA%\exo` unless `EXO_HOME` is set.
 `EXO_MODELS_DIRS` and `EXO_MODELS_READ_ONLY_DIRS` are separated with `;` on Windows.
 
+## Running the tests
+
+The tests also need the workspace packages, so sync with `--all-packages` and run
+the unit tests under `src` (the top-level `tests/` are cluster tests that need a
+POSIX host):
+
+```powershell
+uv sync --python 3.13 --all-packages --extra mlx-cuda13
+uv run pytest src
+```
+
+Image generation (mflux) is not installed on Windows, so its tests are not collected.
+`basedpyright` is configured for macOS (`pythonPlatform = "Darwin"`); on Windows it
+also reports that the macOS/Linux-only `python-daemon` is not installed.
+
 ## Ports
 
 | Port | Protocol | Use |

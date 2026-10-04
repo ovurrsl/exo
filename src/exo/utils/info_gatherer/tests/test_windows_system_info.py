@@ -21,6 +21,7 @@ _ADAPTERS = {
     "Wi-Fi": [_Address(socket.AF_INET, "192.168.1.21")],
     "Local Area Connection": [_Address(socket.AF_INET, "192.168.2.5")],
     "Local Area Connection* 10": [_Address(socket.AF_INET6, "fe80::1")],
+    "Yerel Ağ Bağlantısı* 3": [_Address(socket.AF_INET6, "fe80::2")],
     "vEthernet (WSL (Hyper-V firewall))": [_Address(socket.AF_INET, "172.20.0.1")],
     "Tailscale": [_Address(socket.AF_INET, "100.64.0.1")],
 }
@@ -41,6 +42,7 @@ async def test_windows_interface_types_come_from_adapter_names():
         "Wi-Fi": "wifi",
         "Local Area Connection": "ethernet",
         "Local Area Connection* 10": "unknown",
+        "Yerel Ağ Bağlantısı* 3": "unknown",
         "vEthernet (WSL (Hyper-V firewall))": "unknown",
         "Tailscale": "unknown",
     }
