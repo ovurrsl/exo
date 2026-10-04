@@ -116,10 +116,10 @@ netsh int ipv6 set dynamicport tcp start=52500 num=13036
   `mlx-windows-0.32.0.dev20261003` release) contains CUDA code for RTX 50 series GPUs
   (sm_120a) only, and looks for the CUDA libraries in the CUDA 13.0 Toolkit's default
   install folder and for cuDNN in a folder of the machine it was built on. It has
-  only been run on that machine. A build for RTX 20-50 that loads CUDA from NVIDIA's
-  pip wheels exists (MLX v0.32.3, see the MLX README) but is not used yet: processes
-  that ran GPU work exit with code 2170 instead of their real exit code, and exo
-  decides on runner failures by exit code.
+  only been run on that machine. The portable build (MLX v0.32.3: RTX 20-50, CUDA
+  libraries from NVIDIA's pip wheels, no CUDA Toolkit needed) made processes that ran
+  GPU work exit with code 2170; the patch now carries the fix, and the wheel will
+  replace this one once it has been rebuilt and tested (see the MLX README).
 - Only NVIDIA GPUs are supported. MLX's CPU backend works on Windows but is far too
   slow on x86 to be useful (about 0.2 tokens/s for Qwen3-0.6B), and every extra
   installs the CUDA build of MLX.

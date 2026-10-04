@@ -150,6 +150,24 @@ index bcea005443f0831a0211efbcf83b2403ec327037..0ed1812fa1a91b851bf07eea1ed6c99d
  }
  
  void AtomicEvent::signal(Stream s, uint32_t value) {
+diff --git a/mlx/backend/cuda/wddm.cpp b/mlx/backend/cuda/wddm.cpp
+index 71027f77c426dfac6b62732b25fefa398970eadd..eb5c6c068b1149581826721c83ec036aabc46188 100644
+--- a/mlx/backend/cuda/wddm.cpp
++++ b/mlx/backend/cuda/wddm.cpp
+@@ -100,8 +100,11 @@ class WddmMemoryBudget {
+ } // namespace
+ 
+ size_t get_wddm_memory_limit(int device, cudaMemPool_t pool) {
+-  static WddmMemoryBudget budget(gpu::device_count());
+-  return budget.get_memory_limit(device, pool);
++  // Leaked intentionally: destroying it at exit releases the DXGI adapters
++  // while the process unloads its DLLs, and a process that allocated GPU
++  // memory then exits with a wrong exit code or hangs.
++  static auto* budget = new WddmMemoryBudget(gpu::device_count());
++  return budget->get_memory_limit(device, pool);
+ }
+ 
+ } // namespace mlx::core::cu
 diff --git a/mlx/distributed/CMakeLists.txt b/mlx/distributed/CMakeLists.txt
 index 807fd0fbdb791211d6517ded4f57857c2841eb92..7e783f7b95ede989106001e45e4fc86f35427fab 100644
 --- a/mlx/distributed/CMakeLists.txt
