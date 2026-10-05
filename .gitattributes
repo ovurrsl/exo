@@ -1,0 +1,3 @@
+# Keep the MLX patch byte-exact on Windows checkouts (core.autocrlf=true would
+# turn it into CRLF, and git apply and build-mlx-wheel.ps1 need it as committed).
+scripts/windows/mlx/*.patch -text
