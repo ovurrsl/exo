@@ -53,6 +53,8 @@ def read_gpu_memory() -> GpuMemory | None:
     when the GPU, not system RAM, runs low.
 
     None on other platforms, without nvidia-ml-py, or when NVML fails. The
-    figures cover every process on the GPU, as nvidia-smi shows them.
+    figures cover every process on the GPU, as nvidia-smi shows them. Assumes
+    one NVIDIA GPU: NVML numbers GPUs in PCI order and ignores
+    CUDA_VISIBLE_DEVICES, so with several, GPU 0 here need not be MLX's.
     """
     return _reader.read()

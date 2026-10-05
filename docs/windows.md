@@ -75,8 +75,11 @@ through NVML (installed by `--extra mlx-cuda13`) every second:
   cache, prefill activations and the CUDA context) to the master, which places models
   by that. Set `OVERRIDE_MEMORY_MB` to report a fixed amount instead.
 - It evicts the prefix cache when less than 1 GiB of GPU memory is free
-  (`EXO_WINDOWS_GPU_MIN_FREE_MB`); every rank of the instance evicts with it. The
-  system RAM threshold (`EXO_MEMORY_THRESHOLD`) still applies as well.
+  (`EXO_WINDOWS_GPU_MIN_FREE_MB`, keep it below the 2.5 GiB reserve), counting
+  buffers MLX keeps cached for reuse as free; every rank of the instance evicts with
+  it. The system RAM threshold (`EXO_MEMORY_THRESHOLD`) still applies as well.
+- Both assume one NVIDIA GPU: NVML's GPU 0 is used, which with several GPUs need not
+  be the one MLX runs on.
 
 Whether CUDA may spill into shared memory at all is the driver's "CUDA - Sysmem Fallback
 Policy" (NVIDIA Control Panel, Manage 3D settings, globally or for `python.exe`):

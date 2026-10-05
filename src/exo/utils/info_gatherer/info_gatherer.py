@@ -548,7 +548,11 @@ class InfoGatherer:
             if override_memory_env
             else None
         )
-        if override_memory is None and read_gpu_memory() is not None:
+        # The first read initialises NVML, which can take a while on Windows.
+        if (
+            override_memory is None
+            and await to_thread.run_sync(read_gpu_memory) is not None
+        ):
             logger.info(
                 "Reporting GPU memory as this node's memory, keeping "
                 f"{WINDOWS_GPU_MEMORY_RESERVE.in_mb} MB of it in reserve"

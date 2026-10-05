@@ -49,7 +49,9 @@ _MEMORY_THRESHOLD = float(
 )
 
 # On a Windows CUDA node the KV cache lives in GPU memory: evict once less than
-# this much of it is free (see get_memory_used_percentage).
+# this much of it is free (see get_memory_used_percentage). Keep it below the
+# 2.5 GiB the node leaves out of the memory it reports, or a model placed to
+# fill the GPU would evict on every request.
 _WINDOWS_GPU_MIN_FREE = Memory.from_mb(
     int(os.environ.get("EXO_WINDOWS_GPU_MIN_FREE_MB", "1024"))
 )
@@ -560,7 +562,14 @@ def get_available_memory() -> Memory:
 
 def get_memory_used_percentage() -> float:
     gpu = read_gpu_memory()
-    if gpu is not None and gpu.free.in_bytes < _WINDOWS_GPU_MIN_FREE.in_bytes:
+    # MLX keeps freed buffers (e.g. prefill activations, evicted entries) in
+    # its own cache, which the driver still counts as used: count it as free,
+    # so that evicting an entry lowers the pressure and the eviction loop
+    # stops once enough is freed.
+    if (
+        gpu is not None
+        and gpu.free.in_bytes + mx.get_cache_memory() < _WINDOWS_GPU_MIN_FREE.in_bytes
+    ):
         # System RAM says nothing about the GPU memory the KV cache is in.
         # Report it full: the pressure the cache acts on is the maximum over
         # ranks, so every rank then evicts together.
