@@ -39,8 +39,11 @@ ml-explore/mlx v0.32.3 (`64ea011cb65f14d9ce2737e60db9a4ae91ed7441`), 10 files,
 The ring wire protocol of v0.32.3 is the same as that of the MLX commit exo installs
 on macOS (rltakashige/mlx-jaccl-fix-small-recv@cc3f3e60): packet and segment sizes are
 unchanged; v0.32.3 adds a 1 GiB per-call I/O cap and fails fast when a peer is lost.
-This was established by comparing the sources; a Mac <-> Windows ring has not been run
-yet.
+On Linux, CPU builds of cc3f3e60 and of v0.32.3 with this patch ran rings together
+(2, 3 and 4 ranks, mixed in both orders): `all_sum`, `all_gather` and a `send`/`recv`
+pipeline over float32, float16, bfloat16 and int32 arrays of 1 to 33.5 million elements
+all gave the expected results. That covers the protocol code both platforms share, not
+the Winsock paths; a Mac <-> Windows ring has not been run yet.
 
 ## Building
 
@@ -53,6 +56,17 @@ $env:CMAKE_BUILD_PARALLEL_LEVEL = '8'
 
 It clones MLX next to the exo checkout if needed, checks that the tree is v0.32.3 with
 exactly this patch, builds one self-contained `mlx` wheel and prints its SHA-256.
+
+Build with the CUDA 13.0 Toolkit: at run time the wheel loads the CUDA libraries from
+the 13.0 `nvidia-*` wheels `pyproject.toml` pins on Windows (cuBLAS 13.1, cuFFT,
+cuSOLVER, cuSPARSE, nvJitLink, NVRTC 13.0, cuDNN 9.19), and a newer toolkit could
+use functions or PTX those libraries and R580 drivers do not have. Checked on Linux
+against those wheels: they put their DLLs where the patch looks
+(`nvidia\cu13\bin\x86_64`, `nvidia\cudnn\bin`), every DLL they import is among them or
+part of Windows, and the CUDA headers NVRTC needs come from `nvidia-cuda-runtime`
+(`nvidia\cu13\include`) and the CCCL headers the wheel bundles, so no CUDA Toolkit is
+needed to run it. `mlx.dll` needs the Microsoft Visual C++ runtime (`msvcp140.dll`),
+which the Build Tools install.
 
 ## Checking a wheel
 
