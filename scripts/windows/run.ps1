@@ -7,12 +7,9 @@
 #   .\scripts\windows\run.ps1
 #   .\scripts\windows\run.ps1 -v --api-port 52415
 #
-# On a CUDA node the model weights live in GPU memory, but exo reports system RAM
-# to the master by default. Unless OVERRIDE_MEMORY_MB is already set, this script
-# sets it to the GPU's free memory minus a fixed 2.5 GiB reserve (KV cache, prefill
-# logits, CUDA context), so the master never places more on this node than the GPU
-# can hold. Windows does not fail an over-full GPU: it silently spills into shared
-# system memory and generation becomes very slow.
+# On a CUDA node exo reports the GPU's memory to the master by itself (its free
+# memory minus a 2.5 GiB reserve, read through NVML every second). Set
+# OVERRIDE_MEMORY_MB to report a fixed amount instead.
 #
 # In a cluster with macOS nodes, also set EXO_MEMORY_THRESHOLD to the Mac's default
 # (0.70 for a 16 GB Mac, 0.75 for 32 GB, 0.80 for 64 GB+) so every rank evicts the
@@ -34,9 +31,7 @@ if (-not (Test-Path $exo)) {
     Write-Error 'No .venv found. Run `uv sync --python 3.13 --extra mlx-cuda13` first.'
 }
 
-$GpuReserveMiB = 2560
-
-if ((-not $env:OVERRIDE_MEMORY_MB -or -not $env:MLX_PTX_CACHE_DIR) -and (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
+if (-not $env:MLX_PTX_CACHE_DIR -and (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
     # Windows PowerShell 5.1 turns a native command's stderr output into error
     # records, which 'Stop' makes fatal even with 2>$null, and MLX may log there.
     $ErrorActionPreference = 'Continue'
@@ -45,15 +40,8 @@ if ((-not $env:OVERRIDE_MEMORY_MB -or -not $env:MLX_PTX_CACHE_DIR) -and (Get-Com
     $ErrorActionPreference = 'Stop'
     if ($mlxExitCode -eq 0 -and ($mlxInfo | Select-Object -Last 1) -match '^True (\S+)$') {
         $mlxVersion = $Matches[1]
-        if (-not $env:OVERRIDE_MEMORY_MB) {
-            $freeMiB = [int]((nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | Select-Object -First 1).Trim())
-            $env:OVERRIDE_MEMORY_MB = [string][math]::Max(0, $freeMiB - $GpuReserveMiB)
-            Write-Host "CUDA node: reporting $($env:OVERRIDE_MEMORY_MB) MB available (GPU free memory minus $GpuReserveMiB MB)."
-        }
-        if (-not $env:MLX_PTX_CACHE_DIR) {
-            $computeCap = (nvidia-smi --query-gpu=compute_cap --format=csv,noheader | Select-Object -First 1).Trim()
-            $env:MLX_PTX_CACHE_DIR = Join-Path $env:LOCALAPPDATA "exo\mlx-kernel-cache\$mlxVersion-sm$($computeCap -replace '\.', '')"
-        }
+        $computeCap = (nvidia-smi --query-gpu=compute_cap --format=csv,noheader | Select-Object -First 1).Trim()
+        $env:MLX_PTX_CACHE_DIR = Join-Path $env:LOCALAPPDATA "exo\mlx-kernel-cache\$mlxVersion-sm$($computeCap -replace '\.', '')"
     }
 }
 

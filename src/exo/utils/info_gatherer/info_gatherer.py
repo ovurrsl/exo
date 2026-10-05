@@ -8,6 +8,7 @@ from subprocess import CalledProcessError
 from typing import Self, cast
 
 import anyio
+import psutil
 from anyio import fail_after, open_process, to_thread
 from anyio.streams.buffered import BufferedByteReceiveStream
 from loguru import logger
@@ -30,6 +31,7 @@ from exo.shared.types.thunderbolt import (
 from exo.utils.channels import Sender
 from exo.utils.pydantic_ext import TaggedModel
 from exo.utils.task_group import TaskGroup
+from exo.utils.windows_gpu import read_gpu_memory
 
 from .macmon import MacmonMetrics
 from .system_info import (
@@ -369,6 +371,31 @@ def _has_nvml_cuda() -> bool:
         return False
 
 
+# GPU memory a Windows CUDA node leaves out of what it reports, for the KV
+# cache, prefill activations and the CUDA context.
+WINDOWS_GPU_MEMORY_RESERVE = Memory.from_mb(2560)
+
+
+def gather_memory_usage(override_memory: int | None) -> MemoryUsage:
+    """This node's memory as the master should see it.
+
+    System RAM, except on a Windows CUDA node: there the weights and the KV
+    cache live in GPU memory, so it reports the GPU's total memory and its
+    free memory minus WINDOWS_GPU_MEMORY_RESERVE (see read_gpu_memory).
+    OVERRIDE_MEMORY_MB takes precedence everywhere.
+    """
+    gpu = read_gpu_memory() if override_memory is None else None
+    if gpu is None:
+        return MemoryUsage.from_psutil(override_memory=override_memory)
+    swap = psutil.swap_memory()
+    return MemoryUsage.from_bytes(
+        ram_total=gpu.total.in_bytes,
+        ram_available=max(0, gpu.free.in_bytes - WINDOWS_GPU_MEMORY_RESERVE.in_bytes),
+        swap_total=swap.total,
+        swap_available=swap.free,
+    )
+
+
 class NodeBackends(TaggedModel):
     backends: list[Backend]
 
@@ -521,11 +548,14 @@ class InfoGatherer:
             if override_memory_env
             else None
         )
+        if override_memory is None and read_gpu_memory() is not None:
+            logger.info(
+                "Reporting GPU memory as this node's memory, keeping "
+                f"{WINDOWS_GPU_MEMORY_RESERVE.in_mb} MB of it in reserve"
+            )
         while True:
             try:
-                await self.info_sender.send(
-                    MemoryUsage.from_psutil(override_memory=override_memory)
-                )
+                await self.info_sender.send(gather_memory_usage(override_memory))
             except Exception as e:
                 logger.opt(exception=e).warning("Error gathering memory usage")
             await anyio.sleep(memory_poll_rate)

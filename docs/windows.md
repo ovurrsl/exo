@@ -59,17 +59,28 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows\run.ps1
 ```
 
 `run.ps1` passes its arguments to `exo` (for example `-v` or `--api-port`), and on a
-CUDA node it sets two variables unless you set them yourself:
+CUDA node it sets `MLX_PTX_CACHE_DIR` unless you set it yourself: MLX compiles CUDA
+kernels on first use (the first request takes 20-30 s) and caches them under `%TEMP%`,
+which Storage Sense cleans. The script keeps the cache under
+`%LOCALAPPDATA%\exo\mlx-kernel-cache\<mlx version>-sm<compute cap>`.
 
-- `OVERRIDE_MEMORY_MB`: the GPU's free memory minus 2.5 GiB. exo otherwise reports
-  system RAM, and Windows does not fail an over-full GPU: it silently spills into
-  shared system memory and generation becomes very slow. Whether CUDA may spill is
-  the driver's "CUDA - Sysmem Fallback Policy" (NVIDIA Control Panel, Manage 3D
-  settings, globally or for `python.exe`): "Prefer No Sysmem Fallback" makes an
-  allocation that does not fit fail instead.
-- `MLX_PTX_CACHE_DIR`: MLX compiles CUDA kernels on first use (the first request takes
-  20-30 s) and caches them under `%TEMP%`, which Storage Sense cleans. The script keeps
-  the cache under `%LOCALAPPDATA%\exo\mlx-kernel-cache\<mlx version>-sm<compute cap>`.
+### GPU memory
+
+On a CUDA node the model weights and the KV cache live in GPU memory, and Windows does
+not fail an allocation that does not fit: it silently moves it to shared system memory
+and generation becomes very slow. So on Windows exo works with the GPU's memory, read
+through NVML (installed by `--extra mlx-cuda13`) every second:
+
+- It reports the GPU's total memory and its free memory minus 2.5 GiB (for the KV
+  cache, prefill activations and the CUDA context) to the master, which places models
+  by that. Set `OVERRIDE_MEMORY_MB` to report a fixed amount instead.
+- It evicts the prefix cache when less than 1 GiB of GPU memory is free
+  (`EXO_WINDOWS_GPU_MIN_FREE_MB`); every rank of the instance evicts with it. The
+  system RAM threshold (`EXO_MEMORY_THRESHOLD`) still applies as well.
+
+Whether CUDA may spill into shared memory at all is the driver's "CUDA - Sysmem Fallback
+Policy" (NVIDIA Control Panel, Manage 3D settings, globally or for `python.exe`):
+"Prefer No Sysmem Fallback" makes an allocation that does not fit fail instead.
 
 Data, models and logs go to `%LOCALAPPDATA%\exo` unless `EXO_HOME` is set.
 `EXO_MODELS_DIRS` and `EXO_MODELS_READ_ONLY_DIRS` are separated with `;` on Windows.

@@ -22,6 +22,7 @@ from mlx_lm.models.deepseek_v4 import (
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.memory import Memory
+from exo.utils.windows_gpu import read_gpu_memory
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.runner.bootstrap import logger
@@ -45,6 +46,12 @@ def _default_memory_threshold() -> float:
 
 _MEMORY_THRESHOLD = float(
     os.environ.get("EXO_MEMORY_THRESHOLD", _default_memory_threshold())
+)
+
+# On a Windows CUDA node the KV cache lives in GPU memory: evict once less than
+# this much of it is free (see get_memory_used_percentage).
+_WINDOWS_GPU_MIN_FREE = Memory.from_mb(
+    int(os.environ.get("EXO_WINDOWS_GPU_MIN_FREE_MB", "1024"))
 )
 
 
@@ -552,6 +559,12 @@ def get_available_memory() -> Memory:
 
 
 def get_memory_used_percentage() -> float:
+    gpu = read_gpu_memory()
+    if gpu is not None and gpu.free.in_bytes < _WINDOWS_GPU_MIN_FREE.in_bytes:
+        # System RAM says nothing about the GPU memory the KV cache is in.
+        # Report it full: the pressure the cache acts on is the maximum over
+        # ranks, so every rank then evicts together.
+        return 1.0
     mem = psutil.virtual_memory()
     # percent is 0-100
     return float(mem.percent / 100)
