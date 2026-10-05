@@ -126,9 +126,20 @@ netsh int ipv6 set dynamicport tcp start=52500 num=13036
 
 - Run the same exo commit on every node. This branch is based on upstream `main`;
   the macOS nodes should run that commit too.
-- Set `EXO_MEMORY_THRESHOLD` on the Windows node to the Macs' default (0.70 for a
-  16 GB Mac, 0.75 for 32 GB, 0.80 for 64 GB or more), so every rank evicts the prefix
-  cache at the same point; otherwise ranks can disagree mid-collective and stall.
+- Set `EXO_MEMORY_THRESHOLD` on the Windows node to the Macs' default (0.70 below
+  32 GB, 0.75 for 32 GB, 0.80 for 64 GB, 0.85 for 128 GB or more), so every rank evicts
+  the prefix cache at the same point; otherwise ranks can disagree mid-collective and
+  stall.
+- Connect the PC to a Mac with a wired link; Wi-Fi adds milliseconds to every token.
+  The fastest is a USB4/Thunderbolt cable between the two computers' USB4 or
+  Thunderbolt ports: Windows 11 shows it as a "USB4(TM) P2P Network Adapter", which
+  exo reports as a Thunderbolt link so the ring backend prefers it, and the Mac sees
+  it as its Thunderbolt Bridge. (Others measured about 15 Gbit/s between a Mac and a
+  Windows PC this way with an MTU of 9000 on both sides; not yet tried with exo.)
+  Windows puts such an unidentified network in the Public firewall profile, which
+  `allow-firewall.ps1` does not open; mark it Private, e.g.
+  `Set-NetConnectionProfile -InterfaceAlias "Ethernet 3" -NetworkCategory Private`
+  with the adapter's name.
 
 ## Known limitations
 

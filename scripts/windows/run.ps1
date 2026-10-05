@@ -12,8 +12,8 @@
 # OVERRIDE_MEMORY_MB to report a fixed amount instead.
 #
 # In a cluster with macOS nodes, also set EXO_MEMORY_THRESHOLD to the Mac's default
-# (0.70 for a 16 GB Mac, 0.75 for 32 GB, 0.80 for 64 GB+) so every rank evicts the
-# prefix cache at the same point.
+# (0.70 below 32 GB, 0.75 for 32 GB, 0.80 for 64 GB, 0.85 for 128 GB+) so every
+# rank evicts the prefix cache at the same point.
 #
 # MLX compiles CUDA kernels on first use and caches them under %TEMP% by default,
 # where Windows' Storage Sense deletes them; that makes the first request after a

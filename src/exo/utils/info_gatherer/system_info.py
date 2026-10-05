@@ -110,9 +110,13 @@ async def get_network_interfaces() -> list[NetworkInterfaceInfo]:
     """
     interfaces_info: list[NetworkInterfaceInfo] = []
     interface_types = await _get_interface_types_from_networksetup()
+    adapter_descriptions = _windows_adapter_descriptions()
 
     for iface, services in psutil.net_if_addrs().items():
-        iface_type = interface_types.get(iface, _guess_windows_interface_type(iface))
+        iface_type = interface_types.get(
+            iface,
+            _guess_windows_interface_type(iface, adapter_descriptions.get(iface, "")),
+        )
         for service in services:
             match service.family:
                 case socket.AF_INET | socket.AF_INET6:
@@ -149,17 +153,87 @@ _WINDOWS_VIRTUAL_ADAPTER_MARKERS = (
 _WINDOWS_WIFI_DIRECT_NAME = re.compile(r"\*\s*\d+$")
 
 
-def _guess_windows_interface_type(iface: str) -> InterfaceType:
-    """Best-effort interface type from a Windows adapter's friendly name.
+# A cable between two computers' USB4 or Thunderbolt ports is a network
+# adapter whose friendly name is just "Ethernet <n>"; only its driver
+# description tells it apart: "USB4(TM) P2P Network Adapter" (Windows 11's
+# USB4 networking, which Macs' Thunderbolt Bridge connects to) or
+# "Thunderbolt(TM) Networking" (Intel's older Thunderbolt 3 driver). An
+# Ethernet adapter inside a Thunderbolt dock is not matched.
+_WINDOWS_HOST_TO_HOST_LINK = re.compile(r"usb4|thunderbolt\S*\s+network", re.IGNORECASE)
+
+_WINDOWS_NETWORK_CLASS_KEY = (
+    r"SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}"
+)
+_WINDOWS_NETWORK_CONNECTIONS_KEY = (
+    r"SYSTEM\CurrentControlSet\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}"
+)
+
+
+def _windows_adapter_descriptions() -> dict[str, str]:
+    """Windows network adapters' friendly names (as psutil reports them),
+    mapped to their driver descriptions, read from the registry.
+
+    Empty on other platforms or if the registry cannot be read; adapters
+    whose keys cannot be read are left out.
+    """
+    if sys.platform != "win32":
+        return {}
+    import winreg
+
+    try:
+        adapters = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _WINDOWS_NETWORK_CLASS_KEY)
+    except OSError:
+        return {}  # adapter names alone still classify most adapters
+    descriptions_by_id: dict[str, str] = {}
+    with adapters:
+        index = 0
+        while True:
+            try:
+                subkey = winreg.EnumKey(adapters, index)
+            except OSError:
+                break  # no more subkeys
+            index += 1
+            try:
+                with winreg.OpenKey(adapters, subkey) as adapter:
+                    instance_id = str(
+                        winreg.QueryValueEx(adapter, "NetCfgInstanceId")[0]
+                    )
+                    description = str(winreg.QueryValueEx(adapter, "DriverDesc")[0])
+            except OSError:
+                continue  # e.g. the "Properties" subkey, or no access
+            descriptions_by_id[instance_id] = description
+
+    descriptions: dict[str, str] = {}
+    for instance_id, description in descriptions_by_id.items():
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                rf"{_WINDOWS_NETWORK_CONNECTIONS_KEY}\{instance_id}\Connection",
+            ) as connection:
+                name = str(winreg.QueryValueEx(connection, "Name")[0])
+        except OSError:
+            continue  # an adapter without a network connection
+        descriptions[name] = description
+    return descriptions
+
+
+def _guess_windows_interface_type(iface: str, description: str) -> InterfaceType:
+    """Best-effort interface type from a Windows adapter's friendly name and
+    driver description.
 
     Windows has no networksetup equivalent, so names such as "Ethernet 2" and
-    "Wi-Fi" are the only cheap signal. Virtual adapters (Hyper-V/WSL switches,
-    VPN tunnels, VM host-only networks) are reported as "unknown" so placement
-    never prefers them over physical links. Other platforms keep upstream
-    behaviour and report "unknown" for anything networksetup did not classify.
+    "Wi-Fi" are the only cheap signal, except for a USB4/Thunderbolt cable to
+    another computer, which only its description identifies; that is reported
+    as "thunderbolt", the link the ring backend prefers. Virtual adapters
+    (Hyper-V/WSL switches, VPN tunnels, VM host-only networks) are reported as
+    "unknown" so placement never prefers them over physical links. Other
+    platforms keep upstream behaviour and report "unknown" for anything
+    networksetup did not classify.
     """
     if sys.platform != "win32":
         return "unknown"
+    if _WINDOWS_HOST_TO_HOST_LINK.search(description):
+        return "thunderbolt"
     lowered = iface.lower()
     if _WINDOWS_WIFI_DIRECT_NAME.search(iface) or any(
         marker in lowered for marker in _WINDOWS_VIRTUAL_ADAPTER_MARKERS
