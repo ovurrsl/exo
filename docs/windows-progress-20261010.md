@@ -8,10 +8,14 @@ runtime 32 native kontrolü geçti; sonraki kurucu derlemesi dosya kilidi nedeni
 başarısız oldu. Yeni installer ve native Settings kabulü tamamlanmadı.
 **Tüm plan ve kararlı sürüm tamamlanmış değildir.** Varsayılan API portu **52415**.
 
-Yeni ilerleme: API hata/iptal düzeltmeleri, runner lifecycle, cache retention ve
-Windows CI asset düzeltmeleri ayrı dallarda test edildi. İlk fiziksel Qwen
-RAM–CUDA katman aktarımı da geçti; [ölçüm raporu](windows-host-ram-offload-20261010.md)
-küçük deneyin sınırlarını açıklar. Üretim büyük-model offload'u henüz yok.
+Yeni ilerleme: API hata/iptal düzeltmeleri, runner lifecycle, cache retention,
+Windows CI asset ve bağımsız Rust biçim kapısı ayrı dallardan `windows-native`e
+birleştirildi. Birleşik kaynak `a36502ba` üzerinde **728 test geçti**, iki platform
+strict tip kontrolü temiz. Küçük fiziksel Qwen RAM–CUDA katman aktarımı tekrar geçti;
+[ölçüm raporu](windows-host-ram-offload-20261010.md) deneyin sınırlarını açıklar.
+Üretim büyük-model offload'u henüz yok. Kullanıcı Thunderbolt olmadan mevcut LAN
+üzerinden devam etmeyi seçti; Thunderbolt fiziksel kabulü ertelendi.
+[GPU Gen5 x16 ölçümü ve BIOS/ALT_PCIE_MODE rehberi](windows-bios-pcie-20261010.md).
 Thunderbolt kablo bağlantısı OS seviyesinde aktif eş/NIC oluşturmadı;
 [anakart ve Claude dal incelemesi](claude-fork-thunderbolt-20261010.md) mevcut kanıtı içerir.
 
