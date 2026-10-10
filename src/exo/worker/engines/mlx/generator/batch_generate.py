@@ -120,6 +120,11 @@ class ExoBatchGenerator:
             or len(self._mlx_gen._generation_batch) > 0
         )
 
+    @property
+    def has_pending_cancellations(self) -> bool:
+        """Cancelled decode UIDs still awaiting the normal MLX terminal step."""
+        return bool(self._finishing)
+
     def submit(
         self,
         task_params: TextGenerationTaskParams,
