@@ -1,0 +1,30 @@
+# Metadata verified against revision bcaaf7f538adf166c1080a2befdb4f6019f66639.
+# Windows RAM staging remains opt-in and single-node only.
+model_id = "mlx-community/Qwen3-32B-4bit"
+n_layers = 64
+hidden_size = 5120
+num_key_value_heads = 8
+supports_tensor = false
+trust_remote_code = false
+tasks = ["TextGeneration"]
+family = "qwen"
+quantization = "4bit"
+base_model = "Qwen3 32B"
+capabilities = ["text", "thinking", "thinking_toggle"]
+context_length = 40960
+backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
+
+[storage_size]
+in_bytes = 18429667328
+
+[sampling_defaults]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+
+[sampling_defaults.non_thinking]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0

@@ -16,7 +16,13 @@ from exo.utils.windows_gpu import GpuMemory
 from exo.worker.engines.mlx import windows_text_offload as offload
 
 
-def _model(layer_count: int = 2) -> nn.Module:
+def _model(
+    layer_count: int = 2,
+    *,
+    tie_word_embeddings: bool = True,
+    dtype: mx.Dtype = mx.float32,
+    group_size: int = 32,
+) -> nn.Module:
     with mx.stream(mx.Device(mx.cpu)):
         mx.random.seed(7)
         arguments = ModelArgs(
@@ -31,10 +37,11 @@ def _model(layer_count: int = 2) -> nn.Module:
             max_position_embeddings=128,
             rope_theta=10000.0,
             head_dim=16,
-            tie_word_embeddings=True,
+            tie_word_embeddings=tie_word_embeddings,
         )
         model = cast(nn.Module, Qwen3Model(arguments))
-        nn.quantize(model, group_size=32, bits=4)
+        model.set_dtype(dtype)  # pyright: ignore[reportUnknownMemberType]
+        nn.quantize(model, group_size=group_size, bits=4)
         mx.eval(model.parameters())
         return model
 
@@ -198,6 +205,30 @@ def test_cpu_outer_matches_reference_and_restores_parameters(cpu_staging: None) 
             np.testing.assert_allclose(np.array(a), np.array(b), atol=1e-5, rtol=1e-5)
 
 
+def test_discarded_prefill_logits_are_not_eagerly_evaluated(
+    cpu_staging: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapped = _prepare(_model(tie_word_embeddings=False), _policy())
+    original_eval = mx.eval
+
+    def checked_eval(*values: "mx.MX_ARRAY_TREE | None") -> None:
+        if wrapped.stages_closed == 2:
+            assert not any(
+                isinstance(value, mx.array) and value.shape == (1, 3, 128)
+                for value in values
+            ), "discarded prefill logits were evaluated eagerly"
+        original_eval(*values)
+
+    monkeypatch.setattr(mx, "eval", checked_eval)
+    cache = [KVCache(), KVCache()]
+    logits = wrapped(mx.array([[1, 2, 3]]), cache=cache)
+    assert [entry.offset for entry in cache] == [3, 3]
+    assert wrapped.stages_opened == wrapped.stages_closed == 2
+    assert wrapped.active_layer is None
+    original_eval(logits)
+    assert logits.shape == (1, 3, 128)
+
+
 def test_batch_and_long_context_are_rejected(cpu_staging: None) -> None:
     wrapped = _prepare(_model(), _policy())
     with pytest.raises(ValueError, match="batch"):
@@ -256,6 +287,66 @@ def test_stage_failure_restores_host_weights_and_recovers(
 ) -> None:
     wrapped = _prepare(_model(), _policy())
     _exercise_failure_and_recovery(wrapped, monkeypatch)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    os.environ.get("EXO_TEST_WINDOWS_TEXT_OFFLOAD_GPU") != "1",
+    reason="Explicit isolated GPU acceptance required",
+)
+def test_windows_gpu_bfloat16_untied_head_matches_cuda_reference() -> None:
+    # Match the large dense Qwen3 checkpoint: BF16 outer/norm tensors and an
+    # independent affine group64 quantized output head, not tied embedding logits.
+    model = _model(tie_word_embeddings=False, dtype=mx.bfloat16, group_size=64)
+    assert "lm_head" in model
+    head = cast(nn.QuantizedLinear, model["lm_head"])
+    assert cast(mx.array, head["scales"]).dtype == mx.bfloat16
+    original = cast(offload._QwenModel, cast(object, model))  # pyright: ignore[reportPrivateUsage]
+    norm = cast(nn.Module, cast(object, original.model.norm))
+    assert cast(mx.array, norm["weight"]).dtype == mx.bfloat16
+    reference_model = _model(
+        tie_word_embeddings=False, dtype=mx.bfloat16, group_size=64
+    )
+    with mx.stream(mx.Device(mx.gpu)):
+        reference_model.update(
+            cast(
+                dict[str, offload.ParameterTree],
+                offload._map_parameters(  # pyright: ignore[reportPrivateUsage]
+                    cast(offload.ParameterTree, model.parameters()),
+                    lambda value: mx.add(value, mx.zeros_like(value)),
+                ),
+            )
+        )
+        mx.eval(reference_model.parameters())
+        reference_cache = [KVCache(), KVCache()]
+        reference = [
+            _forward(reference_model, tokens, reference_cache)
+            for tokens in ([1, 2, 3], [4], [5])
+        ]
+    wrapped = _prepare(model, _policy())
+    actual_cache = [KVCache(), KVCache()]
+    for tokens, expected in zip(([1, 2, 3], [4], [5]), reference, strict=True):
+        actual = _forward(wrapped, tokens, actual_cache)
+        np.testing.assert_allclose(
+            np.array(actual.astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+            atol=0.03,
+            rtol=0.03,
+        )
+        assert wrapped.active_layer is None
+    assert wrapped.stages_opened == wrapped.stages_closed == 6
+    assert [entry.offset for entry in actual_cache] == [5, 5]
+    for expected_cache, actual_entry in zip(reference_cache, actual_cache, strict=True):
+        for expected_value, actual_value in zip(
+            expected_cache.state, actual_entry.state, strict=True
+        ):
+            assert expected_value is not None and actual_value is not None
+            np.testing.assert_allclose(
+                np.array(actual_value.astype(mx.float32)),
+                np.array(expected_value.astype(mx.float32)),
+                atol=0.03,
+                rtol=0.03,
+            )
 
 
 def test_partial_weight_copy_failure_keeps_canonical_host_parameters(

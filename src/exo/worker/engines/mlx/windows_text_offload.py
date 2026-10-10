@@ -313,11 +313,15 @@ class WindowsQwen3OffloadModel(nn.Module):
         # untied head. Only the replacement decoder layers enter the GPU stream.
         with mx.stream(mx.Device(mx.cpu)):
             logits = cast(_QwenModel, cast(object, self.original))(inputs, cache=cache)
-            mx.eval(logits)
+        # MLX discards intermediate prefill logits. Decoder/cache evaluation is
+        # already complete; keep the canonical CPU head and final copy lazy so
+        # discarded results do not evaluate a vocabulary-sized projection.
         with mx.stream(self.staging.stream):
-            output = self.staging.copy_to_device(logits)
-            mx.synchronize(self.staging.stream)
-            return output
+            return mx.add(
+                logits,
+                mx.zeros_like(logits, stream=self.staging.stream),
+                stream=self.staging.stream,
+            )
 
 
 def prepare_windows_qwen3_offload(

@@ -174,10 +174,27 @@ def load_windows_offloaded_model(
         prepare_windows_qwen3_offload,
     )
 
+    config = cast(
+        object, json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+    )
+    if (
+        not isinstance(config, dict)
+        or cast(dict[str, object], config).get("model_type") != "qwen3"
+        or "model_file" in config
+    ):
+        raise ValueError("Windows text offload requires a built-in Qwen3 model")
+
     # Load primitives must originate on CPU; moving already materialized GPU
     # weights afterward cannot make a model larger than VRAM load successfully.
     with mx.stream(mx.Device(mx.cpu)):
-        model, _ = load_model(model_path, lazy=True, strict=True)
+        # MLX rereads config.json: override both dispatch controls so a changed
+        # file cannot select a custom Python module between validation and use.
+        model, _ = load_model(
+            model_path,
+            lazy=True,
+            strict=True,
+            model_config={"model_type": "qwen3", "model_file": None},
+        )
     return cast(
         Model,
         cast(
@@ -186,6 +203,14 @@ def load_windows_offloaded_model(
                 model, policy, cpu_loaded=True, world_size=1, vision=False
             ),
         ),
+    )
+
+
+def load_windows_offloaded_tokenizer(model_path: Path) -> TokenizerWrapper:
+    # This restricted path must not enter model-ID-specific custom imports or
+    # inherit a card/global setting permitting downloaded Python execution.
+    return load_tokenizer(
+        model_path, tokenizer_config_extra={"trust_remote_code": False}
     )
 
 
@@ -223,6 +248,7 @@ def load_mlx_items(
                 raise ValueError("Windows text offload requires one full pipeline node")
             yield ModelLoadingResponse(layers_loaded=0, total=card.n_layers)
             model = load_windows_offloaded_model(model_path, policy)
+            tokenizer = load_windows_offloaded_tokenizer(model_path)
             yield ModelLoadingResponse(layers_loaded=card.n_layers, total=card.n_layers)
         else:
             model, _ = load_model(model_path, lazy=True, strict=False)
@@ -240,9 +266,9 @@ def load_mlx_items(
                     "Model architecture doesn't support layer-by-layer progress tracking",
                 )
             mx.eval(model)
+            tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
         end_time = time.perf_counter()
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
-        tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
 
     else:
         logger.info("Starting distributed init")

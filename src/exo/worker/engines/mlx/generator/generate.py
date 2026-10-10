@@ -418,7 +418,9 @@ def warmup_inference(
     warmup_task_params = TextGenerationTaskParams(
         model=model_id,
         input=[InputMessage(role="user", content=content)],
-        max_output_tokens=50,
+        max_output_tokens=(
+            2 if isinstance(cast(object, model), WindowsQwen3OffloadModel) else 50
+        ),
         temperature=0.0,
     )
 

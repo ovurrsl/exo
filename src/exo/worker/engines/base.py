@@ -16,6 +16,10 @@ from exo.worker.disaggregated.server import PrefillRequest
 class Engine(ABC):
     _cancelled_tasks: set[TaskId]
 
+    @property
+    def supports_disaggregated_prefill(self) -> bool:
+        return True
+
     def should_cancel(self, task_id: TaskId) -> bool:
         return (
             task_id in self._cancelled_tasks

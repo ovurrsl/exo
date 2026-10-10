@@ -43,8 +43,48 @@ every model fitting physical RAM is supported or that performance equals VRAM.
   and individual labels in expanded multi-variant groups. Prettier check passed.
 - `mlx-community/Qwen3-32B-4bit` revision
   `bcaaf7f538adf166c1080a2befdb4f6019f66639` was selected for large-model acceptance
-  (18,429,667,328 tensor bytes). Download and actual large-model acceptance remain
-  pending. Do not claim production RAM offload acceptance from unit tests.
+  (18,429,667,328 tensor bytes). Download completed; all four large shards passed
+  their pinned LFS SHA-256 checks. Actual large-model acceptance is in progress.
+  Do not claim production RAM offload acceptance from unit tests.
 - The running frozen Windows application still contains the older runtime.
   Rebuilding and replacing the installed runtime is a separate pending step.
 - Mac clustering remains deferred as requested. No Mac Swift files were changed.
+
+## Restricted loader security correction
+
+The opt-in loader previously called MLX before checking the concrete model type.
+MLX can execute a snapshot's `model_file` during that call. A harmless local marker
+test reproduced execution before rejection. The restricted loader now requires a
+flat built-in `qwen3` configuration and rejects any `model_file` field before
+loading. Explicit dispatch overrides also protect MLX's subsequent config reread.
+Its separate tokenizer loader forces `trust_remote_code=False` and bypasses
+model-ID-driven custom Python imports. Existing normal and distributed loaders
+retain their prior paths; the newly introduced 32B card explicitly declines remote
+code as well.
+
+Regression coverage includes custom and parent-relative paths, non-object and
+unsupported configurations, config replacement between validation and use,
+tokenizer `auto_map`, and an offload card whose ID otherwise triggers Kimi imports.
+The malicious marker no longer appears. Real Qwen3-0.6B still produces `Hello!`
+with EOS 151645 and 112 opened/closed stages, no active stage remaining. Independent
+read-only investigation and candidate review found no surviving snapshot-Python
+route in this restricted branch. This is scoped remediation, not a repository-wide
+security audit. The earlier c31 package evidence cannot certify the corrected
+source; packaging must be repeated after the new source freeze.
+
+## Large-model performance correction
+
+The first 32B source run loaded successfully in 37.4 seconds but spent 120.56
+seconds in warmup prefill. A read-only CPU sample confirmed active computation,
+not a stalled peer: the wrapper eagerly evaluated its CPU vocabulary projection
+even for intermediate prefill logits that MLX discards. The corrected wrapper
+keeps that projection and its final GPU copy lazy, while still evaluating decoder
+output and KV state and synchronizing before restoring each staged weight set.
+Only offloaded models use a two-token warmup; ordinary models retain 50 tokens.
+
+In the subsequent local run, the same warmup prefill took 17.33 seconds and the
+runner became ready in 76.57 seconds including loading. This is a single local
+comparison, not a general throughput guarantee. Discarded-logit and warmup
+regressions pass; both real CUDA FP32 and BF16 logits/KV parity tests also pass.
+The first acceptance run was deliberately interrupted and is not a passed test.
+The corrected run is still exercising full HTTP inference and cancellation.
