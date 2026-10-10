@@ -440,13 +440,29 @@ def _check_gpu_capacity(
     # Include copy temporaries, independently of MLX's pinned-host counters.
     if gpu is None:
         raise MemoryError("Insufficient dedicated NVIDIA VRAM for Qwen3 staging")
-    validate_stage_capacity(
-        free_gpu_bytes=gpu.free.in_bytes,
-        layer_bytes=layer_bytes,
-        reserve_bytes=policy.gpu_reserve_bytes
-        if reserve_bytes is None
-        else reserve_bytes,
+    remaining_reserve = (
+        policy.gpu_reserve_bytes if reserve_bytes is None else reserve_bytes
     )
+    try:
+        validate_stage_capacity(
+            free_gpu_bytes=gpu.free.in_bytes,
+            layer_bytes=layer_bytes,
+            reserve_bytes=remaining_reserve,
+        )
+    except MemoryError:
+        # CUDA driver pools can retain freed scratch even with MLX caching off.
+        # Reclaim only on shortfall, then recheck the unchanged bound once.
+        mx.clear_cache()
+        gpu = read_gpu_memory()
+        if gpu is None:
+            raise MemoryError(
+                "NVIDIA VRAM capacity is unavailable after CUDA pool reclamation"
+            ) from None
+        validate_stage_capacity(
+            free_gpu_bytes=gpu.free.in_bytes,
+            layer_bytes=layer_bytes,
+            reserve_bytes=remaining_reserve,
+        )
 
 
 @final

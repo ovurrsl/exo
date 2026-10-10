@@ -898,10 +898,16 @@ def test_capacity_shortfall_reclaims_once_and_rechecks_actual_free(
 ) -> None:
     samples = iter([49, reclaimed_free])
     events: list[str] = []
+
     def read() -> GpuMemory | None:
         events.append("read")
         value = next(samples)
-        return None if value is None else GpuMemory(Memory.from_gb(12), Memory.from_bytes(value))
+        return (
+            None
+            if value is None
+            else GpuMemory(Memory.from_gb(12), Memory.from_bytes(value))
+        )
+
     monkeypatch.setattr(offload, "read_gpu_memory", read)
     monkeypatch.setattr(mx, "clear_cache", lambda: events.append("trim"))
     if reclaimed_free == 50:
@@ -917,9 +923,15 @@ def test_capacity_fit_or_missing_nvml_does_not_trim(
     monkeypatch: pytest.MonkeyPatch, free: int | None
 ) -> None:
     events: list[str] = []
+
     def read() -> GpuMemory | None:
         events.append("read")
-        return None if free is None else GpuMemory(Memory.from_gb(12), Memory.from_bytes(free))
+        return (
+            None
+            if free is None
+            else GpuMemory(Memory.from_gb(12), Memory.from_bytes(free))
+        )
+
     monkeypatch.setattr(offload, "read_gpu_memory", read)
     monkeypatch.setattr(mx, "clear_cache", lambda: events.append("trim"))
     if free is None:
