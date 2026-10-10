@@ -2,6 +2,7 @@ import contextlib
 import os
 from collections.abc import Generator
 from dataclasses import dataclass
+from typing import cast
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -28,6 +29,7 @@ from .utils_mlx import (
     load_mlx_items,
 )
 from .vision import VisionProcessor
+from .windows_text_offload import WindowsQwen3OffloadModel
 
 
 @dataclass
@@ -94,7 +96,9 @@ class MlxBuilder(Builder):
         kv_prefix_cache = KVPrefixCache(self.group, cuda_group=self.cuda_cache_group)
 
         device_rank = 0 if self.group is None else self.group.rank()
-        if os.environ.get("EXO_NO_BATCH"):
+        if os.environ.get("EXO_NO_BATCH") or isinstance(
+            cast(object, self.inference_model), WindowsQwen3OffloadModel
+        ):
             logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(
                 model=self.inference_model,

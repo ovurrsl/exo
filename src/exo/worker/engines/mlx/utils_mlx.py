@@ -42,6 +42,7 @@ from mlx_lm.utils import load_model
 from pydantic import RootModel
 
 from exo.download.download_utils import build_model_path
+from exo.master.windows_text_placement import is_windows_text_offload_card
 from exo.shared.types.common import Host
 from exo.shared.types.memory import Memory
 from exo.shared.types.tasks import TaskId, TextGeneration
@@ -57,6 +58,11 @@ from exo.shared.types.worker.shards import (
     PipelineShardMetadata,
     ShardMetadata,
     TensorShardMetadata,
+)
+from exo.utils.windows_gpu import read_gpu_memory
+from exo.utils.windows_text_offload_config import (
+    WindowsTextOffloadPolicy,
+    read_windows_text_offload_policy,
 )
 from exo.utils.windows_weights import validate_windows_weight_budget
 from exo.worker.engines.mlx.auto_parallel import (
@@ -161,6 +167,28 @@ def initialize_mlx(
     return mlx_distributed_init(bound_instance)
 
 
+def load_windows_offloaded_model(
+    model_path: Path, policy: WindowsTextOffloadPolicy
+) -> Model:
+    from exo.worker.engines.mlx.windows_text_offload import (
+        prepare_windows_qwen3_offload,
+    )
+
+    # Load primitives must originate on CPU; moving already materialized GPU
+    # weights afterward cannot make a model larger than VRAM load successfully.
+    with mx.stream(mx.Device(mx.cpu)):
+        model, _ = load_model(model_path, lazy=True, strict=True)
+    return cast(
+        Model,
+        cast(
+            object,
+            prepare_windows_qwen3_offload(
+                model, policy, cpu_loaded=True, world_size=1, vision=False
+            ),
+        ),
+    )
+
+
 def load_mlx_items(
     bound_instance: BoundInstance,
     group: mx.distributed.Group | None,
@@ -173,21 +201,45 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
-        model, _ = load_model(model_path, lazy=True, strict=False)
-        validate_windows_weight_budget(model)
-        # Eval layers one by one for progress reporting
-        try:
-            inner = get_inner_model(model)
-            layers = get_layers(inner)
-            total = len(layers)
-            for i, layer in enumerate(layers):
-                mx.eval(layer)  # type: ignore
-                yield ModelLoadingResponse(layers_loaded=i, total=total)
-        except ValueError as e:
-            logger.opt(exception=e).debug(
-                "Model architecture doesn't support layer-by-layer progress tracking",
-            )
-        mx.eval(model)
+        card = bound_instance.bound_shard.model_card
+        policy = WindowsTextOffloadPolicy()
+        if sys.platform == "win32" and is_windows_text_offload_card(card):
+            gpu_memory = read_gpu_memory()
+            if (
+                gpu_memory is not None
+                and card.storage_size.in_bytes
+                > gpu_memory.free.in_bytes - policy.gpu_reserve_bytes
+            ):
+                policy = read_windows_text_offload_policy()
+        if policy.enabled and is_windows_text_offload_card(card):
+            if (
+                not isinstance(bound_instance.bound_shard, PipelineShardMetadata)
+                or bound_instance.bound_shard.world_size != 1
+                or bound_instance.bound_shard.start_layer != 0
+                or bound_instance.bound_shard.end_layer != card.n_layers
+                or isinstance(bound_instance.instance, MlxJacclInstance)
+                or len(bound_instance.instance.shard_assignments.node_to_runner) != 1
+            ):
+                raise ValueError("Windows text offload requires one full pipeline node")
+            yield ModelLoadingResponse(layers_loaded=0, total=card.n_layers)
+            model = load_windows_offloaded_model(model_path, policy)
+            yield ModelLoadingResponse(layers_loaded=card.n_layers, total=card.n_layers)
+        else:
+            model, _ = load_model(model_path, lazy=True, strict=False)
+            validate_windows_weight_budget(model)
+            # Eval layers one by one for progress reporting
+            try:
+                inner = get_inner_model(model)
+                layers = get_layers(inner)
+                total = len(layers)
+                for i, layer in enumerate(layers):
+                    mx.eval(layer)  # type: ignore
+                    yield ModelLoadingResponse(layers_loaded=i, total=total)
+            except ValueError as e:
+                logger.opt(exception=e).debug(
+                    "Model architecture doesn't support layer-by-layer progress tracking",
+                )
+            mx.eval(model)
         end_time = time.perf_counter()
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
         tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)

@@ -3,15 +3,17 @@ import contextlib
 import hashlib
 import json
 import random
+import sys
 import time
 from collections.abc import AsyncGenerator, Iterable
 from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, TypedDict, cast
 from uuid import uuid4
 
 import anyio
+import psutil
 from anyio import BrokenResourceError, ClosedResourceError
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -131,6 +133,11 @@ from exo.master.windows_image_placement import (
     cuda_image_instance_memory,
     windows_nodes,
 )
+from exo.master.windows_text_placement import (
+    cuda_text_instance_memory,
+    cuda_text_memory_requirement,
+    local_windows_text_offload_policy,
+)
 from exo.shared.apply import apply
 from exo.shared.constants import (
     DASHBOARD_DIR,
@@ -150,6 +157,7 @@ from exo.shared.models.model_cards import (
     ModelTask,
 )
 from exo.shared.tracing import TraceEvent, compute_stats, export_trace, load_trace_file
+from exo.shared.types.backends import Backend
 from exo.shared.types.chunks import (
     ErrorChunk,
     ImageChunk,
@@ -218,6 +226,20 @@ ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
 _GENERATION_INTERRUPTED_MESSAGE = (
     "The model instance serving this request stopped before it finished"
 )
+
+
+class WindowsModelCapacity(TypedDict):
+    mode: Literal["vram", "ram_offload", "unavailable"]
+    required_bytes: int
+    available_bytes: int
+
+
+class WindowsModelCapacityResponse(TypedDict):
+    models: dict[str, WindowsModelCapacity]
+
+
+def _available_host_memory_bytes() -> int:
+    return int(psutil.virtual_memory().available)
 
 
 def _format_to_content_type(image_format: Literal["png", "jpeg", "webp"] | None) -> str:
@@ -373,6 +395,7 @@ class API:
         self.app.get("/v1/feature-flags")(self.get_feature_flags)
         self.app.get("/models")(self.get_models)
         self.app.get("/v1/models")(self.get_models)
+        self.app.get("/windows/model-capacity")(self.get_windows_model_capacity)
         self.app.post("/models/add")(self.add_custom_model)
         self.app.delete("/models/custom/{model_id:path}")(self.delete_custom_model)
         self.app.get("/models/search")(self.search_models)
@@ -478,6 +501,19 @@ class API:
                 self.state.node_backends,
                 windows_nodes(self.state.node_identities),
             )
+            local_capacity = self.state.node_memory.get(self.node_id)
+            if (
+                local_capacity is None
+                or model_card.storage_size > local_capacity.ram_available
+            ):
+                image_memory = image_memory or cuda_text_instance_memory(
+                    instance,
+                    model_card,
+                    self.state.node_backends,
+                    windows_nodes(self.state.node_identities),
+                    offload_policy=local_windows_text_offload_policy(),
+                    local_node_id=self.node_id,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if image_memory is not None:
@@ -537,6 +573,8 @@ class API:
                 download_status=self.state.downloads,
                 node_rdma_ctl=self.state.node_rdma_ctl,
                 windows_node_ids=windows_nodes(self.state.node_identities),
+                offload_policy=local_windows_text_offload_policy(),
+                local_node_id=self.node_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -603,6 +641,8 @@ class API:
                     download_status=self.state.downloads,
                     node_rdma_ctl=self.state.node_rdma_ctl,
                     windows_node_ids=windows_nodes(self.state.node_identities),
+                    offload_policy=local_windows_text_offload_policy(),
+                    local_node_id=self.node_id,
                 )
             except ValueError as exc:
                 if (model_card.model_id, sharding, instance_meta, 0) not in seen:
@@ -652,6 +692,22 @@ class API:
                     windows_nodes(self.state.node_identities),
                 )
                 total_bytes = (image_memory or model_card.storage_size).in_bytes
+                local_capacity = self.state.node_memory.get(self.node_id)
+                text_memory = (
+                    cuda_text_instance_memory(
+                        instance,
+                        model_card,
+                        self.state.node_backends,
+                        windows_nodes(self.state.node_identities),
+                        offload_policy=local_windows_text_offload_policy(),
+                        local_node_id=self.node_id,
+                    )
+                    if local_capacity is None
+                    or model_card.storage_size > local_capacity.ram_available
+                    else None
+                )
+                if text_memory is not None:
+                    total_bytes = text_memory.in_bytes
                 per_node = total_bytes // len(placement_node_ids)
                 remainder = total_bytes % len(placement_node_ids)
                 for index, node_id in enumerate(sorted(placement_node_ids, key=str)):
@@ -1850,6 +1906,53 @@ class API:
             total_available += memory.ram_available
 
         return total_available
+
+    async def get_windows_model_capacity(self) -> WindowsModelCapacityResponse:
+        if (
+            sys.platform != "win32"
+            or Backend.MlxCuda not in self.state.node_backends.get(self.node_id, [])
+        ):
+            return {"models": {}}
+        capacity = self.state.node_memory.get(self.node_id)
+        available = max(0, capacity.ram_available.in_bytes) if capacity else 0
+        try:
+            policy = local_windows_text_offload_policy()
+        except (ValueError, MemoryError):
+            policy = None
+        host_available = (
+            _available_host_memory_bytes()
+            if policy is not None and policy.enabled
+            else 0
+        )
+        results: dict[str, WindowsModelCapacity] = {}
+        for card in await model_cards.card_cache.list_all():
+            required = card.storage_size.in_bytes
+            mode: Literal["vram", "ram_offload", "unavailable"] = "unavailable"
+            if Backend.MlxCuda in card.backends and required <= available:
+                mode = "vram"
+            elif policy is not None and policy.enabled:
+                try:
+                    staged = cuda_text_memory_requirement(
+                        card,
+                        [self.node_id],
+                        self.state.node_backends,
+                        windows_nodes(self.state.node_identities),
+                        offload_policy=policy,
+                        local_node_id=self.node_id,
+                        host_available_bytes=host_available,
+                    )
+                except ValueError:
+                    staged = None
+                if staged is not None:
+                    required = staged.in_bytes
+                    if required <= available:
+                        mode = "ram_offload"
+            results[str(card.model_id)] = {
+                "mode": mode,
+                "required_bytes": required,
+                "available_bytes": available,
+            }
+        return {"models": results}
 
     async def get_models(self, status: str | None = Query(default=None)) -> ModelList:
         """Returns list of available models, optionally filtered by being downloaded."""

@@ -53,6 +53,7 @@ async def test_create_instance_reports_exact_capacity_without_rounding_admission
         ephemeral_port=1234,
     )
     api = object.__new__(API)
+    api.node_id = node
     api.state = State(
         node_memory={
             node: MemoryUsage.from_bytes(

@@ -36,6 +36,7 @@ def single_node_api() -> tuple[API, Receiver[ForwarderCommand]]:
     topology = Topology()
     topology.add_node(NODE)
     api = object.__new__(API)
+    api.node_id = NODE
     api.state = State(
         topology=topology,
         node_memory={NODE: create_node_memory(10_000_000)},
