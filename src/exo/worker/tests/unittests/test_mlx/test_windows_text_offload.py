@@ -1,6 +1,7 @@
 import os
 import sys
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from typing import cast
 
 import mlx.core as mx
@@ -22,12 +23,13 @@ def _model(
     tie_word_embeddings: bool = True,
     dtype: mx.Dtype = mx.float32,
     group_size: int = 32,
+    hidden_size: int = 64,
 ) -> nn.Module:
     with mx.stream(mx.Device(mx.cpu)):
         mx.random.seed(7)
         arguments = ModelArgs(
             model_type="qwen3",
-            hidden_size=64,
+            hidden_size=hidden_size,
             num_hidden_layers=layer_count,
             intermediate_size=128,
             num_attention_heads=4,
@@ -203,6 +205,64 @@ def test_cpu_outer_matches_reference_and_restores_parameters(cpu_staging: None) 
     for expected, actual in zip(reference_cache, actual_cache, strict=True):
         for a, b in zip(expected.state, actual.state, strict=True):
             np.testing.assert_allclose(np.array(a), np.array(b), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
+@pytest.mark.parametrize("group_size", [32, 64])
+def test_bfloat16_wide_output_projection_matches_float32_dequantized_reference(
+    cpu_staging: None, tie_word_embeddings: bool, group_size: int
+) -> None:
+    # Qwen3-32B's reduction width exposes scalar BF16 accumulation error that
+    # the small-width staging tests cannot detect. Keep the vocabulary small.
+    model = _model(
+        1,
+        tie_word_embeddings=tie_word_embeddings,
+        dtype=mx.bfloat16,
+        group_size=group_size,
+        hidden_size=5120,
+    )
+    inner = cast(offload._QwenModel, cast(object, model)).model  # pyright: ignore[reportPrivateUsage]
+    reference_cache = [KVCache()]
+    hidden_states: list[mx.array] = []
+    for tokens in ([1, 2, 3], [4]):
+        hidden = cast(Callable[..., mx.array], inner)(
+            mx.array([tokens]), cache=reference_cache
+        )
+        mx.eval(hidden, *reference_cache[0].state)
+        hidden_states.append(hidden)
+    projection = (
+        inner.embed_tokens
+        if tie_word_embeddings
+        else cast(nn.Module, cast(dict[str, object], model)["lm_head"])
+    )
+    parameters = cast(dict[str, mx.array], projection.parameters())
+    packed = np.array(parameters["weight"])
+    scales = np.array(parameters["scales"].astype(mx.float32))
+    biases = np.array(parameters["biases"].astype(mx.float32))
+    unpacked = (
+        (packed[:, :, None] >> np.arange(0, 32, 4, dtype=np.uint32)) & 15
+    ).reshape(128, 5120)
+    dequantized = unpacked.astype(np.float32) * np.repeat(
+        scales, group_size, axis=1
+    ) + np.repeat(biases, group_size, axis=1)
+    wrapped = _prepare(model, replace(_policy(), stage_limit_bytes=2 * 1024**2))
+    canonical = cast(dict[str, mx.array], projection.parameters())
+    actual_cache = [KVCache()]
+    for tokens, hidden in zip(([1, 2, 3], [4]), hidden_states, strict=True):
+        expected = np.array(hidden.astype(mx.float32)) @ dequantized.T
+        actual = _forward(wrapped, tokens, actual_cache)
+        np.testing.assert_allclose(
+            np.array(actual.astype(mx.float32)), expected, atol=1e-4, rtol=1e-4
+        )
+        assert actual.dtype == mx.float32
+    assert reference_cache[0].offset == actual_cache[0].offset == 4
+    assert wrapped.stages_opened == wrapped.stages_closed == 2
+    after = cast(dict[str, mx.array], projection.parameters())
+    assert after["weight"] is canonical["weight"]
+    assert after["scales"] is canonical["scales"]
+    assert after["biases"] is canonical["biases"]
+    assert after["weight"].dtype == mx.uint32
+    assert after["scales"].dtype == after["biases"].dtype == mx.bfloat16
 
 
 def test_discarded_prefill_logits_are_not_eagerly_evaluated(

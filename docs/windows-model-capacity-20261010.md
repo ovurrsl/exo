@@ -1,5 +1,11 @@
 # Windows model capacity and experimental RAM offload
 
+**Quality qualification update (11 October):** the earlier oversized-model
+acceptance below exercised fixed prompts at temperature zero. It does not qualify
+normal sampled multilingual chat. A real BF16 CPU output-head numerical regression
+has since been reproduced; VRAM residency is also incomplete. See the
+[research and correction plan](windows-vram-first-quality-research-20261010.md).
+
 The model picker keeps the existing Mac layout and palette. On a single Windows
 CUDA node, normal dedicated-VRAM capacity is green; qualified experimental RAM
 offload is yellow with an explicit `RAM offload` label; insufficient or unsupported
