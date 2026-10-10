@@ -22,20 +22,17 @@ on the CPU. Missing model files or tensors fail strict loading. Unsupported visi
 MoE, Qwen3.5, distributed and tensor-parallel paths are not qualified.
 
 Normal models that fit dedicated VRAM retain the ordinary GPU loading path.
-Offload is not enabled by default while acceptance on an actual >12 GB model is
-pending. Thus the yellow label is a qualified experimental mode, not a claim that
+Offload remains opt-in after acceptance on an actual >12 GB model. Thus the
+yellow label is a qualified experimental mode, not a claim that
 every model fitting physical RAM is supported or that performance equals VRAM.
 
 ## Verification and remaining work
 
-- Python regression: 777 passed, 8 skipped, 191 deselected. After review, the
-  loader was changed to strict loading and all five loader tests passed, including
-  real missing-file and missing-tensor cases.
-- Full Windows and Darwin Python type checks: zero errors before the final strict
-  loader change; targeted checks of that change also passed. Ruff check and format
-  check passed. Nix is unavailable on this Windows machine.
-- Small real CUDA staging/logit/KV parity and failure cleanup were previously
-  exercised. This does not substitute for a model larger than dedicated VRAM.
+- Python regression after the security and performance corrections: 797 passed,
+  8 skipped, 195 deselected. These counts do not treat skipped tests as acceptance.
+- Full Windows and Darwin Python type checks: zero errors. Ruff check and format
+  check passed (335 files). Nix is unavailable on this Windows machine.
+- Real CUDA FP32 and BF16 staging/logit/KV parity and failure cleanup passed.
 - Dashboard production build passed. Svelte check has the same 15 errors and six
   warnings as the unchanged baseline; no new diagnostics were introduced.
 - All 18 dashboard capacity/image-fit/render tests passed, including actual Svelte
@@ -44,10 +41,17 @@ every model fitting physical RAM is supported or that performance equals VRAM.
 - `mlx-community/Qwen3-32B-4bit` revision
   `bcaaf7f538adf166c1080a2befdb4f6019f66639` was selected for large-model acceptance
   (18,429,667,328 tensor bytes). Download completed; all four large shards passed
-  their pinned LFS SHA-256 checks. Actual large-model acceptance is in progress.
-  Do not claim production RAM offload acceptance from unit tests.
-- The running frozen Windows application still contains the older runtime.
-  Rebuilding and replacing the installed runtime is a separate pending step.
+  their pinned LFS SHA-256 checks. Both source and self-contained frozen HTTP
+  acceptance passed: three chats, a 1,222-token input, cancellation followed by
+  another successful chat, and normal runner/node exit (code 0).
+- The corrected runtime was rebuilt from production commit
+  `1d357a6061b3e359616aefe9767118d99c6fbb69`. Its 32 frozen runtime gates passed,
+  including GPU/CPU computation, spawned processes, Unicode paths, a real
+  5.346 GB safetensors file, and local two/three/four-process ring checks.
+  These local ring checks do not establish Mac/Windows cluster acceptance.
+- An unsigned review installer is being packaged separately. Clean installation
+  on a Windows machine without development tools, signing, and release/update
+  publication remain pending.
 - Mac clustering remains deferred as requested. No Mac Swift files were changed.
 
 ## Restricted loader security correction
@@ -69,8 +73,8 @@ The malicious marker no longer appears. Real Qwen3-0.6B still produces `Hello!`
 with EOS 151645 and 112 opened/closed stages, no active stage remaining. Independent
 read-only investigation and candidate review found no surviving snapshot-Python
 route in this restricted branch. This is scoped remediation, not a repository-wide
-security audit. The earlier c31 package evidence cannot certify the corrected
-source; packaging must be repeated after the new source freeze.
+security audit. The earlier c31 package evidence does not certify this source;
+the corrected runtime has its own source freeze and repeated frozen gates.
 
 ## Large-model performance correction
 
@@ -87,4 +91,25 @@ runner became ready in 76.57 seconds including loading. This is a single local
 comparison, not a general throughput guarantee. Discarded-logit and warmup
 regressions pass; both real CUDA FP32 and BF16 logits/KV parity tests also pass.
 The first acceptance run was deliberately interrupted and is not a passed test.
-The corrected run is still exercising full HTTP inference and cancellation.
+The corrected source and self-contained frozen runs both completed HTTP inference
+and cancellation/recovery. The frozen run cleared development resource, dashboard
+and Python path overrides, so it exercised bundled assets. An earlier frozen run
+with inherited development overrides was interrupted and is not a passed test.
+
+## Oversized-model measured acceptance
+
+The frozen report is
+`build/acceptance/qwen3-32b-ram-offload-self-contained-frozen-20261010/inference.json`.
+It records 18,429,667,328 model tensor bytes against 12,820,938,752 physical GPU
+bytes. Peak owned process-tree RSS was 20,986,691,584 bytes (19.55 GiB); minimum
+available system RAM was 6,367,793,152 bytes. Peak **system-wide** GPU usage was
+2,855,944,192 bytes, including desktop/other GPU users; this is not an exclusive
+EXO allocation measurement. Capacity qualified the model as `ram_offload`.
+
+Observed replies included `4` for the arithmetic prompt and `The color of the
+apple is red.` after the long input. Cancellation recovery produced another
+valid greeting. These short fixed-input checks establish functionality on this
+RTX 5070/48 GiB machine, not universal model compatibility or quality evaluation.
+CPU projection and repeated staging make generation substantially slower than
+fully resident GPU inference (approximately 0.11 token/s in the source short-chat
+sample). Longer contexts and other architectures require separate qualification.
