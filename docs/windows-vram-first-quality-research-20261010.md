@@ -162,3 +162,13 @@ Ham kayıtlar ignored `build/acceptance/qwen3-32b-sampled-quality-a567c59b/` ve
 `qwen3-32b-thinking-cancel-quality-a567c59b/` dizinlerinde. Açık masaüstü uygulaması
 henüz bu yeni kaynağa paketlenmedi; runtime yenilenmeden aynı düzeltmeyi içerdiği
 söylenemez. Kalıcı VRAM yerleşimi ve paket kabulü açık kalıyor.
+
+### Düşünce kanalı düzeltmesi — `ff59455b`
+
+Terminal token artık açık düşünce bloğunu kendiliğinden kapatmıyor; tam kapanış
+etiketi varsa etiket yutulurken finish/usage olayı korunuyor. Default suite
+816 geçti, 8 atlandı, 195 dışlandı; Windows/Darwin strict types ve Ruff temiz.
+Gerçek 32B modelinde 8-token sınırıyla `finish_reason=length`, boş `content` ve
+`reasoning_content="\nOkay, the user is asking"` alındı. Düğüm ve runner exit 0.
+Bu, yarım düşüncenin cevaba sızmadığını doğrular; tamamlanmış thinking cevabı
+kabulü değildir. Ham kayıt: `build/acceptance/qwen3-32b-truncated-reasoning-ff59455b/`.
