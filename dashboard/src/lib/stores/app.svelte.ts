@@ -50,6 +50,7 @@ export interface NodeInfo {
   last_macmon_update: number;
   friendly_name?: string;
   os_version?: string;
+  backends?: string[];
 }
 
 export interface TopologyEdge {
@@ -234,6 +235,7 @@ interface RawStateResponse {
   // New granular node state fields
   nodeIdentities?: Record<string, RawNodeIdentity>;
   nodeMemory?: Record<string, RawMemoryUsage>;
+  nodeBackends?: Record<string, string[]>;
   nodeSystem?: Record<string, RawSystemPerformanceProfile>;
   nodeNetwork?: Record<string, RawNodeNetworkInfo>;
   // Thunderbolt identifiers per node
@@ -373,6 +375,7 @@ const DEFAULT_IMAGE_PARAMS: ImageGenerationParams = {
 interface GranularNodeState {
   nodeIdentities?: Record<string, RawNodeIdentity>;
   nodeMemory?: Record<string, RawMemoryUsage>;
+  nodeBackends?: Record<string, string[]>;
   nodeSystem?: Record<string, RawSystemPerformanceProfile>;
   nodeNetwork?: Record<string, RawNodeNetworkInfo>;
 }
@@ -465,6 +468,7 @@ function transformTopology(
       last_macmon_update: Date.now() / 1000,
       friendly_name: identity?.friendlyName,
       os_version: identity?.osVersion,
+      backends: granularState.nodeBackends?.[nodeId],
     };
   }
 
@@ -1317,6 +1321,7 @@ class AppStore {
         this.topologyData = transformTopology(data.topology, {
           nodeIdentities: data.nodeIdentities,
           nodeMemory: data.nodeMemory,
+          nodeBackends: data.nodeBackends,
           nodeSystem: data.nodeSystem,
           nodeNetwork: data.nodeNetwork,
         });

@@ -75,6 +75,7 @@
   import { tweened } from "svelte/motion";
   import { cubicInOut, cubicOut } from "svelte/easing";
   import { onMount } from "svelte";
+  import { getWindowsCudaImageFitStatus } from "$lib/utils/windows-image-fit";
 
   const chatStarted = $derived(hasStartedChat());
   const minimized = $derived(isTopologyMinimized());
@@ -1213,6 +1214,18 @@
     storage_size_megabytes?: number;
   }): ModelMemoryFitStatus {
     const modelSizeGB = getModelSizeGB(model);
+    const windowsImageFit = getWindowsCudaImageFitStatus(
+      model.id,
+      data?.nodes ?? {},
+      downloadsData,
+      {
+        minNodes: selectedMinNodes,
+        instanceType: selectedInstanceType,
+        nodeFilter,
+        modelStorageBytes: modelSizeGB * 1024 * 1024 * 1024,
+      },
+    );
+    if (windowsImageFit !== null) return windowsImageFit;
     if (modelSizeGB <= availableMemoryGB()) {
       return "fits_now";
     }
