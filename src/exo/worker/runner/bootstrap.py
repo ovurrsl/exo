@@ -96,7 +96,7 @@ def entrypoint(
         raise SystemExit(1) from e
     finally:
         try:
-            event_sender.close()
+            event_sender.close(graceful=True)
             task_receiver.close()
         finally:
             event_sender.join()

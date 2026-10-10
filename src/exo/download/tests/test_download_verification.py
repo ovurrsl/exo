@@ -1,5 +1,6 @@
 """Tests for download verification and cache behavior."""
 
+import hashlib
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -26,6 +27,36 @@ def model_id() -> ModelId:
 
 class TestFileVerification:
     """Tests for file size verification in _download_file."""
+
+    async def test_completed_partial_retains_snapshot_revision(
+        self, tmp_path: Path
+    ) -> None:
+        from exo.download.download_utils import (
+            _download_file,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        content = b"already downloaded and verified bytes"
+        (tmp_path / "model.safetensors.partial").write_bytes(content)
+        commit = "a" * 40
+        with (
+            patch(
+                "exo.download.download_utils.file_meta",
+                new_callable=AsyncMock,
+                return_value=(len(content), hashlib.sha256(content).hexdigest()),
+            ),
+            patch(
+                "exo.download.download_utils._resolved_snapshot_revision",
+                new_callable=AsyncMock,
+                return_value=commit,
+            ) as revision,
+        ):
+            await _download_file(
+                ModelId("test-org/test-model"), "main", "model.safetensors", tmp_path
+            )
+        revision.assert_awaited_once()
+        assert (
+            tmp_path / ".exo-revisions/model.safetensors.revision"
+        ).read_text().strip() == commit
 
     async def test_redownload_when_file_size_changes_upstream(
         self, model_id: ModelId, tmp_path: Path

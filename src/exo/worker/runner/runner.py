@@ -1,4 +1,5 @@
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -338,13 +339,26 @@ class Runner:
 
         self.submit_generation(starting_task)
 
+        windows_progress_time = time.monotonic()
+
         while self.active_tasks:
             results = self.generator.step()
+
+            # Non-output ranks still report forward progress to the Windows
+            # supervisor. Reuse the existing event instead of changing the wire.
+            if (
+                sys.platform == "win32"
+                and time.monotonic() - windows_progress_time >= 1
+            ):
+                self.update_status(RunnerRunning())
+                windows_progress_time = time.monotonic()
 
             finished: list[TaskId] = []
             for task_id, result in results:
                 match result:
                     case CancelledResponse():
+                        if sys.platform == "win32":
+                            self.send_task_status(task_id, TaskStatus.Cancelled)
                         finished.append(task_id)
                     case FinishedResponse():
                         self.send_task_status(task_id, TaskStatus.Complete)

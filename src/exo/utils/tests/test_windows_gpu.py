@@ -21,6 +21,7 @@ class _FakeNvml:
         self.free = free
         self.inits = 0
         self.failing = False
+        self.device_count = 1
 
     def module(self) -> types.ModuleType:
         nvml = types.ModuleType("pynvml")
@@ -29,6 +30,8 @@ class _FakeNvml:
             nvmlInit=self._init,
             nvmlDeviceGetHandleByIndex=self._handle_by_index,
             nvmlDeviceGetMemoryInfo=self._memory_info,
+            nvmlDeviceGetCount=lambda: self.device_count,
+            nvmlShutdown=lambda: None,
         )
         return nvml
 
@@ -98,3 +101,24 @@ def test_without_nvidia_ml_py_reads_as_unknown():
         mock.patch.dict(sys.modules, {"pynvml": None}),
     ):
         assert _GpuMemoryReader().read() is None
+
+
+def test_multiple_devices_are_not_guessed():
+    nvml = _FakeNvml(total=8, free=4)
+    nvml.device_count = 2
+    assert _read(_GpuMemoryReader(), "win32", nvml) is None
+
+
+def test_cuda_device_remapping_is_rejected():
+    nvml = _FakeNvml(total=8, free=4)
+    with mock.patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "1"}):
+        assert _read(_GpuMemoryReader(), "win32", nvml) is None
+
+
+def test_gpu_loss_retains_only_the_diagnostic_total():
+    nvml = _FakeNvml(total=8, free=4)
+    reader = _GpuMemoryReader()
+    assert _read(reader, "win32", nvml) is not None
+    nvml.failing = True
+    assert _read(reader, "win32", nvml) is None
+    assert reader.last_total == Memory.from_bytes(8)

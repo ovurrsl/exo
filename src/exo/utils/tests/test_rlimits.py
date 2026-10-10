@@ -1,4 +1,6 @@
 import sys
+from importlib import import_module
+from typing import Protocol, cast
 from unittest import mock
 
 import pytest
@@ -6,9 +8,22 @@ import pytest
 from exo.utils.rlimits import install_windows_resource_shim, raise_nofile_limit
 
 
+class _ResourceApi(Protocol):
+    RLIMIT_NOFILE: int
+
+    def getrlimit(self, resource: int) -> tuple[int, int]: ...
+
+    def setrlimit(self, resource: int, limits: tuple[int, int]) -> None: ...
+
+
+def _resource_api() -> _ResourceApi:
+    # The actual POSIX module and Windows shim expose this same small API.
+    return cast(_ResourceApi, cast(object, import_module("resource")))
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX resource limits")
 def test_raise_nofile_limit_raises_soft_limit_up_to_hard_limit():
-    import resource
+    resource = _resource_api()
 
     with (
         mock.patch.object(resource, "getrlimit", return_value=(256, 4096)),
@@ -37,7 +52,7 @@ def test_windows_resource_shim_reports_the_ucrt_descriptor_cap():
         sys.modules.pop("resource", None)
         install_windows_resource_shim()
 
-        import resource
+        resource = _resource_api()
 
         assert resource.getrlimit(resource.RLIMIT_NOFILE) == (8192, 8192)
         resource.setrlimit(resource.RLIMIT_NOFILE, (1, 1))

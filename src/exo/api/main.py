@@ -125,6 +125,10 @@ from exo.api.types.openai_responses import (
 )
 from exo.master.image_store import ImageStore
 from exo.master.placement import place_instance as get_instance_placements
+from exo.master.windows_image_placement import (
+    cuda_image_instance_memory,
+    windows_nodes,
+)
 from exo.shared.apply import apply
 from exo.shared.constants import (
     DASHBOARD_DIR,
@@ -448,6 +452,20 @@ class API:
         model_card = await ModelCard.load(instance.shard_assignments.model_id)
         required_memory = model_card.storage_size
         available_memory = self._calculate_total_available_memory()
+        try:
+            image_memory = cuda_image_instance_memory(
+                instance,
+                model_card,
+                self.state.node_backends,
+                windows_nodes(self.state.node_identities),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if image_memory is not None:
+            required_memory = image_memory
+            node_id = next(iter(instance.shard_assignments.node_to_runner))
+            capacity = self.state.node_memory.get(node_id)
+            available_memory = capacity.ram_available if capacity else Memory()
 
         if required_memory > available_memory:
             raise HTTPException(
@@ -490,6 +508,7 @@ class API:
                 current_instances=self.state.instances,
                 download_status=self.state.downloads,
                 node_rdma_ctl=self.state.node_rdma_ctl,
+                windows_node_ids=windows_nodes(self.state.node_identities),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -555,6 +574,7 @@ class API:
                     required_nodes=required_nodes,
                     download_status=self.state.downloads,
                     node_rdma_ctl=self.state.node_rdma_ctl,
+                    windows_node_ids=windows_nodes(self.state.node_identities),
                 )
             except ValueError as exc:
                 if (model_card.model_id, sharding, instance_meta, 0) not in seen:
@@ -597,7 +617,13 @@ class API:
 
             memory_delta_by_node: dict[str, int] = {}
             if placement_node_ids:
-                total_bytes = model_card.storage_size.in_bytes
+                image_memory = cuda_image_instance_memory(
+                    instance,
+                    model_card,
+                    self.state.node_backends,
+                    windows_nodes(self.state.node_identities),
+                )
+                total_bytes = (image_memory or model_card.storage_size).in_bytes
                 per_node = total_bytes // len(placement_node_ids)
                 remainder = total_bytes % len(placement_node_ids)
                 for index, node_id in enumerate(sorted(placement_node_ids, key=str)):

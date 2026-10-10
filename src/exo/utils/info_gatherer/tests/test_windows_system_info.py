@@ -2,12 +2,15 @@ import importlib
 import socket
 import sys
 import types
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 from subprocess import CompletedProcess
 from typing import NamedTuple, Self
 from unittest import mock
 
 import psutil
+import pytest
+from anyio import sleep_forever
 
 from exo.utils.info_gatherer import system_info
 
@@ -167,13 +170,21 @@ async def test_adapter_names_are_not_guessed_on_linux():
 
 
 def _fake_run_process(calls: list[str], returncode: int):
-    outputs = {"powershell": b"ROG STRIX Z890-I\r\n", "nvidia-smi": b"RTX 5070\r\n"}
+    outputs = {
+        "powershell.exe": b"ROG STRIX Z890-I\r\n",
+        "nvidia-smi.exe": b"RTX 5070\r\n",
+    }
 
     async def run_process(
-        command: Sequence[str], *, check: bool
+        command: Sequence[str], *, check: bool, creationflags: int
     ) -> CompletedProcess[bytes]:
-        calls.append(command[0])
-        return CompletedProcess(list(command), returncode, outputs[command[0]], b"")
+        assert not check
+        assert creationflags == 0x08000000
+        name = Path(command[0]).name.lower()
+        if name == "powershell.exe":
+            assert "-NonInteractive" in command
+        calls.append(name)
+        return CompletedProcess(list(command), returncode, outputs[name], b"")
 
     return run_process
 
@@ -185,12 +196,22 @@ async def test_windows_model_and_gpu_name_are_looked_up_once():
     with (
         mock.patch.object(sys, "platform", "win32"),
         mock.patch.object(system_info, "run_process", _fake_run_process(calls, 0)),
+        mock.patch.object(
+            system_info,
+            "_windows_system_directory",
+            return_value=Path.cwd() / "trusted-system",
+        ),
+        mock.patch.object(
+            system_info,
+            "_windows_gpu_executable",
+            return_value=Path.cwd() / "trusted-system" / "nvidia-smi.exe",
+        ),
     ):
         first = await system_info.get_model_and_chip()
         second = await system_info.get_model_and_chip()
 
     assert first == second == ("ROG STRIX Z890-I", "RTX 5070")
-    assert calls == ["powershell", "nvidia-smi"]
+    assert calls == ["powershell.exe", "nvidia-smi.exe"]
 
 
 async def test_failed_windows_lookups_are_retried():
@@ -200,11 +221,115 @@ async def test_failed_windows_lookups_are_retried():
     with (
         mock.patch.object(sys, "platform", "win32"),
         mock.patch.object(system_info, "run_process", _fake_run_process(calls, 1)),
+        mock.patch.object(
+            system_info,
+            "_windows_system_directory",
+            return_value=Path.cwd() / "trusted-system",
+        ),
+        mock.patch.object(
+            system_info,
+            "_windows_gpu_executable",
+            return_value=Path.cwd() / "trusted-system" / "nvidia-smi.exe",
+        ),
     ):
         await system_info.get_model_and_chip()
         await system_info.get_model_and_chip()
 
-    assert calls == ["powershell", "nvidia-smi", "powershell", "nvidia-smi"]
+    assert calls == [
+        "powershell.exe",
+        "nvidia-smi.exe",
+        "powershell.exe",
+        "nvidia-smi.exe",
+    ]
+
+
+@pytest.mark.parametrize(
+    "lookup",
+    [
+        system_info._query_windows_computer_model,  # pyright: ignore[reportPrivateUsage]
+        system_info._query_windows_gpu_name,  # pyright: ignore[reportPrivateUsage]
+    ],
+)
+async def test_stalled_windows_lookup_returns_unknown_after_deadline(
+    lookup: Callable[[], Awaitable[str | None]],
+) -> None:
+    async def blocked_process(
+        _command: Sequence[str], *, check: bool, creationflags: int
+    ) -> CompletedProcess[bytes]:
+        assert not check
+        assert creationflags == 0x08000000
+        await sleep_forever()
+        raise AssertionError("A blocked subprocess unexpectedly completed")
+
+    with (
+        mock.patch.object(system_info, "sys", types.SimpleNamespace(platform="win32")),
+        mock.patch.object(system_info, "run_process", blocked_process),
+        mock.patch.object(system_info, "_WINDOWS_QUERY_TIMEOUT", 0.01),
+        mock.patch.object(
+            system_info,
+            "_windows_system_directory",
+            return_value=Path.cwd() / "trusted-system",
+        ),
+        mock.patch.object(
+            system_info,
+            "_windows_gpu_executable",
+            return_value=Path.cwd() / "trusted-system" / "nvidia-smi.exe",
+        ),
+    ):
+        assert await lookup() is None
+
+
+async def test_windows_queries_do_not_resolve_executables_from_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    trusted_system = tmp_path / "protected-system"
+    trusted_system.mkdir()
+    (trusted_system / "nvidia-smi.exe").write_bytes(b"trusted driver helper")
+    working_directory = tmp_path / "untrusted-working-directory"
+    working_directory.mkdir()
+    for name in ("powershell.exe", "nvidia-smi.exe"):
+        (working_directory / name).write_bytes(b"untrusted executable")
+    monkeypatch.chdir(working_directory)
+    monkeypatch.setattr(system_info, "sys", types.SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(
+        system_info, "_windows_system_directory", lambda: trusted_system
+    )
+    commands: list[str] = []
+
+    async def run_process(
+        command: Sequence[str], *, check: bool, creationflags: int
+    ) -> CompletedProcess[bytes]:
+        commands.append(command[0])
+        return CompletedProcess(list(command), 0, b"test hardware\n", b"")
+
+    monkeypatch.setattr(system_info, "run_process", run_process)
+    await system_info._query_windows_computer_model()  # pyright: ignore[reportPrivateUsage]
+    await system_info._query_windows_gpu_name()  # pyright: ignore[reportPrivateUsage]
+    assert commands == [
+        str(trusted_system / "WindowsPowerShell" / "v1.0" / "powershell.exe"),
+        str(trusted_system / "nvidia-smi.exe"),
+    ]
+
+
+def test_legacy_nvidia_helper_uses_the_protected_program_files_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    system = tmp_path / "protected-system"
+    system.mkdir()
+    program_files = tmp_path / "protected-program-files"
+    legacy = program_files / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy protected NVIDIA executable")
+
+    def known_folder(_system: Path) -> Path:
+        return program_files
+
+    monkeypatch.setattr(system_info, "_windows_program_files_directory", known_folder)
+    find_executable = system_info._windows_gpu_executable  # pyright: ignore[reportPrivateUsage]
+    assert find_executable(system) == legacy
+    current = system / "nvidia-smi.exe"
+    current.write_bytes(b"current protected NVIDIA executable")
+    assert find_executable(system) == current
 
 
 def test_windows_os_version():

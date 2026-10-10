@@ -2,14 +2,16 @@ import asyncio
 import hashlib
 import os
 import random
+import re
 import shutil
 import ssl
 import time
 import traceback
 from collections.abc import Awaitable, Mapping
+from contextlib import AbstractContextManager
 from datetime import timedelta
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, Protocol, cast
 from urllib.parse import urljoin
 
 import aiofiles
@@ -284,7 +286,7 @@ def _scan_model_directory(
     referenced by the index that is missing on disk gets ``size=None``.
     """
     index_files = list(model_dir.glob("**/*.safetensors.index.json"))
-    if not index_files:
+    if not index_files and not _valid_monolithic_weights(model_dir):
         return None
 
     entries_by_path: dict[str, FileListEntry] = {}
@@ -317,7 +319,23 @@ def _scan_model_directory(
                 index_file.read_text()
             )
             relative_dir = index_file.parent.relative_to(model_dir)
-            for filename in set(index_data.weight_map.values()):
+            referenced_files = set(index_data.weight_map.values())
+            if not referenced_files:
+                return None
+            # Some HF quantized conversions retain the original sharded index
+            # alongside a complete new model.safetensors. Prefer that complete
+            # monolithic file only when no original shard has been downloaded.
+            if (
+                referenced_files
+                and "model.safetensors" not in referenced_files
+                and not any(
+                    (index_file.parent / filename).exists()
+                    for filename in referenced_files
+                )
+                and _valid_monolithic_weights(index_file.parent)
+            ):
+                continue
+            for filename in referenced_files:
                 rel_path = (
                     str(relative_dir / filename)
                     if relative_dir != Path(".")
@@ -329,10 +347,34 @@ def _scan_model_directory(
                         path=rel_path,
                         size=None,
                     )
-        except Exception:
-            continue
+        except (ValueError, OSError):
+            return None
 
     return list(entries_by_path.values())
+
+
+class _TensorKeys(Protocol):
+    def keys(self) -> list[str]: ...
+
+
+def _valid_monolithic_weights(model_dir: Path) -> bool:
+    """Validate a complete single-file conversion without materializing arrays."""
+    weight_file = model_dir / "model.safetensors"
+    if not (model_dir / "config.json").is_file() or not weight_file.is_file():
+        return False
+    if list(model_dir.glob("*.safetensors")) != [weight_file]:
+        return False
+    try:
+        from safetensors import safe_open
+
+        open_header = cast(
+            Callable[[str, str], AbstractContextManager[_TensorKeys]], safe_open
+        )
+        with open_header(str(weight_file), "numpy") as tensors:
+            return bool(tensors.keys())
+    except Exception as error:
+        logger.debug(f"Incomplete monolithic weights at {weight_file}: {error}")
+        return False
 
 
 def is_model_directory_complete(model_dir: Path, card: ModelCard | None = None) -> bool:
@@ -617,6 +659,27 @@ async def file_meta(
         return content_length, etag
 
 
+async def _resolved_snapshot_revision(
+    model_id: ModelId, revision: str, path: str
+) -> str | None:
+    """Recover provenance when a fully downloaded partial needs no GET."""
+    if re.fullmatch(r"[0-9a-f]{40}", revision):
+        return revision
+    url = urljoin(f"{get_hf_endpoint()}/{model_id}/resolve/{revision}/", path)
+    headers = await get_download_headers()
+    async with (
+        create_http_session(timeout_profile="short") as session,
+        session.head(url, headers=headers) as response,
+    ):
+        response.raise_for_status()
+        commit = response.headers.get("X-Repo-Commit")
+        return (
+            commit
+            if commit is not None and re.fullmatch(r"[0-9a-f]{40}", commit)
+            else None
+        )
+
+
 async def download_file_with_retry(
     model_id: ModelId,
     revision: str,
@@ -709,6 +772,7 @@ async def _download_file(
         if (await aios.path.exists(partial_path))
         else None
     )
+    snapshot_revision: str | None = None
     if resume_byte_pos != length:
         url = urljoin(f"{get_hf_endpoint()}/{model_id}/resolve/{revision}/", path)
         headers = await get_download_headers()
@@ -732,6 +796,10 @@ async def _download_file(
             assert r.status in [200, 206], (
                 f"Failed to download {path} from {url}: {r.status}"
             )
+            for response in (*r.history, r):
+                if (commit := response.headers.get("X-Repo-Commit")) is not None:
+                    snapshot_revision = commit
+                    break
             async with aiofiles.open(
                 partial_path, "ab" if resume_byte_pos else "wb"
             ) as f:
@@ -751,9 +819,18 @@ async def _download_file(
         raise Exception(
             f"Downloaded file {target_dir / path} has hash {final_hash} but remote hash is {remote_hash}"
         )
+    if resume_byte_pos == length:
+        snapshot_revision = await _resolved_snapshot_revision(model_id, revision, path)
     # replace (not rename): on Windows rename raises FileExistsError when the
     # target already exists, e.g. when re-downloading a corrupted file.
     await aios.replace(partial_path, target_dir / path)
+    if isinstance(snapshot_revision, str) and re.fullmatch(
+        r"[0-9a-f]{40}", snapshot_revision
+    ):
+        revision_path = target_dir / ".exo-revisions" / f"{path}.revision"
+        await aios.makedirs(revision_path.parent, exist_ok=True)
+        async with aiofiles.open(revision_path, "w", encoding="utf-8") as revision_file:
+            await revision_file.write(snapshot_revision + "\n")
     on_progress(length, length, True)
     return target_dir / path
 

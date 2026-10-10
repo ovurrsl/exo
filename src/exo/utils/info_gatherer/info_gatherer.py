@@ -31,7 +31,8 @@ from exo.shared.types.thunderbolt import (
 from exo.utils.channels import Sender
 from exo.utils.pydantic_ext import TaggedModel
 from exo.utils.task_group import TaskGroup
-from exo.utils.windows_gpu import read_gpu_memory
+from exo.utils.windows_cuda_health import probe_windows_cuda
+from exo.utils.windows_gpu import last_known_gpu_total, read_gpu_memory
 
 from .macmon import MacmonMetrics
 from .system_info import (
@@ -358,7 +359,7 @@ async def _gather_iface_map() -> dict[str, str] | None:
 
 def _has_nvml_cuda() -> bool:
     try:
-        import pynvml as nvml  # pyright: ignore[reportMissingModuleSource]
+        import pynvml as nvml
     except ImportError:
         return False
     try:
@@ -382,17 +383,33 @@ def gather_memory_usage(override_memory: int | None) -> MemoryUsage:
     System RAM, except on a Windows CUDA node: there the weights and the KV
     cache live in GPU memory, so it reports the GPU's total memory and its
     free memory minus WINDOWS_GPU_MEMORY_RESERVE (see read_gpu_memory).
-    OVERRIDE_MEMORY_MB takes precedence everywhere.
+    On Windows an override can reduce that budget, but cannot exceed it.
     """
-    gpu = read_gpu_memory() if override_memory is None else None
-    if gpu is None:
+    if sys.platform != "win32":
         return MemoryUsage.from_psutil(override_memory=override_memory)
-    swap = psutil.swap_memory()
+    return _windows_memory_usage(override_memory)
+
+
+def _windows_memory_usage(override_memory: int | None) -> MemoryUsage:
+    gpu = read_gpu_memory()
+    available = (
+        max(0, gpu.free.in_bytes - WINDOWS_GPU_MEMORY_RESERVE.in_bytes)
+        if gpu is not None
+        else 0
+    )
+    if override_memory is not None:
+        available = min(available, max(0, override_memory))
+    try:
+        swap = psutil.swap_memory()
+        swap_total, swap_available = swap.total, swap.free
+    except (OSError, RuntimeError):
+        # Swap is an optional diagnostic, never a fallback CUDA weight budget.
+        swap_total, swap_available = 0, 0
     return MemoryUsage.from_bytes(
-        ram_total=gpu.total.in_bytes,
-        ram_available=max(0, gpu.free.in_bytes - WINDOWS_GPU_MEMORY_RESERVE.in_bytes),
-        swap_total=swap.total,
-        swap_available=swap.free,
+        ram_total=(gpu.total if gpu is not None else last_known_gpu_total()).in_bytes,
+        ram_available=available,
+        swap_total=swap_total,
+        swap_available=swap_available,
     )
 
 
@@ -401,6 +418,13 @@ class NodeBackends(TaggedModel):
 
     @classmethod
     async def gather(cls) -> Self:
+        if sys.platform == "win32":
+            # Probe checkpoints observe task cancellation and kill/reap leaves
+            # before this non-abandoned worker thread returns to shutdown.
+            health = await to_thread.run_sync(probe_windows_cuda)
+            if not health.available:
+                logger.warning(f"Windows CUDA backend unavailable: {health.reason}")
+            return cls(backends=[Backend.MlxCuda] if health.available else [])
         backends: list[Backend] = [Backend.MlxCpu]
         if IS_DARWIN:
             backends.append(Backend.MlxMetal)
@@ -408,8 +432,7 @@ class NodeBackends(TaggedModel):
             backends.append(Backend.MlxCuda)
             # vLLM has no native Windows build; advertising it would let the
             # master place vLLM instances on a node that cannot run them.
-            if sys.platform != "win32":
-                backends.append(Backend.Vllm)
+            backends.append(Backend.Vllm)
         return cls(backends=backends)
 
 
@@ -484,15 +507,27 @@ class InfoGatherer:
             tg.start_soon(self._monitor_misc, 60)
             tg.start_soon(self._monitor_static_info, 60)
             tg.start_soon(self._monitor_disk_usage, 30)
+            if sys.platform == "win32":
+                tg.start_soon(self._monitor_windows_backends, 30)
 
             nc = await NodeConfig.gather()
             if nc is not None:
                 await self.info_sender.send(nc)
 
-            await self.info_sender.send(await NodeBackends.gather())
+            if sys.platform != "win32":
+                await self.info_sender.send(await NodeBackends.gather())
 
     def shutdown(self):
         self._tg.cancel_tasks()
+
+    async def _monitor_windows_backends(self, poll_interval: float) -> None:
+        previous: NodeBackends | None = None
+        while True:
+            current = await NodeBackends.gather()
+            if current != previous:
+                await self.info_sender.send(current)
+                previous = current
+            await anyio.sleep(poll_interval)
 
     async def _monitor_static_info(self, static_info_poll_interval: float):
         while True:

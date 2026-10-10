@@ -58,6 +58,7 @@ from exo.shared.types.worker.shards import (
     ShardMetadata,
     TensorShardMetadata,
 )
+from exo.utils.windows_weights import validate_windows_weight_budget
 from exo.worker.engines.mlx.auto_parallel import (
     get_inner_model,
     get_layers,
@@ -173,6 +174,7 @@ def load_mlx_items(
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
         model, _ = load_model(model_path, lazy=True, strict=False)
+        validate_windows_weight_budget(model)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -219,6 +221,12 @@ def load_mlx_items(
                 f"Time taken to load vision weights: {(time.perf_counter() - vision_start_time):.2f}s"
             )
         except Exception as e:
+            if sys.platform == "win32":
+                raise RuntimeError(
+                    "Vision weights or preprocessing failed to load on Windows. "
+                    "Install the Windows CPU vision dependencies and verify the "
+                    f"model snapshot for {bound_instance.bound_shard.model_card.model_id}."
+                ) from e
             logger.opt(exception=e).error(
                 "Failed to load vision weights — disabling vision for this runner"
             )

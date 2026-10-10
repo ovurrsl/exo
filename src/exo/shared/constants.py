@@ -110,6 +110,12 @@ EXO_ENABLE_IMAGE_MODELS = (
 
 EXO_OFFLINE = os.getenv("EXO_OFFLINE", "false").lower() == "true"
 
+# Enable only for explicitly qualified CUDA tensor-parallel acceptance runs.
+# The supported initial heterogeneous release uses pipeline + TCP ring.
+EXO_ENABLE_CUDA_TENSOR_PARALLEL = (
+    os.getenv("EXO_ENABLE_CUDA_TENSOR_PARALLEL", "false").lower() == "true"
+)
+
 EXO_TRACING_ENABLED = os.getenv("EXO_TRACING_ENABLED", "false").lower() == "true"
 
 ENABLE_DISAGGREGATION = os.getenv("ENABLE_DISAGGREGATION", "false").lower() == "true"

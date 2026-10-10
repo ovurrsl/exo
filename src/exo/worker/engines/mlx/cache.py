@@ -1,7 +1,10 @@
 import gc
+import hashlib
+import json
 import os
+import sys
 from copy import deepcopy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
 import numpy as np
@@ -54,7 +57,30 @@ _MEMORY_THRESHOLD = float(
 # fill the GPU would evict on every request.
 _WINDOWS_GPU_MIN_FREE = Memory.from_mb(
     int(os.environ.get("EXO_WINDOWS_GPU_MIN_FREE_MB", "1024"))
+    if sys.platform == "win32"
+    else 1024
 )
+
+
+def is_cuda_device() -> bool:
+    return (
+        sys.platform != "darwin"
+        and mx.cuda.is_available()
+        and mx.default_device() == mx.gpu
+    )
+
+
+def discover_cuda_cache_group(group: mx.distributed.Group | None) -> bool:
+    """All ranks discover actual devices before any cache-dependent branching."""
+    local_cuda = is_cuda_device()
+    if group is None:
+        return local_cuda
+    cpu = mx.Device(mx.cpu)
+    with mx.stream(cpu):
+        flags = mx.distributed.all_gather(
+            mx.array([int(local_cuda)], dtype=mx.int32), group=group, stream=cpu
+        )
+        return bool(mx.max(flags).item())
 
 
 class CacheSnapshot:
@@ -239,7 +265,7 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
 
 
 class KVPrefixCache:
-    def __init__(self, group: mx.distributed.Group | None):
+    def __init__(self, group: mx.distributed.Group | None, *, cuda_group: bool = False):
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
         self.caches: list[KVCacheType] = []
         self._snapshots: list[list[CacheSnapshot] | None] = []
@@ -248,6 +274,8 @@ class KVPrefixCache:
         self.prefill_tps: list[float] = []
         self._access_counter: int = 0
         self._group = group
+        self._cuda_group = cuda_group
+        self._identities: list[str] = []
 
     def clear(self):
         """Clear all cached prompts and caches."""
@@ -257,6 +285,7 @@ class KVPrefixCache:
         self._media_regions.clear()
         self._last_used.clear()
         self.prefill_tps.clear()
+        self._identities.clear()
 
     def add_kv_cache(
         self,
@@ -275,6 +304,9 @@ class KVPrefixCache:
         self.prefill_tps.append(prefill_tps)
         self._access_counter += 1
         self._last_used.append(self._access_counter)
+        if self._cuda_group:
+            self._identities.append(self._entry_identity(prompt_tokens, media_regions))
+            _ = self._cuda_eviction_state()
         logger.info(f"KV cache added: {len(prompt_tokens)} tokens")
 
     def update_kv_cache(
@@ -302,6 +334,9 @@ class KVPrefixCache:
         self.prefill_tps[index] = prefill_tps
         self._access_counter += 1
         self._last_used[index] = self._access_counter
+        if self._cuda_group:
+            self._identities[index] = self._entry_identity(prompt_tokens, media_regions)
+            _ = self._cuda_eviction_state()
         logger.info(f"KV cache updated (index {index}): {len(prompt_tokens)} tokens")
 
     def _get_snapshot(
@@ -344,6 +379,8 @@ class KVPrefixCache:
         match is truncated to the start of that region.
         """
         max_length = len(prompt_tokens)
+        if self._cuda_group:
+            _ = self._cuda_eviction_state()
         query_regions = media_regions or []
 
         best_index: int | None = None
@@ -437,6 +474,9 @@ class KVPrefixCache:
 
     def _evict_if_needed(self):
         """Evict least recently used entries while memory usage is high."""
+        if self._cuda_group:
+            self._evict_cuda_group()
+            return
         if len(self.caches) == 0:
             return
 
@@ -460,6 +500,86 @@ class KVPrefixCache:
                 f"KV cache evicted LRU entry ({evicted_tokens} tokens) due to memory usage"
             )
 
+        if evicted_any:
+            gc.collect()
+            mx.clear_cache()
+
+    @staticmethod
+    def _entry_identity(
+        tokens: mx.array, media_regions: list["MediaRegion"] | None
+    ) -> str:
+        digest = hashlib.sha256(np.asarray(tokens, dtype="<i8").tobytes())
+        regions = [
+            (region.start_pos, region.end_pos, region.content_hash)
+            for region in media_regions or []
+        ]
+        digest.update(json.dumps(regions, separators=(",", ":")).encode("utf-8"))
+        return digest.hexdigest()
+
+    def _cuda_eviction_state(self) -> tuple[int, bool]:
+        # Even an empty rank participates. A fixed-size header avoids hanging
+        # peers when cache lengths have already diverged.
+        count = len(self.caches)
+        aligned = all(
+            len(values) == count
+            for values in (
+                self.prompts,
+                self._snapshots,
+                self._media_regions,
+                self._last_used,
+                self.prefill_tps,
+                self._identities,
+            )
+        )
+        identity = hashlib.sha256(
+            json.dumps(
+                (self._identities, self._last_used, self._access_counter),
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).digest()
+        local_evict = get_memory_used_percentage() > _MEMORY_THRESHOLD
+        # Bytes have exact integer representation across every backend.
+        header = [count, int(aligned), int(local_evict), *identity]
+        if self._group is None:
+            if not aligned:
+                raise RuntimeError("CUDA prefix cache metadata is inconsistent")
+            return count, local_evict
+        cpu = mx.Device(mx.cpu)
+        with mx.stream(cpu):
+            gathered = mx.distributed.all_gather(
+                mx.array(header, dtype=mx.int32), group=self._group, stream=cpu
+            )
+            flat = cast(list[int], gathered.tolist())
+        width = len(header)
+        records = [flat[start : start + width] for start in range(0, len(flat), width)]
+        if (
+            len(records) != self._group.size()
+            or any(record[1] != 1 for record in records)
+            or any(record[0] != records[0][0] for record in records)
+            or any(record[3:] != records[0][3:] for record in records)
+        ):
+            raise RuntimeError("Prefix caches diverged across CUDA cluster ranks")
+        return count, any(record[2] != 0 for record in records)
+
+    def _evict_cuda_group(self) -> None:
+        evicted_any = False
+        while True:
+            count, evict = self._cuda_eviction_state()
+            if count == 0 or not evict:
+                break
+            index = self._last_used.index(min(self._last_used))
+            for values in (
+                self.prompts,
+                self.caches,
+                self._snapshots,
+                self._media_regions,
+                self._last_used,
+                self.prefill_tps,
+                self._identities,
+            ):
+                _ = values.pop(index)
+            evicted_any = True
+            logger.info("KV cache evicted by joint CUDA cluster memory pressure")
         if evicted_any:
             gc.collect()
             mx.clear_cache()
@@ -561,19 +681,20 @@ def get_available_memory() -> Memory:
 
 
 def get_memory_used_percentage() -> float:
-    gpu = read_gpu_memory()
-    # MLX keeps freed buffers (e.g. prefill activations, evicted entries) in
-    # its own cache, which the driver still counts as used: count it as free,
-    # so that evicting an entry lowers the pressure and the eviction loop
-    # stops once enough is freed.
-    if (
-        gpu is not None
-        and gpu.free.in_bytes + mx.get_cache_memory() < _WINDOWS_GPU_MIN_FREE.in_bytes
-    ):
-        # System RAM says nothing about the GPU memory the KV cache is in.
-        # Report it full: the pressure the cache acts on is the maximum over
-        # ranks, so every rank then evicts together.
-        return 1.0
+    if sys.platform == "win32" and is_cuda_device():
+        gpu = read_gpu_memory()
+        # CUDA's MLX cache counter also includes pinned CPU buffers. Release
+        # cached allocations under pressure, then use fresh driver residency;
+        # host buffers cannot be credited toward available GPU memory.
+        if gpu is not None and gpu.free < _WINDOWS_GPU_MIN_FREE:
+            mx.clear_cache()
+            gpu = read_gpu_memory()
+        if gpu is None or gpu.free < _WINDOWS_GPU_MIN_FREE:
+            # System RAM says nothing about the GPU memory the KV cache is in.
+            # Report it full: the pressure the cache acts on is the maximum over
+            # ranks, so every rank then evicts together.
+            return 1.0
+        return 0.0
     mem = psutil.virtual_memory()
     # percent is 0-100
     return float(mem.percent / 100)

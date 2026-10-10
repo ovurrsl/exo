@@ -11,6 +11,8 @@ from exo.master.placement_utils import (
     get_shard_assignments,
     get_smallest_cycles,
 )
+from exo.master.windows_image_placement import cuda_image_memory_requirement
+from exo.shared.constants import EXO_ENABLE_CUDA_TENSOR_PARALLEL
 from exo.shared.models.model_cards import ModelId
 from exo.shared.topology import Topology
 from exo.shared.types.backends import Backend
@@ -45,7 +47,8 @@ from exo.shared.types.worker.instances import (
     MlxJacclInstance,
     MlxRingInstance,
 )
-from exo.shared.types.worker.shards import Sharding
+from exo.shared.types.worker.runners import RunnerId, ShardAssignments
+from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 from exo.utils.ports import random_ephemeral_port
 
 INSTANCE_META_BACKENDS: dict[InstanceMeta, list[Backend]] = {
@@ -113,6 +116,7 @@ def place_instance(
     required_nodes: set[NodeId] | None = None,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
     node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus] | None = None,
+    windows_node_ids: set[NodeId] | None = None,
 ) -> dict[InstanceId, Instance]:
     cycles = topology.get_cycles()
     candidate_cycles = list(filter(lambda it: len(it) >= command.min_nodes, cycles))
@@ -124,10 +128,29 @@ def place_instance(
             for cycle in candidate_cycles
             if required_nodes.issubset(cycle.node_ids)
         ]
-    cycles_with_sufficient_memory = filter_cycles_by_memory(
-        candidate_cycles, node_memory, command.model_card.storage_size
-    )
+    cycles_with_sufficient_memory: list[Cycle] = []
+    image_qualification_errors: list[str] = []
+    for cycle in candidate_cycles:
+        try:
+            image_memory = cuda_image_memory_requirement(
+                command.model_card,
+                cycle.node_ids,
+                node_backends,
+                windows_node_ids or set(),
+            )
+        except ValueError as exc:
+            image_qualification_errors.append(str(exc))
+            continue
+        cycles_with_sufficient_memory.extend(
+            filter_cycles_by_memory(
+                [cycle], node_memory, image_memory or command.model_card.storage_size
+            )
+        )
     if len(cycles_with_sufficient_memory) == 0:
+        if image_qualification_errors and len(image_qualification_errors) == len(
+            candidate_cycles
+        ):
+            raise ValueError(image_qualification_errors[0])
         raise ValueError("No cycles found with sufficient memory")
 
     if command.sharding == Sharding.Tensor:
@@ -197,6 +220,19 @@ def place_instance(
             f"{sorted(b.value for b in required_backends)} for {command.model_card.model_id}"
         )
 
+    if command.sharding == Sharding.Tensor and not EXO_ENABLE_CUDA_TENSOR_PARALLEL:
+        smallest_cycles = [
+            cycle
+            for cycle in smallest_cycles
+            if len(cycle) == 1
+            or all(Backend.MlxCuda not in node_backends.get(node, []) for node in cycle)
+        ]
+        if not smallest_cycles:
+            raise ValueError(
+                "CUDA tensor parallelism requires release qualification. "
+                "Use pipeline sharding with the TCP ring for this Windows release."
+            )
+
     rdma_ctl_status = node_rdma_ctl or {}
 
     def _all_rdma_ctl_enabled(cycle: Cycle) -> bool:
@@ -251,9 +287,34 @@ def place_instance(
             }
         )
 
-    shard_assignments = get_shard_assignments(
-        command.model_card, selected_cycle, command.sharding, node_memory
+    image_memory = cuda_image_memory_requirement(
+        command.model_card,
+        selected_cycle.node_ids,
+        node_backends,
+        windows_node_ids or set(),
     )
+    if image_memory is None:
+        shard_assignments = get_shard_assignments(
+            command.model_card, selected_cycle, command.sharding, node_memory
+        )
+    else:
+        # Single-node qualification uses actual sequential GPU stages. Keep the
+        # original card in the wire shard; its disk/Mac estimate is unchanged.
+        runner_id = RunnerId()
+        shard_assignments = ShardAssignments(
+            model_id=command.model_card.model_id,
+            node_to_runner={selected_cycle.node_ids[0]: runner_id},
+            runner_to_shard={
+                runner_id: PipelineShardMetadata(
+                    model_card=command.model_card,
+                    device_rank=0,
+                    world_size=1,
+                    start_layer=0,
+                    end_layer=command.model_card.n_layers,
+                    n_layers=command.model_card.n_layers,
+                )
+            },
+        )
 
     cycle_digraph: Topology = topology.get_subgraph_from_nodes(selected_cycle.node_ids)
 

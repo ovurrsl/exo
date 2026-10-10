@@ -1,13 +1,15 @@
+import ctypes
 import platform
 import re
 import socket
 import sys
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from subprocess import CalledProcessError
-from typing import final
+from typing import cast, final
 
 import psutil
-from anyio import run_process
+from anyio import fail_after, run_process
 
 from exo.shared.types.profiling import InterfaceType, NetworkInterfaceInfo
 
@@ -168,6 +170,66 @@ _WINDOWS_NETWORK_CONNECTIONS_KEY = (
     r"SYSTEM\CurrentControlSet\Control\Network\{4d36e972-e325-11ce-bfc1-08002be10318}"
 )
 
+# Win32 CREATE_NO_WINDOW. Kept numeric so mocked Windows tests work on POSIX.
+_WINDOWS_NO_CONSOLE = 0x08000000
+_WINDOWS_QUERY_TIMEOUT = 5
+
+
+def _windows_system_directory() -> Path:
+    # kernel32 is a Windows KnownDLL; do not trust a process environment path.
+    win_dll = cast(type[ctypes.CDLL], getattr(ctypes, "WinDLL"))  # noqa: B009
+    kernel = win_dll("kernel32", use_last_error=True)
+    kernel.GetSystemDirectoryW.argtypes = [
+        ctypes.POINTER(ctypes.c_wchar),
+        ctypes.c_uint,
+    ]
+    kernel.GetSystemDirectoryW.restype = ctypes.c_uint
+    get_directory = cast(
+        Callable[[ctypes.Array[ctypes.c_wchar], int], int], kernel.GetSystemDirectoryW
+    )
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_directory(buffer, len(buffer))
+    if length <= 0 or length >= len(buffer):
+        raise OSError("Windows system directory could not be resolved")
+    return Path(cast(str, cast(object, buffer.value)))
+
+
+def _windows_program_files_directory(system_directory: Path) -> Path:
+    win_dll = cast(type[ctypes.CDLL], getattr(ctypes, "WinDLL"))  # noqa: B009
+    shell = win_dll(str(system_directory / "shell32.dll"), use_last_error=True)
+    shell.SHGetFolderPathW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_wchar),
+    ]
+    shell.SHGetFolderPathW.restype = ctypes.c_long
+    get_directory = cast(
+        Callable[[None, int, None, int, ctypes.Array[ctypes.c_wchar]], int],
+        shell.SHGetFolderPathW,
+    )
+    buffer = ctypes.create_unicode_buffer(32768)
+    # CSIDL_PROGRAM_FILES uses Windows' protected known-folder configuration.
+    result = get_directory(None, 0x26, None, 0, buffer)
+    value = cast(str, cast(object, buffer.value))
+    if result != 0 or not value:
+        raise OSError("Windows Program Files directory could not be resolved")
+    return Path(value)
+
+
+def _windows_gpu_executable(system_directory: Path) -> Path | None:
+    driver_executable = system_directory / "nvidia-smi.exe"
+    if driver_executable.is_file():
+        return driver_executable
+    legacy_executable = (
+        _windows_program_files_directory(system_directory)
+        / "NVIDIA Corporation"
+        / "NVSMI"
+        / "nvidia-smi.exe"
+    )
+    return legacy_executable if legacy_executable.is_file() else None
+
 
 def _windows_adapter_descriptions() -> dict[str, str]:
     """Windows network adapters' friendly names (as psutil reports them),
@@ -196,9 +258,13 @@ def _windows_adapter_descriptions() -> dict[str, str]:
             try:
                 with winreg.OpenKey(adapters, subkey) as adapter:
                     instance_id = str(
-                        winreg.QueryValueEx(adapter, "NetCfgInstanceId")[0]
+                        cast(
+                            object, winreg.QueryValueEx(adapter, "NetCfgInstanceId")[0]
+                        )
                     )
-                    description = str(winreg.QueryValueEx(adapter, "DriverDesc")[0])
+                    description = str(
+                        cast(object, winreg.QueryValueEx(adapter, "DriverDesc")[0])
+                    )
             except OSError:
                 continue  # e.g. the "Properties" subkey, or no access
             descriptions_by_id[instance_id] = description
@@ -210,7 +276,7 @@ def _windows_adapter_descriptions() -> dict[str, str]:
                 winreg.HKEY_LOCAL_MACHINE,
                 rf"{_WINDOWS_NETWORK_CONNECTIONS_KEY}\{instance_id}\Connection",
             ) as connection:
-                name = str(winreg.QueryValueEx(connection, "Name")[0])
+                name = str(cast(object, winreg.QueryValueEx(connection, "Name")[0]))
         except OSError:
             continue  # an adapter without a network connection
         descriptions[name] = description
@@ -293,16 +359,24 @@ async def get_model_and_chip() -> tuple[str, str]:
 
 async def _query_windows_computer_model() -> str | None:
     try:
-        process = await run_process(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "(Get-CimInstance -ClassName Win32_ComputerSystem).Model",
-            ],
-            check=False,
-        )
-    except OSError:
+        with fail_after(_WINDOWS_QUERY_TIMEOUT):
+            process = await run_process(
+                [
+                    str(
+                        _windows_system_directory()
+                        / "WindowsPowerShell"
+                        / "v1.0"
+                        / "powershell.exe"
+                    ),
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "(Get-CimInstance -ClassName Win32_ComputerSystem).Model",
+                ],
+                check=False,
+                creationflags=_WINDOWS_NO_CONSOLE if sys.platform == "win32" else 0,
+            )
+    except (OSError, TimeoutError):
         return None
     if process.returncode != 0:
         return None
@@ -312,15 +386,20 @@ async def _query_windows_computer_model() -> str | None:
 
 async def _query_windows_gpu_name() -> str | None:
     try:
-        process = await run_process(
-            [
-                "nvidia-smi",
-                "--query-gpu=name",
-                "--format=csv,noheader",
-            ],
-            check=False,
-        )
-    except OSError:
+        executable = _windows_gpu_executable(_windows_system_directory())
+        if executable is None:
+            return None
+        with fail_after(_WINDOWS_QUERY_TIMEOUT):
+            process = await run_process(
+                [
+                    str(executable),
+                    "--query-gpu=name",
+                    "--format=csv,noheader",
+                ],
+                check=False,
+                creationflags=_WINDOWS_NO_CONSOLE if sys.platform == "win32" else 0,
+            )
+    except (OSError, TimeoutError):
         return None
     if process.returncode != 0:
         return None
