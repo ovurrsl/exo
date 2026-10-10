@@ -205,6 +205,30 @@ def test_cpu_outer_matches_reference_and_restores_parameters(cpu_staging: None) 
             np.testing.assert_allclose(np.array(a), np.array(b), atol=1e-5, rtol=1e-5)
 
 
+def test_discarded_prefill_logits_are_not_eagerly_evaluated(
+    cpu_staging: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapped = _prepare(_model(tie_word_embeddings=False), _policy())
+    original_eval = mx.eval
+
+    def checked_eval(*values: "mx.MX_ARRAY_TREE | None") -> None:
+        if wrapped.stages_closed == 2:
+            assert not any(
+                isinstance(value, mx.array) and value.shape == (1, 3, 128)
+                for value in values
+            ), "discarded prefill logits were evaluated eagerly"
+        original_eval(*values)
+
+    monkeypatch.setattr(mx, "eval", checked_eval)
+    cache = [KVCache(), KVCache()]
+    logits = wrapped(mx.array([[1, 2, 3]]), cache=cache)
+    assert [entry.offset for entry in cache] == [3, 3]
+    assert wrapped.stages_opened == wrapped.stages_closed == 2
+    assert wrapped.active_layer is None
+    original_eval(logits)
+    assert logits.shape == (1, 3, 128)
+
+
 def test_batch_and_long_context_are_rejected(cpu_staging: None) -> None:
     wrapped = _prepare(_model(), _policy())
     with pytest.raises(ValueError, match="batch"):

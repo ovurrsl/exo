@@ -71,3 +71,20 @@ read-only investigation and candidate review found no surviving snapshot-Python
 route in this restricted branch. This is scoped remediation, not a repository-wide
 security audit. The earlier c31 package evidence cannot certify the corrected
 source; packaging must be repeated after the new source freeze.
+
+## Large-model performance correction
+
+The first 32B source run loaded successfully in 37.4 seconds but spent 120.56
+seconds in warmup prefill. A read-only CPU sample confirmed active computation,
+not a stalled peer: the wrapper eagerly evaluated its CPU vocabulary projection
+even for intermediate prefill logits that MLX discards. The corrected wrapper
+keeps that projection and its final GPU copy lazy, while still evaluating decoder
+output and KV state and synchronizing before restoring each staged weight set.
+Only offloaded models use a two-token warmup; ordinary models retain 50 tokens.
+
+In the subsequent local run, the same warmup prefill took 17.33 seconds and the
+runner became ready in 76.57 seconds including loading. This is a single local
+comparison, not a general throughput guarantee. Discarded-logit and warmup
+regressions pass; both real CUDA FP32 and BF16 logits/KV parity tests also pass.
+The first acceptance run was deliberately interrupted and is not a passed test.
+The corrected run is still exercising full HTTP inference and cancellation.

@@ -366,3 +366,33 @@ def test_offload_branch_bypasses_id_driven_custom_tokenizer(
             next(loading)
     assert cast(object, stopped.value.value) == (model, tokenizer, None)
     assert calls == [tmp_path]
+
+
+@pytest.mark.parametrize("offloaded, expected_tokens", [(True, 2), (False, 50)])
+def test_warmup_is_bounded_only_for_offloaded_model(
+    monkeypatch: pytest.MonkeyPatch, offloaded: bool, expected_tokens: int
+) -> None:
+    model = (
+        offload.WindowsQwen3OffloadModel.__new__(offload.WindowsQwen3OffloadModel)
+        if offloaded
+        else nn.Module()
+    )
+    requests: list[int | None] = []
+
+    def generate(**kwargs: object) -> Iterator[generation.GenerationResponse]:
+        params = cast(generation.TextGenerationTaskParams, kwargs["task"])
+        requests.append(params.max_output_tokens)
+        yield from []
+
+    def template(**kwargs: object) -> str:
+        return "warmup"
+
+    monkeypatch.setattr(generation, "mlx_generate", generate)
+    monkeypatch.setattr(generation, "apply_chat_template", template)
+    generation.warmup_inference(
+        cast(generation.Model, cast(object, model)),
+        cast(utils_mlx.TokenizerWrapper, object()),
+        None,
+        ModelId("test/Qwen3"),
+    )
+    assert requests == [expected_tokens]
