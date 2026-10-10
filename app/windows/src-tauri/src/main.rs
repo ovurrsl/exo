@@ -54,6 +54,7 @@ fn main() {
             commands::pick_directory,
             commands::show_settings,
             commands::hide_window,
+            commands::resize_panel,
             commands::check_update,
             commands::install_update,
             commands::export_diagnostics,
@@ -109,8 +110,16 @@ fn main() {
                                     let scale = monitor.scale_factor();
                                     let width =
                                         ((340.0 * scale) as i32).min(work.size.width as i32);
-                                    let height =
-                                        ((650.0 * scale) as i32).min(work.size.height as i32);
+                                    let logical_height = window
+                                        .inner_size()
+                                        .map(|size| {
+                                            f64::from(size.height)
+                                                / window.scale_factor().unwrap_or(1.0)
+                                        })
+                                        .unwrap_or(650.0)
+                                        .clamp(220.0, 650.0);
+                                    let height = ((logical_height * scale).round() as i32)
+                                        .min(work.size.height as i32);
                                     let (x, y) = popover_position(
                                         physical.x,
                                         physical.y,

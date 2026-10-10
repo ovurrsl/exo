@@ -13,6 +13,7 @@ export type DesktopCommand =
   | "pick_directory"
   | "show_settings"
   | "hide_window"
+  | "resize_panel"
   | "check_update"
   | "install_update"
   | "export_diagnostics"

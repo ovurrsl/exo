@@ -47,6 +47,66 @@ fn local_ui_url(url: &url::Url) -> bool {
             && url.host_str() == Some("127.0.0.1")
             && url.port() == Some(1420))
 }
+fn panel_rect(
+    position: (i32, i32),
+    previous_height: u32,
+    scale: f64,
+    requested_height: u32,
+    work: (i32, i32, u32, u32),
+) -> (i32, i32, u32, u32) {
+    let (left, top, work_width, work_height) = work;
+    let width = ((340.0 * scale).round() as u32).min(work_width).max(1);
+    let height = ((f64::from(requested_height.clamp(220, 650)) * scale).round() as u32)
+        .min(work_height)
+        .max(1);
+    let right_limit = i64::from(left) + i64::from(work_width.saturating_sub(width));
+    let bottom_limit = i64::from(top) + i64::from(work_height.saturating_sub(height));
+    let x = i64::from(position.0).clamp(i64::from(left), right_limit);
+    let anchored_y = if position.1 == top && previous_height < work_height {
+        i64::from(top)
+    } else {
+        i64::from(position.1) + i64::from(previous_height) - i64::from(height)
+    };
+    let y = anchored_y.clamp(i64::from(top), bottom_limit);
+    (x as i32, y as i32, width, height)
+}
+#[tauri::command]
+pub fn resize_panel(window: WebviewWindow, height: u32) -> Result<(), String> {
+    local_window(&window)?;
+    if window.label() != "main" {
+        return Err("Only the compact panel may resize itself".into());
+    }
+    let Some(monitor) = window
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let work = monitor.work_area();
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let previous = window.inner_size().map_err(|error| error.to_string())?;
+    let (x, y, width, height) = panel_rect(
+        (position.x, position.y),
+        previous.height,
+        monitor.scale_factor(),
+        height,
+        (
+            work.position.x,
+            work.position.y,
+            work.size.width,
+            work.size.height,
+        ),
+    );
+    if previous.width != width || previous.height != height {
+        window
+            .set_size(tauri::PhysicalSize::new(width, height))
+            .map_err(|error| error.to_string())?;
+        window
+            .set_position(tauri::PhysicalPosition::new(x, y))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
 #[tauri::command]
 pub fn snapshot(window: WebviewWindow, desktop: DesktopState<'_>) -> Result<Snapshot, String> {
     local_window(&window)?;
@@ -784,6 +844,35 @@ pub async fn quit_app(window: WebviewWindow, desktop: DesktopState<'_>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compact_panel_shrinks_from_the_bottom_without_leaving_the_work_area() {
+        assert_eq!(
+            panel_rect((1580, 390), 650, 1.0, 220, (0, 0, 1920, 1040)),
+            (1580, 820, 340, 220)
+        );
+        assert_eq!(
+            panel_rect((-200, 50), 975, 1.5, 300, (-1920, 40, 1920, 1000)),
+            (-510, 575, 510, 450)
+        );
+    }
+    #[test]
+    fn compact_panel_stays_attached_below_a_top_taskbar() {
+        assert_eq!(
+            panel_rect((1580, 40), 650, 1.0, 220, (0, 40, 1920, 1000)),
+            (1580, 40, 340, 220)
+        );
+    }
+    #[test]
+    fn compact_panel_caps_untrusted_height_and_small_scaled_monitors() {
+        assert_eq!(
+            panel_rect((1900, 900), 650, 1.0, u32::MAX, (0, 40, 1920, 1000)),
+            (1580, 390, 340, 650)
+        );
+        assert_eq!(
+            panel_rect((-10, -20), 650, 2.0, 0, (0, 20, 300, 200)),
+            (0, 20, 300, 200)
+        );
+    }
     #[test]
     fn diagnostics_redact_nested_secrets_and_prompts() {
         let mut value = serde_json::json!({"task": {"messages":[{"content":"private"}],"HF_TOKEN":"secret","safe":"visible"}});
