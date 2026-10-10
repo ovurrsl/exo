@@ -763,7 +763,7 @@ def mlx_generate(
                 generation_tps=float(out.generation_tps),
                 prompt_tokens=int(prefill_tokens + out.prompt_tokens),
                 generation_tokens=int(out.generation_tokens),
-                peak_memory_usage=Memory.from_gb(out.peak_memory),
+                peak_memory_usage=Memory.from_bytes(mx.get_peak_memory()),
             )
             if not stop_matched and out.finish_reason not in get_args(FinishReason):
                 logger.warning(

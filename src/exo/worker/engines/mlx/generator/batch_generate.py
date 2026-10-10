@@ -441,7 +441,7 @@ class ExoBatchGenerator:
                     generation_tps=generation_tps,
                     prompt_tokens=len(state.all_prompt_tokens),
                     generation_tokens=state.completion_tokens,
-                    peak_memory_usage=Memory.from_gb(mx.get_peak_memory() / 1e9),
+                    peak_memory_usage=Memory.from_bytes(mx.get_peak_memory()),
                     prefix_cache_hit=state.prefix_cache_hit,
                 )
                 total_prompt_tokens = len(state.all_prompt_tokens)
