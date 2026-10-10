@@ -100,6 +100,27 @@ def test_host_budget_is_separate_from_vram() -> None:
         )
 
 
+def test_moe_card_with_generic_base_name_does_not_qualify() -> None:
+    local = NodeId()
+    model = card("Qwen3 30B").model_copy(
+        update={"model_id": ModelId("mlx-community/Qwen3-30B-A3B-4bit")}
+    )
+    assert (
+        cuda_text_memory_requirement(
+            model,
+            [local],
+            {local: [Backend.MlxCuda]},
+            {local},
+            offload_policy=WindowsTextOffloadPolicy(
+                enabled=True, host_limit_bytes=64 * 1024**3, stage_limit_bytes=1024**3
+            ),
+            local_node_id=local,
+            host_available_bytes=64 * 1024**3,
+        )
+        is None
+    )
+
+
 def test_full_singleton_placement_exceeds_vram_without_mutating_storage() -> None:
     local = NodeId()
     topology = Topology()

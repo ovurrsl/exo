@@ -61,6 +61,7 @@ async def test_capacity_prefers_exact_vram_then_qualified_ram_offload(
         model("test/exact", 2 * 1024**3),
         model("test/offload", 20 * 1024**3),
         model("test/unsupported", 20 * 1024**3, base="Qwen3.5 27B"),
+        model("mlx-community/Qwen3-30B-A3B-4bit", 20 * 1024**3, base="Qwen3 30B"),
     ]
     monkeypatch.setattr(api_module.sys, "platform", "win32")
     monkeypatch.setattr(card_cache, "list_all", AsyncMock(return_value=cards))
@@ -86,6 +87,9 @@ async def test_capacity_prefers_exact_vram_then_qualified_ram_offload(
         "available_bytes": 2 * 1024**3,
     }
     assert response["models"]["test/unsupported"]["mode"] == "unavailable"
+    assert (
+        response["models"]["mlx-community/Qwen3-30B-A3B-4bit"]["mode"] == "unavailable"
+    )
 
 
 @pytest.mark.parametrize(
