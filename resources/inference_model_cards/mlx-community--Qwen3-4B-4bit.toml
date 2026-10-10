@@ -12,7 +12,8 @@ capabilities = ["text", "thinking", "thinking_toggle"]
 context_length = 40960
 backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
 [storage_size]
-in_bytes = 2278972183
+# Tensor bytes from model.safetensors.index.json, as used for placement.
+in_bytes = 2262920192
 
 # Source: https://huggingface.co/Qwen/Qwen3-4B#best-practices
 [sampling_defaults]
