@@ -105,6 +105,9 @@ jobs:
           cache: npm
           cache-dependency-path: app/windows/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check Windows shell formatting with its Cargo edition
+        working-directory: app/windows/src-tauri
+        run: cargo fmt --check
       - name: Install desktop build dependencies
         working-directory: app/windows
         run: npm ci
