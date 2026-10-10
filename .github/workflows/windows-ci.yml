@@ -20,6 +20,19 @@ jobs:
         with:
           version: "0.12.22"
       - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: Build dashboard assets required by core tests
+        working-directory: dashboard
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Dashboard dependency installation failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Dashboard assets build failed' }
       - name: Install Python and CPU-test dependencies
         run: uv sync --frozen --extra mlx-none
       - name: Lint Windows package and validation code

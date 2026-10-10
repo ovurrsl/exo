@@ -10,7 +10,7 @@ SUCCESS_EXIT_CODE: Final = 7
 
 def run_probe(stage: str) -> None:
     """Exercise CUDA and ring cleanup, including normal interpreter destruction."""
-    if stage == "kernel":
+    if stage == "kernel" and sys.platform == "win32":
         import pynvml as nvml
 
         from exo.utils.windows_gpu import gpu_selection_error

@@ -358,18 +358,21 @@ async def _gather_iface_map() -> dict[str, str] | None:
 
 
 def _has_nvml_cuda() -> bool:
-    try:
-        import pynvml as nvml
-    except ImportError:
+    if sys.platform == "darwin":
         return False
-    try:
-        nvml.nvmlInit()
+    else:
         try:
-            return nvml.nvmlDeviceGetCount() > 0
-        finally:
-            nvml.nvmlShutdown()
-    except Exception:
-        return False
+            import pynvml as nvml
+        except ImportError:
+            return False
+        try:
+            nvml.nvmlInit()
+            try:
+                return nvml.nvmlDeviceGetCount() > 0
+            finally:
+                nvml.nvmlShutdown()
+        except Exception:
+            return False
 
 
 # GPU memory a Windows CUDA node leaves out of what it reports, for the KV
