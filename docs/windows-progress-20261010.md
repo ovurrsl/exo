@@ -1,5 +1,10 @@
 # EXO Windows ve NVIDIA ilerlemesi — 10 Ekim 2026
 
+Bu belge aşağıdaki commit döneminin tarihsel durumudur. Daha sonraki RAM offload
+ve kurucu kayıtları [kapasite raporunda](windows-model-capacity-20261010.md);
+11 Ekim cevap doğruluğu ve VRAM önceliği açıkları
+[yeni araştırmada](windows-vram-first-quality-research-20261010.md) izlenir.
+
 Güncel birleşik kaynak **`79de2150c1979663b63708c13dc6ddee5709f663`**, fork'ın
 `windows-native` dalına gönderildi. Mac düzenini izleyen panel ve tanılama ZIP'inden
 özel içeriği çıkaran düzeltme ayrı konu commitleriyle birleştirildi.
