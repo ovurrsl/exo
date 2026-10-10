@@ -12,6 +12,7 @@ from exo.master.placement_utils import (
     get_smallest_cycles,
 )
 from exo.master.windows_image_placement import cuda_image_memory_requirement
+from exo.master.windows_text_placement import cuda_text_memory_requirement
 from exo.shared.constants import EXO_ENABLE_CUDA_TENSOR_PARALLEL
 from exo.shared.models.model_cards import ModelId
 from exo.shared.topology import Topology
@@ -50,6 +51,7 @@ from exo.shared.types.worker.instances import (
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments
 from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 from exo.utils.ports import random_ephemeral_port
+from exo.utils.windows_text_offload_config import WindowsTextOffloadPolicy
 
 INSTANCE_META_BACKENDS: dict[InstanceMeta, list[Backend]] = {
     InstanceMeta.MlxRing: [Backend.MlxMetal, Backend.MlxCuda, Backend.MlxCpu],
@@ -117,7 +119,33 @@ def place_instance(
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
     node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus] | None = None,
     windows_node_ids: set[NodeId] | None = None,
+    offload_policy: WindowsTextOffloadPolicy | None = None,
+    local_node_id: NodeId | None = None,
+    host_available_bytes: int | None = None,
 ) -> dict[InstanceId, Instance]:
+    def text_memory(nodes: Sequence[NodeId]) -> Memory | None:
+        if (
+            command.instance_meta != InstanceMeta.MlxRing
+            or command.sharding != Sharding.Pipeline
+        ):
+            return None
+        if len(nodes) == 1:
+            capacity = node_memory.get(nodes[0])
+            if (
+                capacity is not None
+                and command.model_card.storage_size <= capacity.ram_available
+            ):
+                return None
+        return cuda_text_memory_requirement(
+            command.model_card,
+            nodes,
+            node_backends,
+            windows_node_ids or set(),
+            offload_policy=offload_policy,
+            local_node_id=local_node_id,
+            host_available_bytes=host_available_bytes,
+        )
+
     cycles = topology.get_cycles()
     candidate_cycles = list(filter(lambda it: len(it) >= command.min_nodes, cycles))
 
@@ -138,12 +166,15 @@ def place_instance(
                 node_backends,
                 windows_node_ids or set(),
             )
+            staged_text_memory = text_memory(cycle.node_ids)
         except ValueError as exc:
             image_qualification_errors.append(str(exc))
             continue
         cycles_with_sufficient_memory.extend(
             filter_cycles_by_memory(
-                [cycle], node_memory, image_memory or command.model_card.storage_size
+                [cycle],
+                node_memory,
+                image_memory or staged_text_memory or command.model_card.storage_size,
             )
         )
     if len(cycles_with_sufficient_memory) == 0:
@@ -293,7 +324,7 @@ def place_instance(
         node_backends,
         windows_node_ids or set(),
     )
-    if image_memory is None:
+    if image_memory is None and text_memory(selected_cycle.node_ids) is None:
         shard_assignments = get_shard_assignments(
             command.model_card, selected_cycle, command.sharding, node_memory
         )

@@ -70,6 +70,7 @@ from exo.worker.engines.mlx.vision import (
     get_inner_model,
     prepare_vision,
 )
+from exo.worker.engines.mlx.windows_text_offload import WindowsQwen3OffloadModel
 from exo.worker.runner.bootstrap import logger
 
 REMOTE_PREFILL_MIN_TOKENS = 1000
@@ -331,7 +332,13 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = 4096
+    prefill_step_size = (
+        cast(
+            WindowsQwen3OffloadModel, cast(object, model)
+        ).staging.policy.max_prefill_tokens
+        if isinstance(cast(object, model), WindowsQwen3OffloadModel)
+        else 4096
+    )
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
@@ -640,6 +647,7 @@ def mlx_generate(
     use_remote = (
         len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
         and task.prefill_endpoint is not None
+        and not isinstance(cast(object, model), WindowsQwen3OffloadModel)
     )
     remote_prefilled = False
     prefill_tps = 0.0

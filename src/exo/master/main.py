@@ -16,6 +16,10 @@ from exo.master.windows_image_placement import (
     cuda_image_instance_memory,
     windows_nodes,
 )
+from exo.master.windows_text_placement import (
+    cuda_text_instance_memory,
+    local_windows_text_offload_policy,
+)
 from exo.routing.event_router import (
     EventRouterBrokenResourceError,
     EventRouterClosedResourceError,
@@ -386,6 +390,8 @@ class Master:
                                 windows_node_ids=windows_nodes(
                                     self.state.node_identities
                                 ),
+                                offload_policy=local_windows_text_offload_policy(),
+                                local_node_id=self.node_id,
                             )
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks
@@ -406,6 +412,34 @@ class Master:
                                 if command.instance.shard_assignments.runner_to_shard
                                 else None
                             )
+                            if command.instance.shard_assignments.runner_to_shard:
+                                local_capacity = self.state.node_memory.get(
+                                    self.node_id
+                                )
+                                model_card = next(
+                                    iter(
+                                        command.instance.shard_assignments.runner_to_shard.values()
+                                    )
+                                ).model_card
+                                text_memory = (
+                                    cuda_text_instance_memory(
+                                        command.instance,
+                                        next(
+                                            iter(
+                                                command.instance.shard_assignments.runner_to_shard.values()
+                                            )
+                                        ).model_card,
+                                        self.state.node_backends,
+                                        windows_nodes(self.state.node_identities),
+                                        offload_policy=local_windows_text_offload_policy(),
+                                        local_node_id=self.node_id,
+                                    )
+                                    if local_capacity is None
+                                    or model_card.storage_size
+                                    > local_capacity.ram_available
+                                    else None
+                                )
+                                image_memory = image_memory or text_memory
                             if image_memory is not None:
                                 node_id = next(
                                     iter(

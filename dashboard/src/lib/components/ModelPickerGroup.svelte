@@ -1,4 +1,9 @@
 <script lang="ts">
+  import {
+    bestModelFitStatus,
+    getModelFitColor,
+    type ModelFitStatus,
+  } from "$lib/utils/windows-model-capacity";
   interface ModelInfo {
     id: string;
     name?: string;
@@ -26,7 +31,6 @@
     nodeNames: string[];
     nodeIds: string[];
   };
-  type ModelFitStatus = "fits_now" | "fits_cluster_capacity" | "too_large";
 
   type ModelPickerGroupProps = {
     group: ModelGroup;
@@ -103,28 +107,13 @@
       : false,
   );
   const groupFitStatus = $derived.by((): ModelFitStatus => {
-    let hasClusterCapacityOnly = false;
-    for (const variant of group.variants) {
-      const fitStatus = getModelFitStatus(variant.id);
-      if (fitStatus === "fits_now") {
-        return "fits_now";
-      }
-      if (fitStatus === "fits_cluster_capacity") {
-        hasClusterCapacityOnly = true;
-      }
-    }
-    return hasClusterCapacityOnly ? "fits_cluster_capacity" : "too_large";
+    return bestModelFitStatus(
+      group.variants.map((variant) => getModelFitStatus(variant.id)),
+    );
   });
 
   function getSizeClassForFitStatus(fitStatus: ModelFitStatus): string {
-    switch (fitStatus) {
-      case "fits_now":
-        return "text-white/40";
-      case "fits_cluster_capacity":
-        return "text-orange-400/80";
-      case "too_large":
-        return "text-red-400/70";
-    }
+    return getModelFitColor(fitStatus);
   }
 
   // Check if this group's model is currently selected (for single-variant groups)
@@ -323,6 +312,13 @@
         )}"
       >
         {formatSize(group.smallestVariant.storage_size_megabytes)}
+        {#if singleVariantFitStatus === "ram_offload"}
+          <span
+            title="Weights use system RAM; decoder layers are staged in VRAM. Experimental single-node Qwen3 support."
+          >
+            · RAM offload</span
+          >
+        {/if}
       </span>
     {/if}
 
@@ -340,6 +336,13 @@
         {group.variants.length} variants{#if sizes.length >= 2}{" "}({formatSize(
             sizes[0],
           )}-{formatSize(sizes[sizes.length - 1])}){/if}
+        {#if groupFitStatus === "ram_offload"}
+          <span
+            title="A variant can use system RAM with decoder layers staged in VRAM."
+          >
+            · RAM offload</span
+          >
+        {/if}
       </span>
     {/if}
 
@@ -530,6 +533,13 @@
             )}"
           >
             {formatSize(variant.storage_size_megabytes)}
+            {#if fitStatus === "ram_offload"}
+              <span
+                title="Weights use system RAM; decoder layers are staged in VRAM. Experimental single-node Qwen3 support."
+              >
+                · RAM offload</span
+              >
+            {/if}
           </span>
 
           <!-- Download indicator for this variant -->
