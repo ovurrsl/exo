@@ -10,6 +10,7 @@ autotests = false
 [features]
 process-test-helper = []
 firewall-helper = []
+native-settings-probe = ["process-test-helper", "tauri/custom-protocol"]
 
 [[bin]]
 name = "exo-firewall-helper"
@@ -30,6 +31,11 @@ required-features = ["process-test-helper"]
 name = "exo-frozen-desktop-probe"
 path = "tests/frozen_desktop_probe.rs"
 required-features = ["process-test-helper"]
+
+[[bin]]
+name = "exo-native-settings-probe"
+path = "tests/native_settings_probe.rs"
+required-features = ["native-settings-probe"]
 
 # This app must never join or change the Mac/Python Rust workspace.
 [workspace]

@@ -140,11 +140,13 @@ jobs:
             New-Item -ItemType Directory -Path "resources/$folder" -Force | Out-Null
             New-Item -ItemType File -Path "resources/$folder/.gitkeep" -Force | Out-Null
           }
-          cargo test --features process-test-helper,firewall-helper
+          # Compile the native Settings helper and run its verifier units;
+          # cargo test does not run the helper's WebView/event-loop main.
+          cargo test --features process-test-helper,firewall-helper,native-settings-probe
           if ($LASTEXITCODE -ne 0) { throw 'Windows shell tests failed' }
       - name: Check Windows shell lint
         working-directory: app/windows/src-tauri
-        run: cargo clippy --all-targets --features process-test-helper,firewall-helper -- -D warnings
+        run: cargo clippy --all-targets --features process-test-helper,firewall-helper,native-settings-probe -- -D warnings
 
 # A hosted CPU runner cannot establish CUDA or heterogeneous cluster parity.
 # The installer workflow runs separate physical GPU and Mac-cluster gates.
