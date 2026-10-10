@@ -7,6 +7,7 @@ Thank you for your interest in contributing to EXO!
 To run EXO from source:
 
 **Prerequisites:**
+
 - [uv](https://github.com/astral-sh/uv) (for Python dependency management)
   ```bash
   brew install uv
@@ -29,9 +30,11 @@ To run EXO from source:
 git clone https://github.com/exo-explore/exo.git
 cd exo/dashboard
 npm install && npm run build && cd ..
-uv sync --extra mlx
+uv sync --all-packages --extra mlx
 uv run exo
 ```
+
+For native Windows/NVIDIA development, use `uv sync --all-packages --extra mlx-cuda13` instead. Follow [the Windows runtime guide](docs/windows.md) for the pinned wheel and GPU acceptance requirements. Source builds require the development tools listed there; the desktop distribution bundles its runtime.
 
 ## Development
 
@@ -52,6 +55,7 @@ Run `nix fmt` to auto-format your code before submitting.
 ## Model Cards
 
 EXO uses TOML-based model cards to define model metadata and capabilities. Model cards are stored in:
+
 - `resources/inference_model_cards/` for text generation models
 - `resources/image_model_cards/` for image generation models
 - `~/.exo/custom_model_cards/` for user-added custom models
@@ -96,6 +100,7 @@ in_bytes = 729808896
 ### Capabilities
 
 The `capabilities` field defines what the model can do:
+
 - `text`: Standard text generation
 - `thinking`: Model supports chain-of-thought reasoning
 - `thinking_toggle`: Thinking can be enabled/disabled via `enable_thinking` parameter
@@ -177,6 +182,7 @@ EXO relies heavily on manual testing at this point in the project, but this is e
 ## Reporting Issues
 
 If you find a bug or have a feature request, please open an issue on GitHub with:
+
 - A clear description of the problem or feature
 - Steps to reproduce (for bugs)
 - Expected vs actual behavior
@@ -185,4 +191,5 @@ If you find a bug or have a feature request, please open an issue on GitHub with
 ## Questions?
 
 Join our community:
+
 - [X](https://x.com/exolabs)
