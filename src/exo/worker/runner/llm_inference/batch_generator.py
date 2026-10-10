@@ -436,11 +436,19 @@ class BatchGenerator(Engine):
         if not self._gen.has_work:
             return self._apply_cancellations()
 
-        results = self._gen.step()
+        output = self._parse_responses(self._gen.step())
 
-        output: list[
-            tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
-        ] = []
+        return filter(
+            lambda chunk: (
+                not isinstance(chunk[1], GenerationChunk) or self.device_rank == 0
+            ),
+            itertools.chain(output, self._apply_cancellations()),
+        )
+
+    def _parse_responses(
+        self, results: list[tuple[int, GenerationResponse]]
+    ) -> list[tuple[TaskId, GenerationChunk | FinishedResponse]]:
+        output: list[tuple[TaskId, GenerationChunk | FinishedResponse]] = []
         for uid, response in results:
             if uid not in self._active_tasks:
                 # should we error here?
@@ -458,23 +466,22 @@ class BatchGenerator(Engine):
                 output.append((task.task_id, FinishedResponse()))
                 del self._active_tasks[uid]
 
-        return filter(
-            lambda chunk: (
-                not isinstance(chunk[1], GenerationChunk) or self.device_rank == 0
-            ),
-            itertools.chain(output, self._apply_cancellations()),
-        )
+        return output
 
     def _apply_cancellations(
         self,
-    ) -> Iterator[tuple[TaskId, CancelledResponse]]:
+    ) -> Iterator[
+        tuple[TaskId, GenerationChunk | FinishedResponse | CancelledResponse]
+    ]:
         if not self._cancelled_tasks:
             return iter([])
 
         cancel_all = CANCEL_ALL_TASKS in self._cancelled_tasks
 
         uids_to_cancel: list[int] = []
-        results: list[tuple[TaskId, CancelledResponse]] = []
+        results: list[
+            tuple[TaskId, GenerationChunk | FinishedResponse | CancelledResponse]
+        ] = []
 
         for uid, (task, _, _) in list(self._active_tasks.items()):
             if task.task_id in self._cancelled_tasks or cancel_all:
@@ -490,7 +497,27 @@ class BatchGenerator(Engine):
             if tid != CANCEL_ALL_TASKS and tid not in already_cancelled:
                 results.append((tid, CancelledResponse()))
 
+        # A cancelled task that hasn't started must never start: the runner has already
+        # forgotten it. The cancellation is agreed, so every rank drops the same tasks.
+        self._queue = deque(
+            task
+            for task in self._queue
+            if not cancel_all and task.task_id not in self._cancelled_tasks
+        )
+        self._maybe_queue = [
+            task
+            for task in self._maybe_queue
+            if not cancel_all and task.task_id not in self._cancelled_tasks
+        ]
         self._cancelled_tasks.clear()
+
+        if uids_to_cancel:
+            # Runner removes its last active task when it receives CancelledResponse.
+            # Finish the agreed decode first so its KV/lazy work cannot survive idle
+            # or overlap a following request's synchronous prefill. Normal MLX steps
+            # retain pipeline collective ordering; preserve surviving requests' output.
+            while self._gen.has_pending_cancellations:
+                results.extend(self._parse_responses(self._gen.step()))
         return iter(results)
 
     def _send_error(self, task: TextGeneration, e: Exception) -> None:
