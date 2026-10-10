@@ -8,7 +8,9 @@ import socket
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from typing import Any
-from urllib.parse import urlparse
+
+from aiohttp.abc import AbstractResolver, ResolveResult
+from yarl import URL
 
 from exo.api.types import (
     ChatCompletionChoice,
@@ -61,6 +63,48 @@ class ImageUrlRejectedError(ValueError):
     """An image URL this node refuses to fetch; the API answers it with 400."""
 
 
+def _parse_image_url(url: str | URL) -> URL:
+    try:
+        parsed = URL(url)
+        # Use the same parser as aiohttp, including its port validation.
+        _ = parsed.port
+    except ValueError as error:
+        raise ImageUrlRejectedError("Malformed image URL") from error
+    if parsed.scheme not in ("http", "https"):
+        raise ImageUrlRejectedError(f"Unsupported image URL scheme: {parsed.scheme!r}")
+    if not parsed.raw_host:
+        raise ImageUrlRejectedError("Image URL has no host")
+    return parsed
+
+
+class _PinnedImageResolver(AbstractResolver):
+    def __init__(self, host: str, addresses: Sequence[str]) -> None:
+        self._host = host
+        self._addresses = tuple(addresses)
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[ResolveResult]:
+        if host != self._host:
+            raise ImageUrlRejectedError("Image URL host changed after validation")
+        return [
+            ResolveResult(
+                hostname=host,
+                host=address,
+                port=port,
+                family=socket.AF_INET6
+                if ipaddress.ip_address(address).version == 6
+                else socket.AF_INET,
+                proto=socket.IPPROTO_TCP,
+                flags=socket.AI_NUMERICHOST | socket.AI_NUMERICSERV,
+            )
+            for address in self._addresses
+        ]
+
+    async def close(self) -> None:
+        pass
+
+
 def _is_public_address(address: str) -> bool:
     ip = ipaddress.ip_address(address)
     return ip.is_global and not (
@@ -69,9 +113,9 @@ def _is_public_address(address: str) -> bool:
 
 
 async def validate_image_url(
-    url: str,
+    url: str | URL,
     resolve: Callable[[str], Awaitable[Sequence[str]]] = _resolve_host,
-) -> None:
+) -> Sequence[str]:
     """Refuse image URLs that would make this node fetch from itself, the
     LAN, or a cloud metadata endpoint on a caller's behalf (SSRF).
 
@@ -80,17 +124,15 @@ async def validate_image_url(
     name pointing at a private address is caught as well as a literal one.
     `resolve` is injectable so this stays testable without DNS.
     """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ImageUrlRejectedError(f"Unsupported image URL scheme: {parsed.scheme!r}")
-    host = parsed.hostname
-    if not host:
-        raise ImageUrlRejectedError("Image URL has no host")
+    parsed = _parse_image_url(url)
+    host = parsed.raw_host
+    assert host is not None
     try:
         addresses: Sequence[str] = [str(ipaddress.ip_address(host))]
     except ValueError:
         try:
-            addresses = await resolve(host)
+            async with asyncio.timeout(10):
+                addresses = await resolve(host)
         except OSError as e:  # socket.gaierror: the name does not resolve
             raise ImageUrlRejectedError(
                 f"Image URL host {host!r} did not resolve"
@@ -102,16 +144,24 @@ async def validate_image_url(
             raise ImageUrlRejectedError(
                 f"Refusing to fetch image from non-public address {address} ({host})"
             )
+    return addresses
 
 
 async def fetch_image_url(url: str) -> Base64Image:
-    await validate_image_url(url)
+    parsed = _parse_image_url(url)
+    addresses = await validate_image_url(parsed)
+    host = parsed.raw_host
+    assert host is not None
     headers = {"User-Agent": "exo/1.0"}
     async with (
-        create_http_session(timeout_profile="short") as session,
+        create_http_session(
+            timeout_profile="short",
+            resolver=_PinnedImageResolver(host, addresses),
+            use_env_proxy=False,
+        ) as session,
         # Redirects are not followed: a public URL could otherwise bounce
         # the request to an address validate_image_url just rejected.
-        session.get(url, headers=headers, allow_redirects=False) as resp,
+        session.get(parsed, headers=headers, allow_redirects=False) as resp,
     ):
         if 300 <= resp.status < 400:
             raise ImageUrlRejectedError(
