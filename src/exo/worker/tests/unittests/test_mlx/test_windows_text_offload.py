@@ -622,31 +622,40 @@ def test_windows_gpu_bfloat16_untied_head_matches_cuda_reference() -> None:
         ]
     wrapped = _prepare(model, _policy())
     actual_cache = [KVCache(), KVCache()]
-    for tokens, expected in zip(([1, 2, 3], [4], [5]), reference, strict=True):
-        actual = _forward(wrapped, tokens, actual_cache)
-        np.testing.assert_allclose(
-            np.array(actual.astype(mx.float32)),
-            np.array(expected.astype(mx.float32)),
-            atol=0.03,
-            rtol=0.03,
-        )
-        assert wrapped.active_layer is None
-    expected_stages = 3 * sum(
-        layer.host_parameters is not None for layer in wrapped.staging.layers
-    )
-    assert wrapped.stages_opened == wrapped.stages_closed == expected_stages
-    assert [entry.offset for entry in actual_cache] == [5, 5]
-    for expected_cache, actual_entry in zip(reference_cache, actual_cache, strict=True):
-        for expected_value, actual_value in zip(
-            expected_cache.state, actual_entry.state, strict=True
-        ):
-            assert expected_value is not None and actual_value is not None
+    try:
+        for tokens, expected in zip(([1, 2, 3], [4], [5]), reference, strict=True):
+            actual = _forward(wrapped, tokens, actual_cache)
             np.testing.assert_allclose(
-                np.array(actual_value.astype(mx.float32)),
-                np.array(expected_value.astype(mx.float32)),
+                np.array(actual.astype(mx.float32)),
+                np.array(expected.astype(mx.float32)),
                 atol=0.03,
                 rtol=0.03,
             )
+            assert wrapped.active_layer is None
+        expected_stages = 3 * sum(
+            layer.host_parameters is not None for layer in wrapped.staging.layers
+        )
+        assert wrapped.stages_opened == wrapped.stages_closed == expected_stages
+        assert [entry.offset for entry in actual_cache] == [5, 5]
+        for expected_cache, actual_entry in zip(
+            reference_cache, actual_cache, strict=True
+        ):
+            for expected_value, actual_value in zip(
+                expected_cache.state, actual_entry.state, strict=True
+            ):
+                assert expected_value is not None and actual_value is not None
+                np.testing.assert_allclose(
+                    np.array(actual_value.astype(mx.float32)),
+                    np.array(expected_value.astype(mx.float32)),
+                    atol=0.03,
+                    rtol=0.03,
+                )
+    finally:
+        # All returned logits were evaluated by _forward; settle before KV release.
+        wrapped.settle_request()
+        actual_cache.clear()
+        reference_cache.clear()
+        wrapped.close()
 
 
 def test_partial_weight_copy_failure_keeps_canonical_host_parameters(
@@ -705,20 +714,29 @@ def test_windows_gpu_staging_matches_tiny_qwen3_cpu_reference(
     ]
     wrapped = _prepare(model, _policy())
     actual_cache = [KVCache(), KVCache()]
-    for tokens, expected in zip(([1, 2, 3], [4], [5]), reference, strict=True):
-        actual = _forward(wrapped, tokens, actual_cache)
-        np.testing.assert_allclose(
-            np.array(actual), np.array(expected), atol=0.02, rtol=0.01
+    try:
+        for tokens, expected in zip(([1, 2, 3], [4], [5]), reference, strict=True):
+            actual = _forward(wrapped, tokens, actual_cache)
+            np.testing.assert_allclose(
+                np.array(actual), np.array(expected), atol=0.02, rtol=0.01
+            )
+            assert wrapped.active_layer is None
+        expected_stages = 3 * sum(
+            layer.host_parameters is not None for layer in wrapped.staging.layers
         )
-        assert wrapped.active_layer is None
-    expected_stages = 3 * sum(
-        layer.host_parameters is not None for layer in wrapped.staging.layers
-    )
-    assert wrapped.stages_opened == wrapped.stages_closed == expected_stages
-    for expected, actual in zip(reference_cache, actual_cache, strict=True):
-        for a, b in zip(expected.state, actual.state, strict=True):
-            np.testing.assert_allclose(np.array(a), np.array(b), atol=0.02, rtol=0.01)
-    _exercise_failure_and_recovery(wrapped, monkeypatch)
+        assert wrapped.stages_opened == wrapped.stages_closed == expected_stages
+        for expected, actual in zip(reference_cache, actual_cache, strict=True):
+            for a, b in zip(expected.state, actual.state, strict=True):
+                np.testing.assert_allclose(
+                    np.array(a), np.array(b), atol=0.02, rtol=0.01
+                )
+        _exercise_failure_and_recovery(wrapped, monkeypatch)
+    finally:
+        # All returned logits were evaluated by _forward; settle before KV release.
+        wrapped.settle_request()
+        actual_cache.clear()
+        reference_cache.clear()
+        wrapped.close()
 
 
 def test_duplicate_cache_owners_are_rejected(cpu_staging: None) -> None:
