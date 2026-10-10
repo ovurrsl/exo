@@ -55,12 +55,14 @@ from exo.utils.task_group import TaskGroup
 from exo.worker.runner.bootstrap import RunnerTerminationError, entrypoint
 from exo.worker.runner.diagnostics import (
     RunnerDiagnosticCollector,
+    RunnerRingTransportError,
     RunnerUnknown,
 )
 from exo.worker.runner.windows_progress import WindowsProgressWatchdog
 
 PREFILL_TIMEOUT_SECONDS = 60
 DECODE_TIMEOUT_SECONDS = 5
+RUNNER_WATCH_INTERVAL = 5.0
 
 
 @dataclass(eq=False)
@@ -425,15 +427,27 @@ class RunnerSupervisor:
     async def _watch_runner(self) -> None:
         with self._cancel_watch_runner:
             while True:
-                await anyio.sleep(5)
+                await anyio.sleep(RUNNER_WATCH_INTERVAL)
                 if not self.runner_process.is_alive():
                     await self._check_runner(RuntimeError("Runner found to be dead"))
+                elif not self._windows_stopping and self._lost_its_peers():
+                    await self._check_runner(
+                        RuntimeError(
+                            "Lost the connection to the instance's other runners"
+                        )
+                    )
                 elif self._windows_progress is not None and not self._windows_stopping:
                     failure = self._windows_progress.failure(
                         time.monotonic(), self.status, bool(self.in_progress)
                     )
                     if failure is not None:
                         await self._check_runner(TimeoutError(failure))
+
+    def _lost_its_peers(self) -> bool:
+        return any(
+            isinstance(diagnostic, RunnerRingTransportError)
+            for diagnostic in self._runner_stdio_handler.diagnostics.diagnostics()
+        )
 
     async def _check_runner(
         self, e: RunnerTerminationError | Exception | None = None
