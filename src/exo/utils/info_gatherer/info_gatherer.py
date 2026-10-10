@@ -8,6 +8,7 @@ from subprocess import CalledProcessError
 from typing import Self, cast
 
 import anyio
+import psutil
 from anyio import fail_after, open_process, to_thread
 from anyio.streams.buffered import BufferedByteReceiveStream
 from loguru import logger
@@ -30,6 +31,8 @@ from exo.shared.types.thunderbolt import (
 from exo.utils.channels import Sender
 from exo.utils.pydantic_ext import TaggedModel
 from exo.utils.task_group import TaskGroup
+from exo.utils.windows_cuda_health import probe_windows_cuda
+from exo.utils.windows_gpu import last_known_gpu_total, read_gpu_memory
 
 from .macmon import MacmonMetrics
 from .system_info import (
@@ -355,18 +358,62 @@ async def _gather_iface_map() -> dict[str, str] | None:
 
 
 def _has_nvml_cuda() -> bool:
-    try:
-        import pynvml as nvml  # pyright: ignore[reportMissingModuleSource]
-    except ImportError:
+    if sys.platform == "darwin":
         return False
-    try:
-        nvml.nvmlInit()
+    else:
         try:
-            return nvml.nvmlDeviceGetCount() > 0
-        finally:
-            nvml.nvmlShutdown()
-    except Exception:
-        return False
+            import pynvml as nvml
+        except ImportError:
+            return False
+        try:
+            nvml.nvmlInit()
+            try:
+                return nvml.nvmlDeviceGetCount() > 0
+            finally:
+                nvml.nvmlShutdown()
+        except Exception:
+            return False
+
+
+# GPU memory a Windows CUDA node leaves out of what it reports, for the KV
+# cache, prefill activations and the CUDA context.
+WINDOWS_GPU_MEMORY_RESERVE = Memory.from_mb(2560)
+
+
+def gather_memory_usage(override_memory: int | None) -> MemoryUsage:
+    """This node's memory as the master should see it.
+
+    System RAM, except on a Windows CUDA node: there the weights and the KV
+    cache live in GPU memory, so it reports the GPU's total memory and its
+    free memory minus WINDOWS_GPU_MEMORY_RESERVE (see read_gpu_memory).
+    On Windows an override can reduce that budget, but cannot exceed it.
+    """
+    if sys.platform != "win32":
+        return MemoryUsage.from_psutil(override_memory=override_memory)
+    return _windows_memory_usage(override_memory)
+
+
+def _windows_memory_usage(override_memory: int | None) -> MemoryUsage:
+    gpu = read_gpu_memory()
+    available = (
+        max(0, gpu.free.in_bytes - WINDOWS_GPU_MEMORY_RESERVE.in_bytes)
+        if gpu is not None
+        else 0
+    )
+    if override_memory is not None:
+        available = min(available, max(0, override_memory))
+    try:
+        swap = psutil.swap_memory()
+        swap_total, swap_available = swap.total, swap.free
+    except (OSError, RuntimeError):
+        # Swap is an optional diagnostic, never a fallback CUDA weight budget.
+        swap_total, swap_available = 0, 0
+    return MemoryUsage.from_bytes(
+        ram_total=(gpu.total if gpu is not None else last_known_gpu_total()).in_bytes,
+        ram_available=available,
+        swap_total=swap_total,
+        swap_available=swap_available,
+    )
 
 
 class NodeBackends(TaggedModel):
@@ -374,11 +421,20 @@ class NodeBackends(TaggedModel):
 
     @classmethod
     async def gather(cls) -> Self:
+        if sys.platform == "win32":
+            # Probe checkpoints observe task cancellation and kill/reap leaves
+            # before this non-abandoned worker thread returns to shutdown.
+            health = await to_thread.run_sync(probe_windows_cuda)
+            if not health.available:
+                logger.warning(f"Windows CUDA backend unavailable: {health.reason}")
+            return cls(backends=[Backend.MlxCuda] if health.available else [])
         backends: list[Backend] = [Backend.MlxCpu]
         if IS_DARWIN:
             backends.append(Backend.MlxMetal)
         if await to_thread.run_sync(_has_nvml_cuda):
             backends.append(Backend.MlxCuda)
+            # vLLM has no native Windows build; advertising it would let the
+            # master place vLLM instances on a node that cannot run them.
             backends.append(Backend.Vllm)
         return cls(backends=backends)
 
@@ -454,15 +510,27 @@ class InfoGatherer:
             tg.start_soon(self._monitor_misc, 60)
             tg.start_soon(self._monitor_static_info, 60)
             tg.start_soon(self._monitor_disk_usage, 30)
+            if sys.platform == "win32":
+                tg.start_soon(self._monitor_windows_backends, 30)
 
             nc = await NodeConfig.gather()
             if nc is not None:
                 await self.info_sender.send(nc)
 
-            await self.info_sender.send(await NodeBackends.gather())
+            if sys.platform != "win32":
+                await self.info_sender.send(await NodeBackends.gather())
 
     def shutdown(self):
         self._tg.cancel_tasks()
+
+    async def _monitor_windows_backends(self, poll_interval: float) -> None:
+        previous: NodeBackends | None = None
+        while True:
+            current = await NodeBackends.gather()
+            if current != previous:
+                await self.info_sender.send(current)
+                previous = current
+            await anyio.sleep(poll_interval)
 
     async def _monitor_static_info(self, static_info_poll_interval: float):
         while True:
@@ -518,11 +586,18 @@ class InfoGatherer:
             if override_memory_env
             else None
         )
+        # The first read initialises NVML, which can take a while on Windows.
+        if (
+            override_memory is None
+            and await to_thread.run_sync(read_gpu_memory) is not None
+        ):
+            logger.info(
+                "Reporting GPU memory as this node's memory, keeping "
+                f"{WINDOWS_GPU_MEMORY_RESERVE.in_mb} MB of it in reserve"
+            )
         while True:
             try:
-                await self.info_sender.send(
-                    MemoryUsage.from_psutil(override_memory=override_memory)
-                )
+                await self.info_sender.send(gather_memory_usage(override_memory))
             except Exception as e:
                 logger.opt(exception=e).warning("Error gathering memory usage")
             await anyio.sleep(memory_poll_rate)

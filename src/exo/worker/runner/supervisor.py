@@ -1,6 +1,8 @@
 import codecs
 import contextlib
 import signal
+import sys
+import time
 from dataclasses import dataclass, field
 from os import PathLike
 from typing import Callable, Self
@@ -27,6 +29,7 @@ from exo.shared.types.tasks import (
     CANCEL_ALL_TASKS,
     ImageEdits,
     ImageGeneration,
+    Shutdown,
     Task,
     TaskId,
     TaskStatus,
@@ -39,6 +42,7 @@ from exo.shared.types.worker.runners import (
     RunnerIdle,
     RunnerLoading,
     RunnerRunning,
+    RunnerShutdown,
     RunnerShuttingDown,
     RunnerStatus,
     RunnerWarmingUp,
@@ -51,11 +55,14 @@ from exo.utils.task_group import TaskGroup
 from exo.worker.runner.bootstrap import RunnerTerminationError, entrypoint
 from exo.worker.runner.diagnostics import (
     RunnerDiagnosticCollector,
+    RunnerRingTransportError,
     RunnerUnknown,
 )
+from exo.worker.runner.windows_progress import WindowsProgressWatchdog
 
 PREFILL_TIMEOUT_SECONDS = 60
 DECODE_TIMEOUT_SECONDS = 5
+RUNNER_WATCH_INTERVAL = 5.0
 
 
 @dataclass(eq=False)
@@ -195,6 +202,11 @@ class RunnerSupervisor:
     in_progress: dict[TaskId, Task] = field(default_factory=dict, init=False)
     completed: set[TaskId] = field(default_factory=set, init=False)
     cancelled: set[TaskId] = field(default_factory=set, init=False)
+    _windows_progress: WindowsProgressWatchdog | None = field(default=None, init=False)
+    _windows_stopping: bool = field(default=False, init=False)
+    _shutdown_forwarded: anyio.Event = field(default_factory=anyio.Event, init=False)
+    _windows_close_done: anyio.Event = field(default_factory=anyio.Event, init=False)
+    _windows_close_succeeded: bool = field(default=False, init=False)
     _cancel_watch_runner: anyio.CancelScope = field(
         default_factory=anyio.CancelScope, init=False
     )
@@ -240,6 +252,11 @@ class RunnerSupervisor:
             _event_sender=event_sender,
         )
 
+        if sys.platform == "win32":
+            self._windows_progress = WindowsProgressWatchdog(
+                time.monotonic(), initialize_timeout
+            )
+
         return self
 
     async def run(self):
@@ -275,6 +292,40 @@ class RunnerSupervisor:
     def shutdown(self):
         self._tg.cancel_tasks()
 
+    async def close_windows_runner(self, task: Shutdown | None = None) -> bool:
+        """Request owned Windows worker exit before the enclosing group cancels."""
+        if sys.platform != "win32":
+            return True
+        if self._windows_stopping:
+            await self._windows_close_done.wait()
+            return self._windows_close_succeeded
+        self._windows_stopping = True
+        try:
+            with anyio.fail_after(8):
+                with contextlib.suppress(ClosedResourceError):
+                    await self._cancel_sender.send_async(CANCEL_ALL_TASKS)
+                await self.start_task(
+                    task
+                    or Shutdown(
+                        instance_id=self.bound_instance.instance.instance_id,
+                        runner_id=self.bound_instance.bound_runner_id,
+                    )
+                )
+                # The task-reader thread must also receive EOF. Leaving this
+                # pipe open keeps its non-daemon thread alive after Shutdown.
+                self._task_sender.close()
+                code = await self.runner_process.wait()
+                self._windows_close_succeeded = code == 0
+                if code != 0:
+                    logger.warning(f"Windows runner shutdown returned exit code {code}")
+        except (TimeoutError, ClosedResourceError, BrokenResourceError, OSError):
+            logger.warning(
+                "Windows runner did not finish cooperative shutdown; stopping owned process"
+            )
+        finally:
+            self._windows_close_done.set()
+        return self._windows_close_succeeded
+
     async def start_task(self, task: Task):
         if task.task_id in self.pending:
             logger.warning(
@@ -290,6 +341,8 @@ class RunnerSupervisor:
         event = anyio.Event()
         self.pending[task.task_id] = event
         self.in_progress[task.task_id] = task
+        if self._windows_progress is not None:
+            self._windows_progress.progress(time.monotonic())
         try:
             await self._task_sender.send_async(task)
         except ClosedResourceError:
@@ -297,6 +350,10 @@ class RunnerSupervisor:
             logger.warning(f"Task {task} dropped, runner closed communication.")
             return
         await event.wait()
+        if isinstance(task, Shutdown):
+            # The worker cancels this supervisor when start_task returns.
+            # Acknowledgement alone can drop the final cluster-state event.
+            await self._shutdown_forwarded.wait()
 
     async def cancel_task(self, task_id: TaskId):
         if task_id in self.completed:
@@ -304,6 +361,8 @@ class RunnerSupervisor:
             self.cancelled.add(task_id)
             return
         self.cancelled.add(task_id)
+        if self._windows_progress is not None and task_id in self.in_progress:
+            self._windows_progress.cancel(task_id, time.monotonic())
         with anyio.move_on_after(0.5) as scope:
             try:
                 await self._cancel_sender.send_async(task_id)
@@ -320,6 +379,8 @@ class RunnerSupervisor:
         try:
             with self._ev_recv as events:
                 async for event in events:
+                    if self._windows_progress is not None:
+                        self._windows_progress.progress(time.monotonic())
                     if isinstance(event, RunnerTerminationError):
                         # try to get exception if possible
                         await self._check_runner(event)
@@ -329,9 +390,12 @@ class RunnerSupervisor:
                     if isinstance(event, TaskAcknowledged):
                         self.pending.pop(event.task_id).set()
                         continue
-                    if (
-                        isinstance(event, TaskStatusUpdated)
-                        and event.task_status == TaskStatus.Complete
+                    if isinstance(event, TaskStatusUpdated) and (
+                        event.task_status == TaskStatus.Complete
+                        or (
+                            self._windows_progress is not None
+                            and event.task_status == TaskStatus.Cancelled
+                        )
                     ):
                         # If a task has just been completed, we should be working on it.
                         assert isinstance(
@@ -346,7 +410,13 @@ class RunnerSupervisor:
                         )
                         self.in_progress.pop(event.task_id, None)
                         self.completed.add(event.task_id)
+                        if self._windows_progress is not None:
+                            self._windows_progress.completed(event.task_id)
                     await self._event_sender.send(event)
+                    if isinstance(event, RunnerStatusUpdated) and isinstance(
+                        event.runner_status, RunnerShutdown
+                    ):
+                        self._shutdown_forwarded.set()
         except (ClosedResourceError, BrokenResourceError):
             # this is the happy path shutdown - we don't need to spam log with it
             await self._check_runner()
@@ -357,13 +427,36 @@ class RunnerSupervisor:
     async def _watch_runner(self) -> None:
         with self._cancel_watch_runner:
             while True:
-                await anyio.sleep(5)
+                await anyio.sleep(RUNNER_WATCH_INTERVAL)
                 if not self.runner_process.is_alive():
                     await self._check_runner(RuntimeError("Runner found to be dead"))
+                elif not self._windows_stopping and self._lost_its_peers():
+                    await self._check_runner(
+                        RuntimeError(
+                            "Lost the connection to the instance's other runners"
+                        )
+                    )
+                elif self._windows_progress is not None and not self._windows_stopping:
+                    failure = self._windows_progress.failure(
+                        time.monotonic(), self.status, bool(self.in_progress)
+                    )
+                    if failure is not None:
+                        await self._check_runner(TimeoutError(failure))
+
+    def _lost_its_peers(self) -> bool:
+        return any(
+            isinstance(diagnostic, RunnerRingTransportError)
+            for diagnostic in self._runner_stdio_handler.diagnostics.diagnostics()
+        )
 
     async def _check_runner(
         self, e: RunnerTerminationError | Exception | None = None
     ) -> None:
+        # A Windows worker closes its event pipe before Python/native-library
+        # finalization finishes. The cooperative closer owns that exit wait;
+        # cancelling AsyncProcess here applies its shorter generic join grace.
+        if self._windows_stopping and e is None and self.runner_process.is_alive():
+            return
         if not self._cancel_watch_runner.cancel_called:
             self._cancel_watch_runner.cancel()
         logger.info("Checking runner's status")
@@ -375,7 +468,9 @@ class RunnerSupervisor:
         logger.info(f"Runner exited with exit code {rc}")
 
         # If exit code is 0 then the transient errors were recoverable, meaning we don't need runner diagnostics
-        if rc == 0:
+        if rc == 0 and (
+            e is None or self._windows_progress is None or self._windows_stopping
+        ):
             return
 
         if isinstance(rc, int) and rc < 0:

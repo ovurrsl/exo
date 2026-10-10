@@ -10,6 +10,7 @@ export default defineConfig({
       "/state": "http://localhost:52415",
       "/models": "http://localhost:52415",
       "/instance": "http://localhost:52415",
+      "/windows/model-capacity": "http://localhost:52415",
     },
   },
 });

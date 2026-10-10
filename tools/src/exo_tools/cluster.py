@@ -15,6 +15,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -98,7 +99,12 @@ class EcoSession:
 
         # Register cleanup handlers
         atexit.register(self.stop_all)
-        for sig in (signal.SIGTERM, signal.SIGHUP):
+        shutdown_signals = (
+            (signal.SIGTERM,)
+            if sys.platform == "win32"
+            else (signal.SIGTERM, signal.SIGHUP)
+        )
+        for sig in shutdown_signals:
             signal.signal(sig, self._signal_handler)
 
     def _signal_handler(self, signum: int, _frame: object) -> None:

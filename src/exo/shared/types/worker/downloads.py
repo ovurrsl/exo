@@ -57,7 +57,7 @@ class ModelSafetensorsIndexMetadata(BaseModel):
 
 
 class ModelSafetensorsIndex(BaseModel):
-    metadata: ModelSafetensorsIndexMetadata | None
+    metadata: ModelSafetensorsIndexMetadata | None = None
     weight_map: dict[str, str]
 
 

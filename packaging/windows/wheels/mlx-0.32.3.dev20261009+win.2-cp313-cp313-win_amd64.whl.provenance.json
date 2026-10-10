@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "upstream_commit": "64ea011cb65f14d9ce2737e60db9a4ae91ed7441",
+  "patch_sha256": "dfa80c9391b37cf656bee124f43c3684da19e9a1feb517315aa1b5f3d6e70fe4",
+  "wheel_filename": "mlx-0.32.3.dev20261009+win.2-cp313-cp313-win_amd64.whl",
+  "wheel_sha256": "130b4426dce31f3cb0fa1a2e79bf452d780e477cc35d86acec93dfe5a2294796",
+  "backend": "cuda13",
+  "architectures": "120a-real;120-virtual",
+  "built_at_utc": "2026-10-09T19:44:32.0249789Z",
+  "release_gates": "native Unicode/CUDA/ring gates and full local FLUX generation/cancellation/recovery passed; frozen, installer and physical Mac gates pending"
+}

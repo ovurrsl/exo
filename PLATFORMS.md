@@ -32,7 +32,7 @@ Linux CUDA Support -- depends heavily on ecosystem
 
 ## Longer term!
 
-Windows CUDA Support
+Windows CUDA Support -- experimental, see [docs/windows.md](docs/windows.md)
 
 Windows CPU Support
 

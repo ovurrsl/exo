@@ -1,0 +1,11 @@
+{
+  "identifier": "io.ovurrsl.exo.test.native-settings-probe",
+  "build": { "beforeDevCommand": "", "beforeBuildCommand": "" },
+  "app": { "windows": [] },
+  "bundle": {
+    "active": false,
+    "resources": [],
+    "createUpdaterArtifacts": false,
+    "windows": { "webviewInstallMode": { "type": "skip" } }
+  }
+}

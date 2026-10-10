@@ -67,6 +67,7 @@
     isConnected,
     type DownloadProgress,
     type PlacementPreview,
+    windowsModelCapacities,
   } from "$lib/stores/app.svelte";
   import { addToast, dismissByMessage } from "$lib/stores/toast.svelte";
   import HeaderNav from "$lib/components/HeaderNav.svelte";
@@ -75,6 +76,12 @@
   import { tweened } from "svelte/motion";
   import { cubicInOut, cubicOut } from "svelte/easing";
   import { onMount } from "svelte";
+  import { getWindowsCudaImageFitStatus } from "$lib/utils/windows-image-fit";
+  import {
+    getWindowsModelFitStatus,
+    isModelLoadable,
+    type ModelFitStatus,
+  } from "$lib/utils/windows-model-capacity";
 
   const chatStarted = $derived(hasStartedChat());
   const minimized = $derived(isTopologyMinimized());
@@ -785,10 +792,7 @@
       capabilities?: string[];
     }>
   >([]);
-  type ModelMemoryFitStatus =
-    | "fits_now"
-    | "fits_cluster_capacity"
-    | "too_large";
+  type ModelMemoryFitStatus = ModelFitStatus;
 
   // Model tasks lookup for ChatForm - maps both short IDs and full HuggingFace IDs
   const modelTasks = $derived(() => {
@@ -1213,6 +1217,34 @@
     storage_size_megabytes?: number;
   }): ModelMemoryFitStatus {
     const modelSizeGB = getModelSizeGB(model);
+    const windowsCapacityFit = getWindowsModelFitStatus(
+      model.id,
+      windowsModelCapacities(),
+      data?.nodes ?? {},
+      {
+        minNodes: selectedMinNodes,
+        instanceType: selectedInstanceType,
+        nodeFilter,
+      },
+    );
+    const windowsImageFit = getWindowsCudaImageFitStatus(
+      model.id,
+      data?.nodes ?? {},
+      downloadsData,
+      {
+        minNodes: selectedMinNodes,
+        instanceType: selectedInstanceType,
+        nodeFilter,
+        modelStorageBytes: modelSizeGB * 1024 * 1024 * 1024,
+      },
+    );
+    if (windowsImageFit !== null) {
+      return windowsImageFit === "fits_now" &&
+        windowsCapacityFit === "fits_vram"
+        ? "fits_vram"
+        : windowsImageFit;
+    }
+    if (windowsCapacityFit !== null) return windowsCapacityFit;
     if (modelSizeGB <= availableMemoryGB()) {
       return "fits_now";
     }
@@ -1228,7 +1260,7 @@
     name?: string;
     storage_size_megabytes?: number;
   }): boolean {
-    return getModelMemoryFitStatus(model) === "fits_now";
+    return isModelLoadable(getModelMemoryFitStatus(model));
   }
 
   // Sorted models for dropdown - biggest first, unrunnable at the end

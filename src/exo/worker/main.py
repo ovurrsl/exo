@@ -1,4 +1,6 @@
 import hashlib
+import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -61,6 +63,8 @@ from exo.utils.task_group import TaskGroup
 from exo.worker.plan import plan
 from exo.worker.runner.supervisor import RunnerSupervisor
 
+DELETION_REQUEST_RETRY = 10.0
+
 
 class Worker:
     def __init__(
@@ -97,7 +101,10 @@ class Worker:
         self._instance_backoff: KeyedBackoff[InstanceId] = KeyedBackoff(
             base=0.5, cap=10.0
         )
+        self._deletion_requested: dict[InstanceId, float] = {}
         self._stopped: anyio.Event = anyio.Event()
+        self.windows_draining: bool = False
+        self._windows_creation_lock = anyio.Lock()
 
     async def run(self):
         logger.info("Starting Worker")
@@ -146,6 +153,7 @@ class Worker:
 
                 if isinstance(event, InstanceDeleted):
                     self._instance_backoff.reset(event.instance_id)
+                    self._deletion_requested.pop(event.instance_id, None)
 
                 # Buffer input image chunks for image editing
                 if isinstance(event, InputChunkReceived):
@@ -193,6 +201,8 @@ class Worker:
     async def plan_step(self):
         while True:
             await anyio.sleep(0.1)
+            if self.windows_draining:
+                continue
             task: Task | None = plan(
                 self.node_id,
                 self.runners,
@@ -211,20 +221,34 @@ class Worker:
             if isinstance(task, CreateRunner):
                 iid = task.instance_id
                 if self._instance_backoff.attempts(iid) >= EXO_MAX_INSTANCE_RETRIES:
-                    logger.warning(
-                        f"Instance {iid} exceeded {EXO_MAX_INSTANCE_RETRIES} retries, requesting deletion"
-                    )
-                    await self.command_sender.send(
-                        ForwarderCommand(
-                            origin=self._system_id,
-                            command=DeleteInstance(instance_id=iid),
+                    requested_at = self._deletion_requested.get(iid)
+                    now = time.monotonic()
+                    if (
+                        requested_at is None
+                        or now - requested_at >= DELETION_REQUEST_RETRY
+                    ):
+                        logger.warning(
+                            f"Instance {iid} exceeded {EXO_MAX_INSTANCE_RETRIES} retries, requesting deletion"
                         )
-                    )
+                        await self.command_sender.send(
+                            ForwarderCommand(
+                                origin=self._system_id,
+                                command=DeleteInstance(instance_id=iid),
+                            )
+                        )
+                        self._deletion_requested[iid] = now
                     continue
 
             logger.info(f"Worker plan: {task.__class__.__name__}")
             assert task.task_status
-            await self.event_sender.send(TaskCreated(task_id=task.task_id, task=task))
+            # State tasks have already been indexed. Re-announcing one from a
+            # lagging worker can resurrect a request the master just cancelled.
+            if task.task_id not in self.state.tasks:
+                await self.event_sender.send(
+                    TaskCreated(task_id=task.task_id, task=task)
+                )
+            if self.windows_draining:
+                continue
 
             # lets not kill the worker if a runner is unresponsive
             match task:
@@ -279,10 +303,18 @@ class Worker:
                             )
                         )
                 case Shutdown(runner_id=runner_id):
-                    runner = self.runners.pop(runner_id)
+                    runner = self.runners[runner_id]
+                    if sys.platform != "win32":
+                        self.runners.pop(runner_id)
                     try:
-                        with fail_after(3):
-                            await runner.start_task(task)
+                        if sys.platform == "win32":
+                            # Retain ownership until finalization so concurrent
+                            # node shutdown also waits for this closer.
+                            if not await runner.close_windows_runner(task):
+                                raise TimeoutError
+                        else:
+                            with fail_after(3):
+                                await runner.start_task(task)
                     except TimeoutError:
                         await self.event_sender.send(
                             TaskStatusUpdated(
@@ -290,6 +322,7 @@ class Worker:
                             )
                         )
                     finally:
+                        self.runners.pop(runner_id, None)
                         runner.shutdown()
                 case CancelTask(
                     cancelled_task_id=cancelled_task_id, runner_id=runner_id
@@ -376,7 +409,58 @@ class Worker:
                 instance.shard_assignments.node_to_runner[self.node_id]
             ].start_task(task)
 
-    async def _create_supervisor(self, task: CreateRunner) -> RunnerSupervisor:
+    async def stop_windows_admission(self) -> None:
+        self.windows_draining = True
+        # Finish registering any supervisor whose creation was already admitted.
+        async with self._windows_creation_lock:
+            pass
+
+    async def close_windows_instances(self) -> None:
+        runners = tuple(self.runners.values())
+        instances = {
+            runner.bound_instance.instance.instance_id: runner.bound_instance.instance
+            for runner in runners
+        }
+        distributed_runners = {
+            runner_id
+            for instance in instances.values()
+            for runner_id in instance.shard_assignments.node_to_runner.values()
+        }
+        # Keep the peer's planner alive long enough to use its normal Shutdown
+        # path instead of triggering an election with a still-owned worker.
+        commands_available = True
+        try:
+            for instance_id in instances:
+                await self.command_sender.send(
+                    ForwarderCommand(
+                        origin=self._system_id,
+                        command=DeleteInstance(instance_id=instance_id),
+                    )
+                )
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+            commands_available = False
+            logger.warning(
+                "Cluster shutdown command channel unavailable; closing owned Windows runners"
+            )
+        async with anyio.create_task_group() as closing:
+            for runner in runners:
+                closing.start_soon(runner.close_windows_runner)
+        if not commands_available:
+            return
+        while instances.keys() & self.state.instances.keys() or (
+            distributed_runners & self.state.runners.keys()
+        ):
+            await anyio.sleep(0.05)
+
+    async def _create_supervisor(self, task: CreateRunner) -> RunnerSupervisor | None:
+        if sys.platform == "win32":
+            async with self._windows_creation_lock:
+                if self.windows_draining:
+                    return None
+                return await self._create_running_supervisor(task)
+        return await self._create_running_supervisor(task)
+
+    async def _create_running_supervisor(self, task: CreateRunner) -> RunnerSupervisor:
         """Creates and stores a new AssignedRunner with initial downloading status."""
         runner = await RunnerSupervisor.create(
             bound_instance=task.bound_instance,

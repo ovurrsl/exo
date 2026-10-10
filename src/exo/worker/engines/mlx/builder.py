@@ -2,6 +2,7 @@ import contextlib
 import os
 from collections.abc import Generator
 from dataclasses import dataclass
+from typing import cast
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -9,7 +10,7 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 from exo.shared.types.common import ModelId
 from exo.shared.types.events import Event
 from exo.shared.types.tasks import TaskId
-from exo.shared.types.worker.instances import BoundInstance
+from exo.shared.types.worker.instances import BoundInstance, MlxJacclInstance
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.utils.channels import MpReceiver, MpSender
 from exo.worker.engines.base import Builder, Engine
@@ -20,13 +21,15 @@ from exo.worker.runner.llm_inference.batch_generator import (
 )
 from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
-from .cache import KVPrefixCache
+from .cache import KVPrefixCache, discover_cuda_cache_group
+from .snapshot_guard import verify_cuda_group_contract
 from .types import Model
 from .utils_mlx import (
     initialize_mlx,
     load_mlx_items,
 )
 from .vision import VisionProcessor
+from .windows_text_offload import WindowsQwen3OffloadModel
 
 
 @dataclass
@@ -38,11 +41,21 @@ class MlxBuilder(Builder):
     tokenizer: TokenizerWrapper | None = None
     group: mx.distributed.Group | None = None
     vision_processor: VisionProcessor | None = None
+    cuda_cache_group: bool = False
 
     def connect(self, bound_instance: BoundInstance) -> None:
         self.group = initialize_mlx(bound_instance)
+        self.cuda_cache_group = (
+            False
+            if isinstance(bound_instance.instance, MlxJacclInstance)
+            else discover_cuda_cache_group(self.group)
+        )
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
+        if self.group is None:
+            self.cuda_cache_group = discover_cuda_cache_group(None)
+        if self.cuda_cache_group and self.group is not None:
+            verify_cuda_group_contract(bound_instance, self.group)
         (
             self.inference_model,
             self.tokenizer,
@@ -80,10 +93,12 @@ class MlxBuilder(Builder):
                 self.tokenizer.tool_parser,  # type: ignore
             )
 
-        kv_prefix_cache = KVPrefixCache(self.group)
+        kv_prefix_cache = KVPrefixCache(self.group, cuda_group=self.cuda_cache_group)
 
         device_rank = 0 if self.group is None else self.group.rank()
-        if os.environ.get("EXO_NO_BATCH"):
+        if os.environ.get("EXO_NO_BATCH") or isinstance(
+            cast(object, self.inference_model), WindowsQwen3OffloadModel
+        ):
             logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(
                 model=self.inference_model,
