@@ -43,8 +43,31 @@ every model fitting physical RAM is supported or that performance equals VRAM.
   and individual labels in expanded multi-variant groups. Prettier check passed.
 - `mlx-community/Qwen3-32B-4bit` revision
   `bcaaf7f538adf166c1080a2befdb4f6019f66639` was selected for large-model acceptance
-  (18,429,667,328 tensor bytes). Download and actual large-model acceptance remain
-  pending. Do not claim production RAM offload acceptance from unit tests.
+  (18,429,667,328 tensor bytes). Download completed; all four large shards passed
+  their pinned LFS SHA-256 checks. Actual large-model acceptance is in progress.
+  Do not claim production RAM offload acceptance from unit tests.
 - The running frozen Windows application still contains the older runtime.
   Rebuilding and replacing the installed runtime is a separate pending step.
 - Mac clustering remains deferred as requested. No Mac Swift files were changed.
+
+## Restricted loader security correction
+
+The opt-in loader previously called MLX before checking the concrete model type.
+MLX can execute a snapshot's `model_file` during that call. A harmless local marker
+test reproduced execution before rejection. The restricted loader now requires a
+flat built-in `qwen3` configuration and rejects any `model_file` field before
+loading. Explicit dispatch overrides also protect MLX's subsequent config reread.
+Its separate tokenizer loader forces `trust_remote_code=False` and bypasses
+model-ID-driven custom Python imports. Existing normal and distributed loaders
+retain their prior paths; the newly introduced 32B card explicitly declines remote
+code as well.
+
+Regression coverage includes custom and parent-relative paths, non-object and
+unsupported configurations, config replacement between validation and use,
+tokenizer `auto_map`, and an offload card whose ID otherwise triggers Kimi imports.
+The malicious marker no longer appears. Real Qwen3-0.6B still produces `Hello!`
+with EOS 151645 and 112 opened/closed stages, no active stage remaining. Independent
+read-only investigation and candidate review found no surviving snapshot-Python
+route in this restricted branch. This is scoped remediation, not a repository-wide
+security audit. The earlier c31 package evidence cannot certify the corrected
+source; packaging must be repeated after the new source freeze.

@@ -5,6 +5,7 @@ n_layers = 64
 hidden_size = 5120
 num_key_value_heads = 8
 supports_tensor = false
+trust_remote_code = false
 tasks = ["TextGeneration"]
 family = "qwen"
 quantization = "4bit"
