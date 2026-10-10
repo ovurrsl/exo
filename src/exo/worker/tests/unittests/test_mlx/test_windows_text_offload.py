@@ -17,6 +17,7 @@ from exo.utils.windows_gpu import GpuMemory
 from exo.worker.engines.mlx import windows_text_offload as offload
 
 _mock_gpu_budget: list[int] | None = None
+_prepared_models: list[offload.WindowsQwen3OffloadModel] | None = None
 
 
 def _overflow_capacity(
@@ -96,9 +97,12 @@ def _prepare(
 ) -> offload.WindowsQwen3OffloadModel:
     if _mock_gpu_budget is not None and isinstance(model, Qwen3Model):
         _mock_gpu_budget[0] = _overflow_capacity(model, policy)
-    return offload.prepare_windows_qwen3_offload(
+    wrapped = offload.prepare_windows_qwen3_offload(
         model, policy, world_size=world_size, vision=vision, cpu_loaded=True
     )
+    if _prepared_models is not None:
+        _prepared_models.append(wrapped)
+    return wrapped
 
 
 def _policy() -> offload.WindowsTextOffloadPolicy:
@@ -115,6 +119,8 @@ def _policy() -> offload.WindowsTextOffloadPolicy:
 
 @pytest.fixture
 def cpu_staging(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    prepared: list[offload.WindowsQwen3OffloadModel] = []
+    monkeypatch.setattr(sys.modules[__name__], "_prepared_models", prepared)
     budget = [0]
     monkeypatch.setattr(sys.modules[__name__], "_mock_gpu_budget", budget)
     monkeypatch.setattr(sys, "platform", "win32")
@@ -129,7 +135,11 @@ def cpu_staging(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         lambda: GpuMemory(Memory.from_gb(12), Memory.from_bytes(budget[0])),
     )
     with mx.stream(mx.Device(mx.cpu)):
-        yield
+        try:
+            yield
+        finally:
+            for wrapped in prepared:
+                wrapped.close()
 
 
 def test_high_capacity_residency_releases_all_host_owners(
@@ -745,3 +755,95 @@ def test_private_cache_credit_is_cleared_before_forward_returns(
         mx.eval(result)
     assert wrapped.staging.cache_pool_ids is None
     assert wrapped.staging.cache_credits == [0, 0]
+
+
+def test_allocator_cache_lease_is_exclusive_and_restores_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits: list[int] = []
+
+    def set_limit(limit: int) -> int:
+        limits.append(limit)
+        return 123
+
+    monkeypatch.setattr(mx, "set_cache_limit", set_limit)
+    monkeypatch.setattr(mx, "clear_cache", lambda: limits.append(-1))
+    lease = offload._CudaCacheLease.acquire()  # pyright: ignore[reportPrivateUsage]
+    assert limits == [0, -1]
+    with pytest.raises(RuntimeError, match="exclusive"):
+        offload._CudaCacheLease.acquire()  # pyright: ignore[reportPrivateUsage]
+    lease.release()
+    lease.release()
+    assert limits == [0, -1, 123]
+
+
+def test_residency_owns_cache_lease_until_model_close(
+    cpu_staging: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[int] = []
+
+    def set_limit(limit: int) -> int:
+        events.append(limit)
+        return 123
+
+    monkeypatch.setattr(mx, "set_cache_limit", set_limit)
+    monkeypatch.setattr(mx, "clear_cache", lambda: events.append(-1))
+    wrapped = _prepare(_model(), _policy())
+    assert events[0:2] == [0, -1]
+    result = wrapped(mx.array([[1]]))
+    mx.eval(result)
+    wrapped.settle_request()
+    assert 123 not in events
+    wrapped.close()
+    assert events[-2:] == [-1, 123]
+    assert wrapped.original.parameters() == {}
+    assert wrapped.staging.layers == ()
+    wrapped.close()
+    assert events.count(123) == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        wrapped(mx.array([[1]]))
+
+
+def test_residency_initialization_failure_restores_allocator_limit(
+    cpu_staging: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[int] = []
+
+    def set_limit(limit: int) -> int:
+        events.append(limit)
+        return 123
+
+    monkeypatch.setattr(mx, "set_cache_limit", set_limit)
+    monkeypatch.setattr(mx, "clear_cache", lambda: events.append(-1))
+
+    def fail(component: nn.Module, stream: mx.Stream) -> None:
+        component["weight"] = mx.array([99.0])
+        raise RuntimeError("allocation-failure")
+
+    monkeypatch.setattr(offload, "_materialize_resident", fail)
+    with pytest.raises(RuntimeError, match="allocation-failure"):
+        _prepare(_model(), _policy())
+    assert events[0:2] == [0, -1]
+    assert events[-2:] == [-1, 123]
+
+
+def test_wrapper_construction_failure_restores_allocator_limit(
+    cpu_staging: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[int] = []
+
+    def set_limit(limit: int) -> int:
+        events.append(limit)
+        return 123
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("wrapper-construction-failure")
+
+    monkeypatch.setattr(mx, "set_cache_limit", set_limit)
+    monkeypatch.setattr(offload, "WindowsQwen3OffloadModel", fail)
+    with pytest.raises(RuntimeError, match="wrapper-construction"):
+        _prepare(_model(), _policy())
+    assert events == [0, 123]

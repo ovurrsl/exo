@@ -4,7 +4,8 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Protocol, cast, final
+from threading import Lock
+from typing import ClassVar, Protocol, Self, cast, final
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -31,6 +32,45 @@ from exo.worker.engines.mlx.types import KVCacheType
 
 type ParameterTree = mx.array | list[ParameterTree] | dict[str, ParameterTree]
 type AttentionMask = mx.array | str | None
+
+
+class _CudaCacheLease:
+    """Exclusive process allocator ownership for a dedicated offload runner.
+
+    CUDA's free-buffer cache can return pinned CPU buffers to GPU operations.
+    Disable reuse throughout the model lifetime, including lazy output graphs.
+    """
+
+    _lock: ClassVar[Lock] = Lock()
+    _active: ClassVar[bool] = False
+
+    def __init__(self, previous_limit: int):
+        self.previous_limit = previous_limit
+        self.released = False
+
+    @classmethod
+    def acquire(cls) -> Self:
+        with cls._lock:
+            if cls._active:
+                raise RuntimeError(
+                    "CUDA offload requires exclusive allocator ownership"
+                )
+            previous = mx.set_cache_limit(0)
+            try:
+                # Setting the limit alone leaves existing pinned entries reusable.
+                mx.clear_cache()
+            except BaseException:
+                mx.set_cache_limit(previous)
+                raise
+            cls._active = True
+            return cls(previous)
+
+    def release(self) -> None:
+        with self._lock:
+            if not self.released:
+                mx.set_cache_limit(self.previous_limit)
+                self.released = True
+                type(self)._active = False
 
 
 class _ParameterModule(Protocol):
@@ -422,6 +462,7 @@ class WindowsQwen3OffloadModel(nn.Module):
         staging: _LayerStaging,
         overflow_host_parameters: dict[str, ParameterTree],
         projection: nn.Module,
+        cache_lease: _CudaCacheLease,
     ):
         super().__init__()
         self.original = original
@@ -429,6 +470,8 @@ class WindowsQwen3OffloadModel(nn.Module):
         self.overflow_host_parameters = overflow_host_parameters
         self.projection = projection
         self.residency_plan = staging.plan
+        self.cache_lease = cache_lease
+        self.closed = False
 
     @property
     def model(self) -> nn.Module:
@@ -462,6 +505,26 @@ class WindowsQwen3OffloadModel(nn.Module):
         mx.synchronize(mx.default_stream(mx.Device(mx.cpu)))
         self.staging.clear_cache_credit()
 
+    def close(self) -> None:
+        """Release allocator ownership after generation and lazy outputs are settled.
+
+        Direct callers must evaluate or discard outstanding output arrays first:
+        stream synchronization cannot schedule an unevaluated external graph.
+        The runner closes generation iterators and settles their streams first.
+        """
+        if self.closed:
+            return
+        self.settle_request()
+        for layer in self.staging.layers:
+            cast(nn.Module, cast(object, layer.module)).clear()
+        self.staging.layers = ()
+        self.overflow_host_parameters.clear()
+        self.original.clear()
+        self.projection.clear()
+        mx.clear_cache()
+        self.cache_lease.release()
+        self.closed = True
+
     @property
     def layers(self) -> list[nn.Module]:
         return cast(_QwenModel, cast(object, self.original)).model.layers
@@ -488,6 +551,8 @@ class WindowsQwen3OffloadModel(nn.Module):
         cache: KVCacheType | None = None,
         input_embeddings: mx.array | None = None,
     ) -> mx.array:
+        if self.closed:
+            raise RuntimeError("Qwen3 offload model is closed")
         policy = self.staging.policy
         if inputs.ndim != 2 or inputs.shape[0] != 1:
             raise ValueError("Experimental Qwen3 offload supports batch size one")
@@ -666,6 +731,7 @@ def prepare_windows_qwen3_offload(
     ):
         raise MemoryError("Qwen3 overflow decoder layer exceeds the GPU stage limit")
     stream = _new_gpu_stream()
+    cache_lease = _CudaCacheLease.acquire()
     resident_modules: list[nn.Module] = []
     overflow_host_parameters: dict[str, ParameterTree] = {}
     try:
@@ -686,35 +752,36 @@ def prepare_windows_qwen3_offload(
             overflow_host_parameters[identifier] = cast(
                 ParameterTree, component.parameters()
             )
+        staging = _LayerStaging(
+            original.model.layers,
+            policy,
+            stream,
+            plan,
+            kv_bytes,
+            kv_scratch_bytes,
+            args.num_key_value_heads,
+            args.head_dim,
+            cache_dtype,
+        )
+        original.model.layers = [
+            _StagedQwen3Layer(staging, index) for index in range(len(staging.layers))
+        ]
+        original.model.norm = _ResidentUnary(original.model.norm, stream)
+        if tied or "embedding" in plan.resident_component_ids:
+            original.model.embed_tokens = _ResidentUnary(
+                original.model.embed_tokens, stream
+            )
+        return WindowsQwen3OffloadModel(
+            model, staging, overflow_host_parameters, projection, cache_lease
+        )
     except BaseException:
         mx.synchronize(stream)
         for component in resident_modules:
             component.clear()
         overflow_host_parameters.clear()
         mx.clear_cache()
+        cache_lease.release()
         raise
-    staging = _LayerStaging(
-        original.model.layers,
-        policy,
-        stream,
-        plan,
-        kv_bytes,
-        kv_scratch_bytes,
-        args.num_key_value_heads,
-        args.head_dim,
-        cache_dtype,
-    )
-    original.model.layers = [
-        _StagedQwen3Layer(staging, index) for index in range(len(staging.layers))
-    ]
-    original.model.norm = _ResidentUnary(original.model.norm, stream)
-    if tied or "embedding" in plan.resident_component_ids:
-        original.model.embed_tokens = _ResidentUnary(
-            original.model.embed_tokens, stream
-        )
-    return WindowsQwen3OffloadModel(
-        model, staging, overflow_host_parameters, projection
-    )
 
 
 def _decoder_storage_width(layers: list[nn.Module]) -> int:

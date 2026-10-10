@@ -28,6 +28,9 @@ class OffloadModel:
     def settle_request(self) -> None:
         pass
 
+    def close(self) -> None:
+        pass
+
 
 class PrefixSpy:
     def __init__(self, matched_index: int | None) -> None:
@@ -237,6 +240,11 @@ def test_sequential_close_closes_only_active_offload_request(
     monkeypatch: pytest.MonkeyPatch, offload: bool
 ) -> None:
     monkeypatch.setattr(batch_generator, "WindowsQwen3OffloadModel", OffloadModel)
+
+    def synchronized(stream: object) -> None:
+        pass
+
+    monkeypatch.setattr(mx, "synchronize", synchronized)
     engine = object.__new__(batch_generator.SequentialGenerator)
     engine.model = cast(Model, OffloadModel() if offload else object())
     engine.tokenizer = cast(TokenizerWrapper, object())
@@ -357,3 +365,64 @@ def test_ordinary_prefill_closes_iterator_before_cache_trim(
             None,
         )
     assert events == ["close", "trim"]
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("request_error", [False, True])
+def test_sequential_offload_unload_settles_streams_before_idempotent_model_close(
+    monkeypatch: pytest.MonkeyPatch, active: bool, request_error: bool
+) -> None:
+    monkeypatch.setattr(batch_generator, "WindowsQwen3OffloadModel", OffloadModel)
+    events: list[str] = []
+    exo_stream, mlx_stream = object(), object()
+    monkeypatch.setattr(generate, "generation_stream", exo_stream)
+    monkeypatch.setattr(generate, "mlx_generation_stream", mlx_stream)
+
+    def synchronized(stream: object) -> None:
+        assert stream is exo_stream or stream is mlx_stream
+        events.append("exo_sync" if stream is exo_stream else "mlx_sync")
+
+    monkeypatch.setattr(mx, "synchronize", synchronized)
+
+    class ClosingModel(OffloadModel):
+        def close(self) -> None:
+            assert hasattr(engine, "model")
+            events.append("model_close")
+
+    engine = object.__new__(batch_generator.SequentialGenerator)
+    engine.model = cast(Model, cast(object, ClosingModel()))
+    engine.tokenizer = cast(TokenizerWrapper, object())
+    engine.group = None
+    engine._active = None  # pyright: ignore[reportPrivateUsage]
+
+    def request() -> Generator[GenerationResponse]:
+        try:
+            yield GenerationResponse(text="hello", token=1, usage=None)
+        finally:
+            events.append("request_close")
+            if request_error:
+                raise RuntimeError("request close failed")
+
+    if active:
+        generation = request()
+        next(generation)
+        engine._active = (  # pyright: ignore[reportPrivateUsage]
+            cast(TextGeneration, object()),
+            generation,
+            batch_generator.GeneratorQueue(),
+            iter([]),
+        )
+    if active and request_error:
+        with pytest.raises(RuntimeError, match="request close failed"):
+            engine.close()
+    else:
+        engine.close()
+    expected = (["request_close"] if active else []) + [
+        "exo_sync",
+        "mlx_sync",
+        "model_close",
+    ]
+    assert events == expected
+    assert not hasattr(engine, "model")
+    engine.close()
+    assert events == expected

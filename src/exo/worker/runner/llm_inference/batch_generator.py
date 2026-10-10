@@ -34,6 +34,7 @@ from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import (
     PrefillCancelled,
     mlx_generate,
+    settle_generation_streams,
     warmup_inference,
 )
 from exo.worker.engines.mlx.types import Model
@@ -106,6 +107,7 @@ class SequentialGenerator(Engine):
     _maybe_cancel: list[TextGeneration] = field(default_factory=list, init=False)
     _all_tasks: dict[TaskId, TextGeneration] = field(default_factory=dict, init=False)
     _queue: deque[TextGeneration] = field(default_factory=deque, init=False)
+    _offload_closed: bool = field(default=False, init=False)
     _active: (
         tuple[
             TextGeneration,
@@ -307,14 +309,23 @@ class SequentialGenerator(Engine):
         )
 
     def close(self) -> None:
-        if (
-            isinstance(cast(object, self.model), WindowsQwen3OffloadModel)
-            and self._active is not None
-        ):
-            # Close the request while its model can still settle GPU/CPU work.
-            # The output parser owns only queued responses, not the KV cache.
-            self._active[1].close()
-            self._active = None
+        if self._offload_closed:
+            return
+        if isinstance(cast(object, self.model), WindowsQwen3OffloadModel):
+            try:
+                if self._active is not None:
+                    try:
+                        self._active[1].close()
+                    finally:
+                        self._active = None
+            finally:
+                # Idle generation streams can still own lazy work. Settle them
+                # before the wrapper releases its model-lifetime allocator lease.
+                settle_generation_streams()
+                cast(WindowsQwen3OffloadModel, cast(object, self.model)).close()
+                self._offload_closed = True
+                del self.model, self.tokenizer, self.group
+            return
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:

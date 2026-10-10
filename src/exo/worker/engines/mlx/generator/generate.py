@@ -84,6 +84,12 @@ generation_stream = mx.new_stream(mx.default_device())
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 
 
+def settle_generation_streams() -> None:
+    """Settle EXO and MLX LM's distinct generation streams before releasing KV."""
+    mx.synchronize(generation_stream)
+    mx.synchronize(mlx_generation_stream)
+
+
 @contextlib.contextmanager
 def patch_embed_tokens(
     model: Model,
@@ -595,8 +601,7 @@ def mlx_generate(
             finally:
                 # MLX LM schedules sampler/next-token work on its own thread-
                 # local stream, distinct from EXO's generation/model streams.
-                mx.synchronize(generation_stream)
-                mx.synchronize(mlx_generation_stream)
+                settle_generation_streams()
                 offload_model.settle_request()
                 assert owned_cache is not None
                 owned_cache.clear()
