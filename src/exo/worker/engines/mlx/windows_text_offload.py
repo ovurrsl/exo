@@ -4,7 +4,8 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Protocol, cast, final
+from threading import Lock
+from typing import ClassVar, Protocol, Self, cast, final
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -12,9 +13,17 @@ import numpy as np
 import psutil
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.models.qwen3 import Model as Qwen3Model
-from mlx_lm.models.qwen3 import TransformerBlock
+from mlx_lm.models.qwen3 import ModelArgs, TransformerBlock
 
 from exo.utils.windows_gpu import read_gpu_memory
+from exo.utils.windows_residency import (
+    BudgetPolicy,
+    CapacitySnapshot,
+    ComponentSpec,
+    ResidencyPlan,
+    plan_residency,
+    validate_stage_capacity,
+)
 from exo.utils.windows_text_offload_config import (
     WindowsTextOffloadPolicy as WindowsTextOffloadPolicy,
 )
@@ -23,6 +32,52 @@ from exo.worker.engines.mlx.types import KVCacheType
 
 type ParameterTree = mx.array | list[ParameterTree] | dict[str, ParameterTree]
 type AttentionMask = mx.array | str | None
+
+# Planning-only slack for physical CUDA allocation overhead. The RTX 5070
+# acceptance probe measured ~39 MB beyond parameter bytes and a ~28 MB stage
+# deficit at an otherwise logical fit. This bounded allowance is not a universal
+# driver guarantee; every stage still checks actual free VRAM. Do not also add it
+# to the remaining reserve, which would consume the slack a second time.
+_PHYSICAL_GPU_HEADROOM_BYTES = 256 * 1024**2
+
+
+class _CudaCacheLease:
+    """Exclusive process allocator ownership for a dedicated offload runner.
+
+    CUDA's free-buffer cache can return pinned CPU buffers to GPU operations.
+    Disable reuse throughout the model lifetime, including lazy output graphs.
+    """
+
+    _lock: ClassVar[Lock] = Lock()
+    _active: ClassVar[bool] = False
+
+    def __init__(self, previous_limit: int):
+        self.previous_limit = previous_limit
+        self.released = False
+
+    @classmethod
+    def acquire(cls) -> Self:
+        with cls._lock:
+            if cls._active:
+                raise RuntimeError(
+                    "CUDA offload requires exclusive allocator ownership"
+                )
+            previous = mx.set_cache_limit(0)
+            try:
+                # Setting the limit alone leaves existing pinned entries reusable.
+                mx.clear_cache()
+            except BaseException:
+                mx.set_cache_limit(previous)
+                raise
+            cls._active = True
+            return cls(previous)
+
+    def release(self) -> None:
+        with self._lock:
+            if not self.released:
+                mx.set_cache_limit(self.previous_limit)
+                self.released = True
+                type(self)._active = False
 
 
 class _ParameterModule(Protocol):
@@ -158,27 +213,112 @@ def _state_arrays(state: object) -> Iterator[mx.array]:
 @dataclass(frozen=True)
 class _Layer:
     module: _Decoder
-    host_parameters: dict[str, ParameterTree]
+    host_parameters: dict[str, ParameterTree] | None
     bytes: int
 
 
 @final
 class _LayerStaging:
-    def __init__(self, layers: list[nn.Module], policy: WindowsTextOffloadPolicy):
+    def __init__(
+        self,
+        layers: list[nn.Module],
+        policy: WindowsTextOffloadPolicy,
+        stream: mx.Stream,
+        plan: ResidencyPlan,
+        kv_bytes: int,
+        kv_scratch_bytes: int,
+        kv_heads: int,
+        head_dim: int,
+        cache_dtype: mx.Dtype,
+    ):
         self.policy = policy
-        self.stream = _new_gpu_stream()
+        self.stream = stream
+        self.plan = plan
+        self.kv_bytes = kv_bytes
+        self.kv_scratch_bytes = kv_scratch_bytes
+        self.kv_heads = kv_heads
+        self.head_dim = head_dim
+        self.cache_dtype = cache_dtype
+        self.cache_credits = [0] * len(layers)
+        self.cache_pool_ids: tuple[int, ...] | None = None
         self.layers = tuple(
             _Layer(
                 cast(_Decoder, cast(object, layer)),
-                cast(dict[str, ParameterTree], layer.parameters()),
+                cast(dict[str, ParameterTree], layer.parameters())
+                if f"layer{index}" in plan.overflow_component_ids
+                else None,
                 parameter_bytes(layer),
             )
-            for layer in layers
+            for index, layer in enumerate(layers)
         )
         self.active_layer: int | None = None
         self.stages_opened = 0
         self.stages_closed = 0
         self.peak_staged_weight_bytes = 0
+
+    def remaining_reserve(self) -> int:
+        return (
+            self.policy.gpu_reserve_bytes
+            + self.kv_scratch_bytes
+            + max(0, self.kv_bytes - sum(self.cache_credits))
+        )
+
+    def register_cache_pool(self, cache: KVCacheType) -> None:
+        identifiers = tuple(id(entry) for entry in cache)
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("Residency requires unique cache owners per layer")
+        if identifiers != self.cache_pool_ids:
+            if any(
+                type(entry) is not KVCache
+                or entry.offset != 0
+                or entry.keys is not None
+                or entry.values is not None
+                for entry in cache
+            ):
+                raise ValueError(
+                    "Residency requires a fresh single-owner plain KV cache pool"
+                )
+            self.cache_pool_ids = identifiers
+            self.cache_credits = [0] * len(self.layers)
+
+    def clear_cache_credit(self) -> None:
+        self.cache_pool_ids = None
+        self.cache_credits = [0] * len(self.layers)
+
+    def record_cache_credit(self, index: int, cache: KVCache | None) -> None:
+        if cache is None:
+            return
+        if (
+            type(cache) is not KVCache
+            or self.cache_pool_ids is None
+            or id(cache) != self.cache_pool_ids[index]
+        ):
+            raise ValueError("KV credit requires the registered plain cache owner")
+        keys, values = cache.keys, cache.values
+        if keys is None and values is None and cache.offset == 0:
+            return
+        if (
+            keys is None
+            or values is None
+            or keys is values
+            or keys.shape != values.shape
+            or keys.ndim != 4
+            or keys.shape[0] != 1
+            or keys.shape[1] != self.kv_heads
+            or keys.shape[3] != self.head_dim
+            or keys.dtype != self.cache_dtype
+            or values.dtype != self.cache_dtype
+            or not (
+                0
+                <= cache.offset
+                <= keys.shape[2]
+                <= self.policy.max_context_tokens + 255
+            )
+        ):
+            raise ValueError(
+                "KV capacity, dimensions or dtype exceed the residency plan"
+            )
+        self.cache_credits[index] = keys.nbytes + values.nbytes
 
     def copy_to_device(self, value: mx.array) -> mx.array:
         zeros = mx.zeros_like(value, stream=self.stream)
@@ -196,7 +336,22 @@ class _LayerStaging:
         if self.active_layer is not None:
             raise RuntimeError("Nested or concurrent Qwen3 staging is unsupported")
         layer = self.layers[index]
-        _check_gpu_capacity(layer.bytes, self.policy)
+        _check_gpu_capacity(
+            layer.bytes if layer.host_parameters is not None else 0,
+            self.policy,
+            self.remaining_reserve(),
+        )
+        if layer.host_parameters is None:
+            self.active_layer = index
+            try:
+                with mx.stream(self.stream):
+                    yield layer.module
+            finally:
+                try:
+                    mx.synchronize(self.stream)
+                finally:
+                    self.active_layer = None
+            return
         device_parameters: ParameterTree | None = None
         counted = False
         try:
@@ -246,6 +401,9 @@ class _StagedQwen3Layer(nn.Module):
         cache: KVCache | QuantizedKVCache | None = None,
     ) -> mx.array:
         with self.staging.stage(self.index) as decoder:
+            # Prior canonical KV stays credited through the live-free preflight.
+            # Mutation invalidates that credit until evaluation and synchronization.
+            self.staging.cache_credits[self.index] = 0
             device_hidden = self.staging.copy_to_device(hidden)
             device_mask = (
                 self.staging.copy_to_device(mask)
@@ -253,17 +411,70 @@ class _StagedQwen3Layer(nn.Module):
                 else mask
             )
             result = decoder(device_hidden, device_mask, cache)
-            mx.eval(result, *(_state_arrays(cache.state) if cache is not None else ()))
+            plain_cache = cast(KVCache | None, cache)
+            cache_arrays = (
+                ()
+                if plain_cache is None
+                else tuple(
+                    value
+                    for value in (plain_cache.keys, plain_cache.values)
+                    if value is not None
+                )
+            )
+            mx.eval(result, *cache_arrays)
+            mx.synchronize(self.staging.stream)
+            self.staging.record_cache_credit(self.index, plain_cache)
             return result
 
 
-def _check_gpu_capacity(layer_bytes: int, policy: WindowsTextOffloadPolicy) -> None:
+def _check_gpu_capacity(
+    layer_bytes: int,
+    policy: WindowsTextOffloadPolicy,
+    reserve_bytes: int | None = None,
+    *,
+    enforce_stage_limit: bool = True,
+) -> None:
     gpu = read_gpu_memory()
-    if layer_bytes > policy.stage_limit_bytes:
+    if enforce_stage_limit and layer_bytes > policy.stage_limit_bytes:
         raise MemoryError("Qwen3 decoder layer exceeds the GPU stage limit")
     # Include copy temporaries, independently of MLX's pinned-host counters.
-    if gpu is None or gpu.free.in_bytes < policy.gpu_reserve_bytes + 3 * layer_bytes:
+    if gpu is None:
         raise MemoryError("Insufficient dedicated NVIDIA VRAM for Qwen3 staging")
+    remaining_reserve = (
+        policy.gpu_reserve_bytes if reserve_bytes is None else reserve_bytes
+    )
+    try:
+        validate_stage_capacity(
+            free_gpu_bytes=gpu.free.in_bytes,
+            layer_bytes=layer_bytes,
+            reserve_bytes=remaining_reserve,
+        )
+    except MemoryError:
+        # CUDA driver pools can retain freed scratch even with MLX caching off.
+        # Reclaim only on shortfall, then recheck the unchanged bound once.
+        mx.clear_cache()
+        gpu = read_gpu_memory()
+        if gpu is None:
+            raise MemoryError(
+                "NVIDIA VRAM capacity is unavailable after CUDA pool reclamation"
+            ) from None
+        validate_stage_capacity(
+            free_gpu_bytes=gpu.free.in_bytes,
+            layer_bytes=layer_bytes,
+            reserve_bytes=remaining_reserve,
+        )
+
+
+@final
+class _ResidentUnary(nn.Module):
+    def __init__(self, original: nn.Module, stream: mx.Stream):
+        super().__init__()
+        self.original = original
+        self.stream = stream
+
+    def __call__(self, inputs: mx.array) -> mx.array:
+        with mx.stream(self.stream):
+            return cast(Callable[[mx.array], mx.array], self.original)(inputs)
 
 
 @final
@@ -271,13 +482,19 @@ class WindowsQwen3OffloadModel(nn.Module):
     def __init__(
         self,
         original: nn.Module,
-        host_parameters: dict[str, ParameterTree],
         staging: _LayerStaging,
+        overflow_host_parameters: dict[str, ParameterTree],
+        projection: nn.Module,
+        cache_lease: _CudaCacheLease,
     ):
         super().__init__()
         self.original = original
-        self.host_parameters = host_parameters
         self.staging = staging
+        self.overflow_host_parameters = overflow_host_parameters
+        self.projection = projection
+        self.residency_plan = staging.plan
+        self.cache_lease = cache_lease
+        self.closed = False
 
     @property
     def model(self) -> nn.Module:
@@ -297,9 +514,39 @@ class WindowsQwen3OffloadModel(nn.Module):
     def canonical_host_weight_bytes(self) -> int:
         return sum(
             {
-                id(value): value.nbytes for value in _arrays(self.host_parameters)
+                id(value): value.nbytes
+                for value in _arrays(self.overflow_host_parameters)
             }.values()
         )
+
+    @property
+    def persistent_gpu_weight_bytes(self) -> int:
+        return self.residency_plan.persistent_gpu_bytes
+
+    def settle_request(self) -> None:
+        mx.synchronize(self.staging.stream)
+        mx.synchronize(mx.default_stream(mx.Device(mx.cpu)))
+        self.staging.clear_cache_credit()
+
+    def close(self) -> None:
+        """Release allocator ownership after generation and lazy outputs are settled.
+
+        Direct callers must evaluate or discard outstanding output arrays first:
+        stream synchronization cannot schedule an unevaluated external graph.
+        The runner closes generation iterators and settles their streams first.
+        """
+        if self.closed:
+            return
+        self.settle_request()
+        for layer in self.staging.layers:
+            cast(nn.Module, cast(object, layer.module)).clear()
+        self.staging.layers = ()
+        self.overflow_host_parameters.clear()
+        self.original.clear()
+        self.projection.clear()
+        mx.clear_cache()
+        self.cache_lease.release()
+        self.closed = True
 
     @property
     def layers(self) -> list[nn.Module]:
@@ -327,6 +574,8 @@ class WindowsQwen3OffloadModel(nn.Module):
         cache: KVCacheType | None = None,
         input_embeddings: mx.array | None = None,
     ) -> mx.array:
+        if self.closed:
+            raise RuntimeError("Qwen3 offload model is closed")
         policy = self.staging.policy
         if inputs.ndim != 2 or inputs.shape[0] != 1:
             raise ValueError("Experimental Qwen3 offload supports batch size one")
@@ -336,35 +585,42 @@ class WindowsQwen3OffloadModel(nn.Module):
             raise ValueError("Qwen3 offload prefill chunk exceeds its bounded limit")
         if cache is not None and (
             len(cache) != len(self.layers)
-            or any(
-                not isinstance(entry, (KVCache, QuantizedKVCache)) for entry in cache
-            )
+            or any(type(entry) is not KVCache for entry in cache)
         ):
-            raise ValueError("Only dense Qwen3 KV caches are supported")
+            raise ValueError(
+                "Only single-owner dense Qwen3 unquantized KV caches are supported"
+            )
         offset = max((entry.offset for entry in cache or []), default=0)
         if offset + inputs.shape[1] > policy.max_context_tokens:
             raise ValueError("Qwen3 offload context exceeds its bounded limit")
-        # The real Qwen3 forward runs CPU embedding, final norm and its tied or
-        # untied head. Only the replacement decoder layers enter the GPU stream.
-        with mx.stream(mx.Device(mx.cpu)):
-            original = cast(_QwenModel, cast(object, self.original))
-            hidden = original.model(inputs, cache=cache)
-            tied = "lm_head" not in self.original
-            projection = (
-                original.model.embed_tokens
-                if tied
-                else cast(nn.Module, cast(dict[str, object], self.original)["lm_head"])
-            )
-            logits = _cpu_output_projection(hidden, projection, tied=tied)
-        # MLX discards intermediate prefill logits. Decoder/cache evaluation is
-        # already complete; keep the canonical CPU head and final copy lazy so
-        # discarded results do not evaluate a vocabulary-sized projection.
-        with mx.stream(self.staging.stream):
-            return mx.add(
-                logits,
-                mx.zeros_like(logits, stream=self.staging.stream),
-                stream=self.staging.stream,
-            )
+        private_cache = cache is None
+        if private_cache:
+            cache = [KVCache() for _ in self.layers]
+        assert cache is not None
+        try:
+            self.staging.register_cache_pool(cache)
+            # Only an overflowing untied embedding executes on CPU. Resident unary
+            # modules and all decoder wrappers enter the explicitly owned GPU stream.
+            with mx.stream(mx.Device(mx.cpu)):
+                original = cast(_QwenModel, cast(object, self.original))
+                hidden = original.model(inputs, cache=cache)
+                tied = "lm_head" not in self.original
+            with mx.stream(self.staging.stream):
+                logits = _cpu_output_projection(hidden, self.projection, tied=tied)
+            # MLX discards intermediate prefill logits. Decoder/cache evaluation is
+            # already complete; keep the resident GPU head lazy so
+            # discarded results do not evaluate a vocabulary-sized projection.
+            with mx.stream(self.staging.stream):
+                return mx.add(
+                    logits,
+                    mx.zeros_like(logits, stream=self.staging.stream),
+                    stream=self.staging.stream,
+                )
+
+        finally:
+            if private_cache:
+                # Settle while the private canonical KV owners are still alive.
+                self.settle_request()
 
 
 def prepare_windows_qwen3_offload(
@@ -385,7 +641,6 @@ def prepare_windows_qwen3_offload(
     if not cpu_loaded:
         raise ValueError("Offload preparation requires the trusted CPU-stream loader")
     original = cast(_QwenModel, cast(object, model))
-    needed = parameter_bytes(model)
     if not original.model.layers:
         raise ValueError("Qwen3 must contain decoder layers")
     if any(not isinstance(layer, TransformerBlock) for layer in original.model.layers):
@@ -401,35 +656,198 @@ def prepare_windows_qwen3_offload(
                 raise ValueError(
                     "CPU Qwen3 heads require affine 4-bit group32/group64 quantization"
                 )
-    components = [
-        original.model.embed_tokens,
-        original.model.norm,
-        *original.model.layers,
-    ]
-    if "lm_head" in model:
-        components.append(cast(nn.Module, cast(dict[str, object], model)["lm_head"]))
-    largest_component = max(parameter_bytes(component) for component in components)
-    if (
-        needed > policy.host_limit_bytes
-        or needed + 6 * largest_component + policy.host_reserve_bytes
-        > _host_available_bytes()
-    ):
-        raise MemoryError("Insufficient host RAM or explicit host weight budget")
-    _check_gpu_capacity(
-        max(parameter_bytes(layer) for layer in original.model.layers), policy
+    tied = "lm_head" not in model
+    projection = (
+        original.model.embed_tokens if tied else cast(nn.Module, model["lm_head"])
     )
-    with mx.stream(mx.Device(mx.cpu)):
-        # Finish and replace one component before loading the next. The trusted
-        # loader creates lazy CPU Load primitives, so a second full model copy
-        # never accumulates. Tied embeddings are a single component.
-        for component in components:
-            _canonicalize_component(component)
-        host_parameters = original.parameters()
-    staging = _LayerStaging(original.model.layers, policy)
-    original.model.layers = [
-        _StagedQwen3Layer(staging, index) for index in range(len(staging.layers))
-    ]
-    return WindowsQwen3OffloadModel(model, host_parameters, staging)
+    components: dict[str, nn.Module] = {
+        "head": projection,
+        "norm": original.model.norm,
+        **{f"layer{index}": layer for index, layer in enumerate(original.model.layers)},
+    }
+    if not tied:
+        components["embedding"] = original.model.embed_tokens
+    seen_arrays: set[int] = set()
+    for component in components.values():
+        identities = {
+            id(value) for value in _arrays(cast(ParameterTree, component.parameters()))
+        }
+        if seen_arrays.intersection(identities):
+            raise ValueError(
+                "Partial aliases across Qwen3 ownership components are unsupported"
+            )
+        seen_arrays.update(identities)
+    specifications = (
+        ComponentSpec(
+            "head",
+            ("embedding",) if tied else (),
+            frozenset({"head", "embedding"}) if tied else frozenset({"head"}),
+            parameter_bytes(projection),
+        ),
+        ComponentSpec(
+            "norm", (), frozenset({"norm"}), parameter_bytes(original.model.norm)
+        ),
+        *(
+            ComponentSpec(
+                f"layer{index}",
+                (),
+                frozenset({"decoder"}),
+                parameter_bytes(layer),
+                index,
+            )
+            for index, layer in enumerate(original.model.layers)
+        ),
+        *(
+            (
+                ComponentSpec(
+                    "embedding",
+                    (),
+                    frozenset({"embedding"}),
+                    parameter_bytes(original.model.embed_tokens),
+                ),
+            )
+            if not tied
+            else ()
+        ),
+    )
+    args = cast(ModelArgs, original.args)
+    dtype_bytes = _decoder_storage_width(original.model.layers)
+    cache_dtype = next(
+        value.dtype
+        for value in _arrays(
+            cast(ParameterTree, original.model.embed_tokens.parameters())
+        )
+        if mx.issubdtype(value.dtype, mx.floating)
+    )
+    if args.num_key_value_heads <= 0 or args.head_dim <= 0:
+        raise ValueError("Invalid dense Qwen3 KV dimensions")
+    layer_kv = (
+        2
+        * args.num_key_value_heads
+        * args.head_dim
+        * (policy.max_context_tokens + 255)
+        * dtype_bytes
+    )
+    kv_bytes = layer_kv * len(original.model.layers)
+    kv_scratch_bytes = 2 * layer_kv
+    memory = read_gpu_memory()
+    if memory is None:
+        raise MemoryError(
+            "NVIDIA VRAM capacity is unavailable before residency planning"
+        )
+    plan = plan_residency(
+        specifications,
+        CapacitySnapshot(
+            max(0, memory.free.in_bytes - _PHYSICAL_GPU_HEADROOM_BYTES),
+            _host_available_bytes(),
+        ),
+        BudgetPolicy(
+            policy.gpu_reserve_bytes,
+            kv_bytes,
+            kv_scratch_bytes,
+            policy.host_reserve_bytes,
+            policy.host_limit_bytes,
+            6 * max(spec.byte_size for spec in specifications),
+        ),
+    )
+    if any(
+        spec.byte_size > policy.stage_limit_bytes
+        for spec in specifications
+        if spec.component_id in plan.overflow_component_ids and "decoder" in spec.roles
+    ):
+        raise MemoryError("Qwen3 overflow decoder layer exceeds the GPU stage limit")
+    stream = _new_gpu_stream()
+    cache_lease = _CudaCacheLease.acquire()
+    resident_modules: list[nn.Module] = []
+    overflow_host_parameters: dict[str, ParameterTree] = {}
+    try:
+        for identifier in plan.resident_component_ids:
+            component = components[identifier]
+            _check_gpu_capacity(
+                parameter_bytes(component),
+                policy,
+                plan.reserve_bytes,
+                enforce_stage_limit=False,
+            )
+            resident_modules.append(component)
+            _materialize_resident(component, stream)
+        for identifier in plan.overflow_component_ids:
+            component = components[identifier]
+            with mx.stream(mx.Device(mx.cpu)):
+                _canonicalize_component(component)
+            overflow_host_parameters[identifier] = cast(
+                ParameterTree, component.parameters()
+            )
+        staging = _LayerStaging(
+            original.model.layers,
+            policy,
+            stream,
+            plan,
+            kv_bytes,
+            kv_scratch_bytes,
+            args.num_key_value_heads,
+            args.head_dim,
+            cache_dtype,
+        )
+        original.model.layers = [
+            _StagedQwen3Layer(staging, index) for index in range(len(staging.layers))
+        ]
+        original.model.norm = _ResidentUnary(original.model.norm, stream)
+        if tied or "embedding" in plan.resident_component_ids:
+            original.model.embed_tokens = _ResidentUnary(
+                original.model.embed_tokens, stream
+            )
+        return WindowsQwen3OffloadModel(
+            model, staging, overflow_host_parameters, projection, cache_lease
+        )
+    except BaseException:
+        mx.synchronize(stream)
+        for component in resident_modules:
+            component.clear()
+        overflow_host_parameters.clear()
+        mx.clear_cache()
+        cache_lease.release()
+        raise
+
+
+def _decoder_storage_width(layers: list[nn.Module]) -> int:
+    width = 0
+    for layer in layers:
+        for value in _arrays(cast(ParameterTree, layer.parameters())):
+            if mx.issubdtype(value.dtype, mx.floating):
+                if value.dtype not in (mx.float16, mx.bfloat16, mx.float32):
+                    raise ValueError("Unsupported Qwen3 KV storage dtype")
+                width = max(width, 4 if value.dtype == mx.float32 else 2)
+    if not width:
+        raise ValueError("Missing Qwen3 floating storage dtype")
+    return width
+
+
+def _materialize_resident(component: nn.Module, stream: mx.Stream) -> None:
+    source = cast(ParameterTree, component.parameters())
+    copied: dict[int, mx.array] = {}
+
+    def copy_once(value: mx.array) -> mx.array:
+        if id(value) not in copied:
+            with mx.stream(stream):
+                result = mx.add(
+                    value, mx.zeros_like(value, stream=stream), stream=stream
+                )
+                mx.eval(result)
+                copied[id(value)] = result
+        return copied[id(value)]
+
+    try:
+        with mx.stream(stream):
+            parameters = cast(
+                dict[str, ParameterTree], _map_parameters(source, copy_once)
+            )
+            mx.eval(*_arrays(parameters))
+            mx.synchronize(stream)
+            component.update(parameters)
+    finally:
+        mx.synchronize(stream)
+        copied.clear()
 
 
 def _canonicalize_component(component: nn.Module) -> None:
