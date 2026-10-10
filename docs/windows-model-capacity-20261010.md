@@ -28,7 +28,7 @@ every model fitting physical RAM is supported or that performance equals VRAM.
 
 ## Verification and remaining work
 
-- Python regression after the security and performance corrections: 797 passed,
+- Python regression after security, performance and catalog corrections: 798 passed,
   8 skipped, 195 deselected. These counts do not treat skipped tests as acceptance.
 - Full Windows and Darwin Python type checks: zero errors. Ruff check and format
   check passed (335 files). Nix is unavailable on this Windows machine.
@@ -113,3 +113,18 @@ RTX 5070/48 GiB machine, not universal model compatibility or quality evaluation
 CPU projection and repeated staging make generation substantially slower than
 fully resident GPU inference (approximately 0.11 token/s in the source short-chat
 sample). Longer contexts and other architectures require separate qualification.
+
+## Catalog admission correction after desktop verification
+
+Live desktop API verification exposed an unsupported MoE entry incorrectly
+labelled `ram_offload`: the existing Qwen3-30B-A3B card uses the generic base name
+`Qwen3 30B`. Numeric family-name matching was insufficient. Admission now limits
+the experimental path to known dense Qwen3 base sizes; catalog 30B/235B expert
+models cannot qualify for staging. Models that genuinely fit VRAM retain the
+ordinary path. Regression coverage verifies both placement admission and the
+private capacity response. Strict actual architecture validation remains in the
+loader, so a custom misleading card cannot bypass loading checks.
+
+The earlier 1d357 runtime's successful 32B inference remains evidence for that
+unchanged inference path, but its desktop MoE label is superseded. A new runtime
+must include this admission correction before distributing the candidate.

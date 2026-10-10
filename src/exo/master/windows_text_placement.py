@@ -1,6 +1,5 @@
 """Local Windows text staging admission without treating host RAM as VRAM."""
 
-import re
 import sys
 from collections.abc import Mapping, Sequence
 
@@ -28,12 +27,22 @@ def local_windows_text_offload_policy() -> WindowsTextOffloadPolicy | None:
 
 
 def is_windows_text_offload_card(card: ModelCard) -> bool:
+    # Catalog MoE cards use generic names such as "Qwen3 30B"; a numeric
+    # family-name regex alone would advertise unsupported expert staging.
+    dense_bases = {
+        "Qwen3 0.6B",
+        "Qwen3 1.7B",
+        "Qwen3 4B",
+        "Qwen3 8B",
+        "Qwen3 14B",
+        "Qwen3 32B",
+    }
     return (
         Backend.MlxCuda in card.backends
         and card.tasks == [ModelTask.TextGeneration]
         and card.vision is None
         and card.quantization == "4bit"
-        and re.fullmatch(r"Qwen3 \d+(?:\.\d+)?B", card.base_model) is not None
+        and card.base_model in dense_bases
     )
 
 
