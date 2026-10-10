@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "EXO Windows",
+  "version": "0.3.70",
+  "identifier": "io.ovurrsl.exo.windows",
+  "plugins": { "updater": { "pubkey": "", "requireSignedVersion": true } },
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "EXO",
+        "width": 360,
+        "height": 650,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "skipTaskbar": true,
+        "alwaysOnTop": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'self'",
+      "capabilities": ["desktop"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "publisher": "ovurrsl",
+    "shortDescription": "EXO native Windows cluster desktop",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": {
+      "resources/runtime/": "runtime/",
+      "resources/firewall/": "firewall/",
+      "installer-template.LICENSE": "licenses/tauri-installer-MIT.txt"
+    },
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": { "type": "fixedRuntime", "path": "resources/webview2" },
+      "nsis": {
+        "template": "installer.nsi",
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "installerHooks": "nsis-hooks.nsh"
+      }
+    }
+  }
+}
