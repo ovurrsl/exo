@@ -104,3 +104,11 @@ Sonraki resmî GUI incelemesi Windows **USB4 Hubs and Devices** sayfası ve **De
 ## Sonraki salt okunur fiziksel kontrol
 
 10 Ekim 2026 son kontrolünde Mac `system_profiler SPThunderboltDataType` iki portta da `receptacle_no_devices_connected` bildirdi. `en1`/`en2` inactive; Windows tekrarında USB4 P2P NIC yine yok. Mac servis listesinde `EXO Thunderbolt 1`/`EXO Thunderbolt 2` var, `Thunderbolt Bridge` yok. Bu, aktif eş bağlantısının henüz oluşmadığını gösterir. Kablo arızası, yanlış port veya belirli BIOS ayarı tek başına kök neden olarak saptanmadı. BIOS ve ağ ayarları değiştirilmedi.
+
+## Kullanıcının son kararı: LAN üzerinden devam
+
+Kullanıcı daha sonra **Thunderbolt olmadan devam** edilmesini istedi. Fiziksel kablo/USB4NET/bridge ve Thunderbolt-specific ring kapıları ertelendi; aynı fork kaynak/runtime sürümleriyle mevcut Ethernet/Wi-Fi LAN kabulü sürdürülecek. LAN testi Thunderbolt testi olarak etiketlenmez.
+
+Yeni fotoğrafta ROG USB-C kablo etiketi `14016-00751200` okunuyor; kullanıcı iki ucun da USB-C olduğunu doğruladı. [Anakartın resmi donanım kılavuzu](https://dlcdnets.asus.com/pub/ASUS/mb/LGA1851/ROG_STRIX_Z890-I_GAMING_WIFI/E24355_ROG_STRIX_Z890-I_GAMING_WIFI_EM_WEB.pdf) kutudaki Type-C kabloyu HIVE II aksesuarıyla listeler ve onun bağlantısını tarif eder. Bu fotoğraftan Thunderbolt/40 Gbps standardı doğrulanmadı; özel kablo arızası sonucu çıkarılmadı. Kullanıcı LAN devamını seçtiği için ek kablo/BIOS değişikliği yapılmadı.
+
+GPU'nun Gen5 x16 hedefi ağ kablosundan bağımsızdır. NVIDIA ölçümü GPU max 5, host/configuration max 4 ve width16 bildirir. Kullanıcı NCASE T1/PCIe5 riser kullanıyor; ROG FPS `ALT_PCIE_MODE` anahtarı Gen4/Gen3 zorlayabilir. [Koşullu GPU/BIOS rehberi](windows-bios-pcie-20261010.md), bu anahtar ve M.2_2 paylaşımını açıklar; gerçek ayar veya fiziksel konum henüz doğrulanmadı.
