@@ -1,5 +1,7 @@
 # Yararlı EXO dallarının Windows entegrasyonu — 10 Ekim 2026
 
+Bu belgenin birleşik kaynak tablosu `a36502ba` entegrasyon snapshot'ını kaydeder. Sonraki **20 LAN yanıtı, iptal/cache/2.825-token testleri**, güncel hosted Windows/Darwin sonuçları ve **`f99234db` GUI ile derlenen imzasız kurucu** [LAN kabul raporunda](windows-lan-acceptance-20261010.md) ve [masaüstü kabul raporunda](windows-desktop-acceptance-20261010.md) izlenir. Aşağıdaki founder incelemesinin panel taşması ve değişmemiş ayarda restart bulguları `de85b2cf` ile giderildi; native Settings/DPI ve kurulum kapıları ayrı kaldı.
+
 Güncel upstream'in **280 dalı**, arşiv `ex-exo`nun **120 dalı** ve inceleme başlangıcındaki fork'un **14 dalı** sabit uç SHA'larıyla değerlendirildi. Her dalın içeriği kendi raporunda bulunur: [upstream](upstream-branches-20261010.md), [arşiv](ex-exo-branches-20261010.md), [Claude fork ve Thunderbolt](claude-fork-thunderbolt-20261010.md). Envanter statiktir; bütün dalların kodunun çalıştırıldığı veya birleştirildiği anlamına gelmez.
 
 Uygulama tek tek uyumlu düzeltmeleri alır. Mac Swift kaynakları, Darwin MLX pin'i, Metal/JACCL yolu, ortak strict JSON mesajları ve varsayılan API **52415** korunur. Her değişiklik grubu ayrı topic dalına gönderilir; inceleme ve birleşik test sonrasında `windows-native`e alınır. `main` veya upstream'e merge, kararlı yayın ve geçmişi yeniden yazma yapılmaz.
