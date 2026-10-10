@@ -23,6 +23,7 @@ from mlx_lm.models.deepseek_v4 import (
     _CompressorBranch as CompressorBranch,  # type: ignore
 )
 from mlx_lm.tokenizer_utils import TokenizerWrapper
+from numpy.typing import NDArray
 
 from exo.shared.types.memory import Memory
 from exo.utils.windows_gpu import read_gpu_memory
@@ -264,6 +265,19 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
     return any(is_non_trimmable_cache_entry(c) for c in cache)
 
 
+_MAX_RETAINED_SNAPSHOTS = 16
+
+
+def _bounded_snapshots(snapshots: list[CacheSnapshot]) -> list[CacheSnapshot]:
+    # A position identifies a prefix only within this entry. Keep the newest
+    # snapshot at each position, then the latest restore points. Older hybrid
+    # prefixes fall back to cold prefill when no retained snapshot applies.
+    by_position = {snapshot.token_count: snapshot for snapshot in snapshots}
+    return [by_position[position] for position in sorted(by_position)][
+        -_MAX_RETAINED_SNAPSHOTS:
+    ]
+
+
 class KVPrefixCache:
     def __init__(self, group: mx.distributed.Group | None, *, cuda_group: bool = False):
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
@@ -299,7 +313,9 @@ class KVPrefixCache:
         self._evict_if_needed()
         self.prompts.append(prompt_tokens)
         self.caches.append(deepcopy(cache))
-        self._snapshots.append(ssm_snapshots)
+        self._snapshots.append(
+            _bounded_snapshots(ssm_snapshots) if ssm_snapshots else None
+        )
         self._media_regions.append(media_regions or [])
         self.prefill_tps.append(prefill_tps)
         self._access_counter += 1
@@ -329,7 +345,7 @@ class KVPrefixCache:
 
         self.prompts[index] = prompt_tokens
         self.caches[index] = deepcopy(cache)
-        self._snapshots[index] = merged or None
+        self._snapshots[index] = _bounded_snapshots(merged) or None
         self._media_regions[index] = media_regions or []
         self.prefill_tps[index] = prefill_tps
         self._access_counter += 1
@@ -670,9 +686,11 @@ def get_prefix_length(prompt: mx.array, cached_prompt: mx.array) -> int:
     if n == 0:
         return 0
 
-    equal = mx.equal(prompt[:n], cached_prompt[:n]).astype(mx.int32)
-    prefix_mask = mx.cumprod(equal)  # stays 1 until first mismatch, then 0 forever
-    return int(mx.sum(prefix_mask).item())
+    left = cast(NDArray[np.int32], np.asarray(prompt[:n]))
+    right = cast(NDArray[np.int32], np.asarray(cached_prompt[:n]))
+    unequal = cast(NDArray[np.bool_], left != right)
+    mismatches = np.flatnonzero(unequal)
+    return int(cast(np.intp, mismatches[0])) if mismatches.size else n
 
 
 def get_available_memory() -> Memory:
