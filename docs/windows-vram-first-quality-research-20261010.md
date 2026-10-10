@@ -122,3 +122,43 @@ FP32 birikime alacak; normal sampled Türkçe sohbet ayrı kabul kapısı olacak
 
 Araştırma tamamlandıktan sonra uygulama ayrı, test edilmiş commitlerle ilerler:
 [uygulama planı](superpowers/plans/2026-10-11-windows-vram-first-quality.md).
+
+## İlk düzeltme ve gerçek sohbet kontrolü
+
+`a567c59b06234f4c3347ef7a1583e8d3c80dda54`, yalnız Windows RAM-offload
+quantized çıkış hesabını FP32 yapar. Canonical U32/BF16 ağırlıklar değişmez;
+discarded prefill logits lazy kalır. Mac/normal CUDA loader ve Swift değişmez.
+Geniş 5.120 hidden testleri tied/untied, group32/64, prefill ve dolu KV ile tek
+token decode'u kapsar. Düzeltme öncesi sayısal assertion başarısız, sonrasında
+başarılıdır. Son default suite: **802 geçti, 8 atlandı, 195 slow dışlandı**;
+beklenen malicious-tokenizer fallback uyarısı bir adet. Windows/Darwin strict
+type check sıfır hata/uyarı, Ruff ve 335 dosya biçim kontrolü geçti.
+
+Pinned gerçek Qwen3-32B snapshot'ı kaynak runtime'da 0,7/0,8/20/0 ve seed 42,
+thinking kapalı ayarlarıyla özel namespace/portta çalıştırıldı. Bütün yanıtlar
+`finish_reason=stop`; test düğümü ve spawned runner normal çıkış 0 ile kapandı:
+
+| Test girdisi | Gerçek cevap |
+|---|---|
+| Naber? Türkçe kısa cevap ver. | Merhaba! Nasılsın? |
+| İki artı iki kaç eder? Yalnız sayıyı yaz. | 4 |
+| Elma kırmızıdır… Türkçe tek kelimeyle cevap ver. | Kırmızı. |
+| Önceki konuşmada adı Deniz; Benim adım ne? | Deniz |
+
+Bu koşunun peak owned-process RSS değeri 21.491.273.728 bayt; peak **global** GPU
+kullanımı 2.254.123.008 bayt; minimum host available 11.535.319.040 bayt.
+Bu ölçüm kalıcı VRAM yerleşimi yapıldığını göstermez; bellek mimarisi henüz eski
+staging yoludur. Genel hız/çok dilli kalite garantisi de değildir.
+
+Ayrı thinking açık koşuda (0,6/0,95/20/0), 128 token limitine düşünme sırasında
+ulaşıldı: `finish_reason=length`, 126 reasoning token, final content ` basic`.
+Bu **başarılı nihai cevap değildir**. Reasoning metni aritmetiği doğru açıklıyor,
+ancak son parçanın cevap olarak sınıflandırılması ayrı parser düzeltmesi gerektirir.
+Aynı koşuda streaming iptal sonrası `Hello!` toparlanma ve düzgün kapanış geçti.
+Thinking kabul kaydındaki `passed=true` yalnız aracın HTTP/lifecycle kontrolüdür;
+semantik final-cevap kabulü olarak kullanılmaz.
+
+Ham kayıtlar ignored `build/acceptance/qwen3-32b-sampled-quality-a567c59b/` ve
+`qwen3-32b-thinking-cancel-quality-a567c59b/` dizinlerinde. Açık masaüstü uygulaması
+henüz bu yeni kaynağa paketlenmedi; runtime yenilenmeden aynı düzeltmeyi içerdiği
+söylenemez. Kalıcı VRAM yerleşimi ve paket kabulü açık kalıyor.

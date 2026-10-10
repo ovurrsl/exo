@@ -34,11 +34,13 @@
 
 **Interfaces:** existing `prepare_windows_qwen3_offload(...) -> WindowsQwen3OffloadModel` and `__call__(inputs, cache, input_embeddings) -> mx.array` stay unchanged. An internal projection adapter may wrap QuantizedLinear/QuantizedEmbedding while preserving canonical parameter storage and tied lookup behavior.
 
-- [ ] Write a regression with BF16 quantized head width 5120 and independently dequantized FP32 reference; cover tied/untied, prefill/decode and unchanged canonical dtype/storage.
-- [ ] Run against current source and record failure due to numerical drift, not missing imports or mocks.
-- [ ] Promote activation/scales/affine biases to FP32 at the CPU projection operation; leave packed weights intact and avoid eager vocabulary projection of discarded prefill.
-- [ ] Pass numerical regression, existing offload cleanup/KV/parity tests, Windows/Darwin strict types, Ruff and default pytest suite.
-- [ ] Commit focused code and tests; report numerical proof without claiming full chat acceptance.
+- [x] Write a regression with BF16 quantized head width 5120 and independently dequantized FP32 reference; cover tied/untied, prefill/decode and unchanged canonical dtype/storage.
+- [x] Run against current source and record failure due to numerical drift, not missing imports or mocks.
+- [x] Promote activation/scales/affine biases to FP32 at the CPU projection operation; leave packed weights intact and avoid eager vocabulary projection of discarded prefill.
+- [x] Pass numerical regression, existing offload cleanup/KV/parity tests, Windows/Darwin strict types, Ruff and default pytest suite.
+- [x] Commit focused code and tests; report numerical proof without claiming full chat acceptance.
+
+Record: `a567c59b`; default suite 802 passed/8 skipped/195 deselected, one expected malicious-tokenizer fallback warning; strict Windows/Darwin types and Ruff clean. Real sampled nonthinking Turkish greeting, arithmetic, color and multi-turn name recall all stopped normally. Thinking-on 128-token probe truncated inside reasoning; a trailing fragment was mislabeled final content. Cancellation/recovery passed, semantic thinking final acceptance remains open.
 
 ## Task 2: Real sampled chat acceptance
 
