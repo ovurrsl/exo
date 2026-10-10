@@ -1,6 +1,6 @@
 # Windows–Mac LAN kabulü — 10 Ekim 2026
 
-Kullanıcının Thunderbolt olmadan devam etme kararıyla, RTX 5070 Windows PC ve bir M1 MacBook Air A2337 mevcut yerel ağ üzerinde sınandı. **TCP ring, iki master düzeninde pipeline üretimi, Windows düğümü durdurma ve aktif üretimi iptal ettikten sonra toparlanma geçti.** Bu sonuç tek Mac ve küçük Qwen modeli içindir; bütün planın veya kararlı sürümün tamamlandığı anlamına gelmez.
+Kullanıcının Thunderbolt olmadan devam etme kararıyla, RTX 5070 Windows PC ve bir M1 MacBook Air A2337 mevcut yerel ağ üzerinde sınandı. **TCP ring, iki master düzeninde pipeline üretimi, Windows düğümü durdurma, aktif üretimi iptal ettikten sonra toparlanma ve benchmark API'sinde prefix cache geçti.** Bu sonuç tek Mac ve küçük Qwen modeli içindir; bütün planın veya kararlı sürümün tamamlandığı anlamına gelmez.
 
 ## Kaynak ve runtime kimliği
 
@@ -19,16 +19,17 @@ Windows rotası **Ethernet / 192.168.1.101**, Mac rotası **en0 / 192.168.1.105*
 
 ## Donanım sonuçları
 
-| Deney                               | Sonuç | Doğrulanan kapsam                                                                                                                                          |
-| ----------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fiziksel ring, Mac rank 0 ve rank 1 | Geçti | FP32/FP16/BF16/int32; 4.096 ve 2.097.153 eleman; all_sum/all_gather ve komşu aktarımı. Her iki rank sırası geçti, timeout olmadı.                          |
-| Windows master, Qwen3-0.6B-4bit     | Geçti | Model gerçekten iki düğüme Pipeline/MlxRing ile bölündü; üç sabit sohbet, instance silme, iki worker ve iki node normal çıkış 0.                           |
-| Mac master, aynı model              | Geçti | Mac'in master oluşu loglardan doğrulandı; üç sabit sohbet, instance/worker temizliği, normal çıkış 0.                                                      |
-| Windows node stop                   | Geçti | Üç sohbetten sonra yalnız sahip olunan Windows node named Event ile kapandı; Mac'teki instance ve runner'lar da boşaldı. Zorla temizleme gerekmedi.        |
-| Aktif SSE client disconnect         | Geçti | İlk içerik geldikten sonra bağlantı kapandı; iki rank toparlandı, aynı instance yeni “hello” sohbetini üretti. İptal ve sonraki üretim toplam 7,06 saniye. |
-| Aktif `/v1/cancel`                  | Geçti | Canlı stream command'ı iptal edildi; aynı instance sonraki sohbeti üretti. İptal ve sonraki üretim toplam 6,716 saniye.                                    |
+| Deney                               | Sonuç | Doğrulanan kapsam                                                                                                                                                                                          |
+| ----------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fiziksel ring, Mac rank 0 ve rank 1 | Geçti | FP32/FP16/BF16/int32; 4.096 ve 2.097.153 eleman; all_sum/all_gather ve komşu aktarımı. Her iki rank sırası geçti, timeout olmadı.                                                                          |
+| Windows master, Qwen3-0.6B-4bit     | Geçti | Model gerçekten iki düğüme Pipeline/MlxRing ile bölündü; üç sabit sohbet, instance silme, iki worker ve iki node normal çıkış 0.                                                                           |
+| Mac master, aynı model              | Geçti | Mac'in master oluşu loglardan doğrulandı; üç sabit sohbet, instance/worker temizliği, normal çıkış 0.                                                                                                      |
+| Windows node stop                   | Geçti | Üç sohbetten sonra yalnız sahip olunan Windows node named Event ile kapandı; Mac'teki instance ve runner'lar da boşaldı. Zorla temizleme gerekmedi.                                                        |
+| Aktif SSE client disconnect         | Geçti | İlk içerik geldikten sonra bağlantı kapandı; iki rank toparlandı, aynı instance yeni “hello” sohbetini üretti. İptal ve sonraki üretim toplam 7,06 saniye.                                                 |
+| Aktif `/v1/cancel`                  | Geçti | Canlı stream command'ı iptal edildi; aynı instance sonraki sohbeti üretti. İptal ve sonraki üretim toplam 6,716 saniye.                                                                                    |
+| Açık prefix cache seçeneği          | Geçti | `/bench/chat/completions` üzerinde `use_prefix_cache=true`; üç üretimde `generation_stats` doğrulandı, cache sonucu sırasıyla `none`, `partial`, `partial`. Instance drain ve tüm worker/node çıkışları 0. |
 
-Küçük modelde 14 tamamlanmış sohbet yanıtı ve iki kesilmiş üretim sınandı. Aynı istemde “hello”, “two plus two is four”, ardından yeniden “hello” sonuçları değerlendirildi; bit düzeyinde backend eşitliği iddia edilmedi. Prefix cache hit ve CUDA grubunda ortak eviction logları görüldü; uzun-context ve yüksek VRAM basıncı matrisi ayrıca gereklidir.
+Küçük modelde 17 tamamlanmış sohbet yanıtı ve iki kesilmiş üretim sınandı. Aynı istemde “hello”, “two plus two is four”, ardından yeniden “hello” sonuçları değerlendirildi; bit düzeyinde backend eşitliği iddia edilmedi. `use_prefix_cache` seçeneği benchmark request şemasında tanınır; normal chat request'inde bu ek alan dikkate alınmadığından, açık seçenek kabulü ayrı benchmark deneyiyle doğrulandı. CUDA grubunda ortak eviction logları da görüldü; uzun-context ve yüksek VRAM basıncı matrisi ayrıca gereklidir.
 
 ## Test ortamındaki düzeltmeler ve açık bulgular
 
@@ -48,9 +49,11 @@ Yerel kanıtlar `build/acceptance/` altında tutulur ve source repository'ye mod
 - `mixed-ring-integrated-lan-20261010/mixed-ring.json` ve dört rank logu;
 - `mixed-model-integrated-lan-{windows-master,mac-master,node-stop}-20261010/mixed-model.json`;
 - `mixed-model-integrated-lan-cancel-recovery-retry-20261010/mixed-model.json`; ilk başarısız deney ayrı dizinde;
+- `mixed-model-integrated-lan-prefix-cache-20261010/mixed-model.json` ve üç üretimin cache istatistikleri;
 - `mac-platform-fixture-{windows,mac}-suite-20261010.log`, `integration-review-platform-gates-20261010.md`;
 - `upstream-integrated-{mac,windows}-lan-cleanup-20261010.*`.
+- `mac-after-prefix-lan-cleanup-20261010.log`, `windows-after-prefix-lan-cleanup-20261010.json`.
 
-Test sonunda Windows frozen runtime'ına ve Mac izole Python node'una ait süreç kalmadığı doğrulandı. Yalnız bu çalışmanın PID ve başlangıç zamanı doğrulanan süreli `caffeinate` yardımcısı kapatıldı. Kullanıcının mevcut Mac EXO uygulaması değiştirilmedi.
+Test sonunda Windows frozen runtime'ına ve Mac izole Python node'una ait süreç kalmadığı doğrulandı; ayrı prefix cache deneyi sonrasında aynı süreç ve Mac uygulama kaynak kontrolleri yeniden geçti. Yalnız bu çalışmanın PID ve başlangıç zamanı doğrulanan süreli `caffeinate` yardımcısı kapatıldı. Prefix cache deneyinin uyku önleyicisi node PID'sine bağlıydı ve node çıkınca normal kapandı. Kullanıcının mevcut Mac EXO uygulaması değiştirilmedi.
 
 Sırada Windows panel/Settings P1 düzeltmeleri ve native kabul, yeni installer, temiz Windows kurulum, ikinci M1/üç cihaz, uzun context ve gerçek bellek baskısı, production RAM offload admission, karma offload/ileri dağıtık özellikler ve çalışan güvenlik taraması var. Thunderbolt testi kullanıcı kararıyla ertelenmiş durumda.
