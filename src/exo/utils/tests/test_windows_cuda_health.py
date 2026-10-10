@@ -378,6 +378,7 @@ def test_child_rejects_multiple_devices_before_importing_cuda():
     ):
         setattr(nvml, name, implementation)
     with (
+        mock.patch.object(sys, "platform", "win32"),
         mock.patch.dict(sys.modules, {"pynvml": nvml, "mlx": None}),
         pytest.raises(RuntimeError, match="Exactly one NVIDIA GPU"),
     ):
