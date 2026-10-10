@@ -468,9 +468,18 @@ class API:
             available_memory = capacity.ram_available if capacity else Memory()
 
         if required_memory > available_memory:
+            shortfall = required_memory - available_memory
             raise HTTPException(
                 status_code=400,
-                detail=f"Insufficient memory to create instance. Required: {required_memory.in_gb:.1f}GB, Available: {available_memory.in_gb:.1f}GB",
+                detail=(
+                    "Insufficient memory to create instance. "
+                    f"Required: {required_memory.in_gb:.3f} GiB "
+                    f"({required_memory.in_bytes:,} bytes), "
+                    f"Available: {available_memory.in_gb:.3f} GiB "
+                    f"({available_memory.in_bytes:,} bytes). "
+                    f"Shortfall: {shortfall.in_float_mb:.2f} MiB "
+                    f"({shortfall.in_bytes:,} bytes)."
+                ),
             )
 
         command = CreateInstance(
