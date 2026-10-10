@@ -3,7 +3,7 @@ import time
 from collections import deque
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -43,6 +43,7 @@ from exo.worker.engines.mlx.utils_mlx import (
     mx_any,
 )
 from exo.worker.engines.mlx.vision import VisionProcessor
+from exo.worker.engines.mlx.windows_text_offload import WindowsQwen3OffloadModel
 from exo.worker.runner.bootstrap import logger
 
 from .model_output_parsers import apply_all_parsers, map_responses_to_chunks
@@ -118,6 +119,10 @@ class SequentialGenerator(Engine):
         | None
     ) = field(default=None, init=False)
 
+    @property
+    def supports_disaggregated_prefill(self) -> bool:
+        return not isinstance(cast(object, self.model), WindowsQwen3OffloadModel)
+
     def warmup(self):
         self.check_for_cancel_every = warmup_inference(
             model=self.model,
@@ -125,6 +130,10 @@ class SequentialGenerator(Engine):
             group=self.group,
             model_id=self.model_id,
         )
+        if isinstance(cast(object, self.model), WindowsQwen3OffloadModel):
+            # Each token streams the decoder weights again; check cancellation
+            # before starting another expensive transfer instead of batching polls.
+            self.check_for_cancel_every = 1
 
     def submit(
         self,

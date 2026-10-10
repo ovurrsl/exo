@@ -129,6 +129,11 @@ class Runner:
     def _start_prefill_server(self) -> int | None:
         if not ENABLE_DISAGGREGATION:
             return None
+        if (
+            isinstance(self.generator, Engine)
+            and not self.generator.supports_disaggregated_prefill
+        ):
+            return None
         if self.device_rank != 0:
             return None
         if self._prefill_server_port is not None:
