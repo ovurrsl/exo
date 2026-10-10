@@ -12,6 +12,7 @@ from exo.utils.pydantic_ext import FrozenModel
         "Qwen/Qwen3-0.6B",
         "local-model",
         "org/model.with.dots-and_underscores",
+        "org/CON",
     ],
 )
 def test_accepts_huggingface_style_ids(value: str) -> None:
@@ -32,6 +33,20 @@ def test_accepts_huggingface_style_ids(value: str) -> None:
         "trailing/",
         "org\\model",
         "org/model\x00",
+        "",
+        "C:",
+        "C:..",
+        "C:/outside",
+        "org/model:stream",
+        "...",
+        "model.",
+        "model ",
+        "CON",
+        "NUL.txt",
+        "LPT1",
+        "org/model\n",
+        "caches",
+        "CACHES",
     ],
 )
 def test_rejects_ids_that_would_escape_the_models_directory(value: str) -> None:

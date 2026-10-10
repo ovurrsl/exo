@@ -1,3 +1,4 @@
+import ntpath
 from typing import Any, Self
 from uuid import uuid4
 
@@ -32,14 +33,18 @@ class SystemId(Id):
 class ModelId(Id):
     def __new__(cls, value: str | None = None) -> Self:
         instance = super().__new__(cls, value)
-        # A model id becomes a directory name via normalize(), so a segment
-        # of "." or ".." would resolve outside the models directory.
+        # The normalized id must be a safe directory name on every platform.
+        # Windows drive prefixes and aliases can escape or name another model;
+        # "caches" is shared metadata, not a model directory.
         if (
-            any(segment in ("", ".", "..") for segment in instance.split("/"))
+            value == ""
+            or any(segment in ("", ".", "..") for segment in instance.split("/"))
             or "\\" in instance
-            or "\x00" in instance
+            or ":" in instance
+            or ntpath.isreserved(instance.normalize())
+            or instance.normalize().casefold() == "caches"
         ):
-            raise ValueError(f"Invalid model id: {instance!r}")
+            raise ValueError(f"Invalid model id: {value!r}")
         return instance
 
     def normalize(self) -> str:
