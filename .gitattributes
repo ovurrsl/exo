@@ -1,3 +1,4 @@
 # Keep the MLX patch byte-exact on Windows checkouts (core.autocrlf=true would
 # turn it into CRLF, and git apply and build-mlx-wheel.ps1 need it as committed).
-scripts/windows/mlx/*.patch -text
+# Unified diff blank context lines contain a required leading space.
+scripts/windows/mlx/*.patch -text -whitespace
