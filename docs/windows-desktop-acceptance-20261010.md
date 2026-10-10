@@ -44,13 +44,16 @@ Yerel kanıtlar ana checkout `exo/build/acceptance/` altında
 rapor aynı worktree'de
 `build/acceptance/windows-mac-design-independent-review-20261010.md`.
 
-Güncel hosted sonuçları [Windows checks 38068184144](https://github.com/ovurrsl/exo/actions/runs/38068184144),
-[38068180381](https://github.com/ovurrsl/exo/actions/runs/38068180381),
-[CI 38068184261](https://github.com/ovurrsl/exo/actions/runs/38068184261) ve
-[38068180571](https://github.com/ovurrsl/exo/actions/runs/38068180571) üzerinden
-izlenir; bu rapor bunların tamamlandığı veya yeşil olduğu iddiasını taşımaz.
-Tarihsel Windows/Darwin başarıları güncel commit'in hosted kabulü değildir.
-Önceki Linux NVSHMEM/cuFile Nix bağımlılık hataları açık kalır.
+Tam `79de2150` kaynağının [Windows checks 38068184144](https://github.com/ovurrsl/exo/actions/runs/38068184144)
+beş işi de başarılı tamamlandı: masaüstü, dashboard, CPU/Rust ve
+Windows/Darwin Python tip kontrolü. Bu CI, fiziksel GPU veya kurulum kabulü
+değildir. [CI 38068184261](https://github.com/ovurrsl/exo/actions/runs/38068184261)
+Linux Nix build işlerinde başarısız.
+[Darwin Nix işi](https://github.com/ovurrsl/exo/actions/runs/38068184261/job/114260012028)
+Metal paketleri ve Nix outputs derlemesi, flake check ve pytest adımlarında
+başarılı tamamlandı.
+Önceki Linux NVSHMEM/cuFile Nix bağımlılık hataları da tarihsel kayıtlarda
+korunur; bütün CI'ın geçtiği iddia edilmez.
 
 ## Native Settings ölçümünün kesin kapsamı
 
@@ -108,18 +111,31 @@ kopyaları açık bulgulardır. Önizleme aktarımı ve gizli pencere sorguları
 ve [tek CUDA media](windows-runtime-media-acceptance-20261010.md) sonuçları
 aynı `7d11c690` runtime kimliğiyle sınırlıdır.
 
-## Güncel kurucu — final kanıt bekleniyor
+## Güncel kurucu — derleme tamamlandı
 
-**`79de2150` kaynağının kurucu derlemesi sürüyor.** Şu ana kadar 257 fixed
-WebView2 dosyası ve 11.440 runtime dosyası doğrulandı; final `Finished 1 bundle`
-ve yeni dosya SHA-256/boyut/yazım zamanı/Authenticode kimliği henüz kaydedilmedi.
-Yerel log:
-`exo/build/acceptance/windows-mac-design-installer-build-20261010.log`.
+Mac düzeni ve ZIP gizlilik düzeltmesini içeren **`79de2150` GUI** ile değişmeyen
+**`7d11c690` CUDA runtime** bir paket olarak derlendi. 257 fixed WebView2 dosyası
+ve 11.440 runtime dosyası hash kontrollerinden geçti. Derleme exit 0 ve
+`Finished 1 bundle` sonucu verdi; taze dosya kimliği ayrıca doğrulandı.
 
-**Final artefakt kaydı: bekleniyor. Kurulum sonucu: bekleniyor.**
-Derleme tamamlanınca yalnız taze dosyanın source/runtime/hash kimliği eklenebilir.
-Aşağıdaki `975cc62d…` kurucusu eski `f99234db` GUI'ye aittir ve güncel kurucu
-kanıtı değildir.
+| Alan                   | Sonuç                                                                               |
+| ---------------------- | ----------------------------------------------------------------------------------- |
+| Kurucu                 | `app/windows/src-tauri/target/release/bundle/nsis/EXO Windows_0.3.70_x64-setup.exe` |
+| Boyut                  | 1.795.270.233 bayt / 1,67 GiB                                                       |
+| Son yazım              | 10 Ekim 2026 19:55:17 +03:00                                                        |
+| Kurucu SHA-256         | `46802dbbc3ecda0d4f82e6798c493e08b3f14632c945be96022ccc300ee430ff`                  |
+| GUI binary SHA-256     | `5793ae4901958dd373e3b55f0004c2a09c5d9523e2ec43de43eac809b55e70cf`                  |
+| MLX / WebView2         | `0.32.3.dev20261009+win.3` / `154.0.4258.62`                                        |
+| Authenticode / kurulum | `NotSigned`; kurulmadı; `release_ready=false`                                       |
+
+Yerel kimlik kaydı `exo/build/acceptance/windows-mac-design-installer-artifact-20261010.json`,
+derleme logu `exo/build/acceptance/windows-mac-design-installer-build-20261010.log`.
+Kayıt kaynak, frontend, executable, runtime manifest ve wheel hash'lerini bağlar.
+Bu tarihten sonraki rapor commitleri uygulama kaynaklarını değiştirmedi.
+Aşağıdaki `975cc62d…` kimliği tarihsel `f99234db` GUI kurucusuna aittir.
+
+Paket hazırlanması kurulum kabulü değildir. PR 2305/2306 düzeltmeleri bu frozen
+runtime'a henüz taşınmadı; kurucu bir yerel test adayıdır.
 
 Açık kapılar: production native opener/paint, beş sekme/klavye,
 fiziksel DPI/monitör, temiz araçsız Windows GPU kurulumu, model koruyan kaldırma,
