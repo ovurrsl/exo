@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
 const liveStatePath = process.env.EXO_DESKTOP_LIVE_STATE;
 const settings = {
@@ -103,6 +103,250 @@ test.beforeEach(async ({ page }) => {
     { settings },
   );
 });
+async function expectTrayControlsWithinViewport(page: Page) {
+  expect(
+    await page.evaluate(() => document.documentElement.scrollHeight),
+  ).toBeLessThanOrEqual(page.viewportSize()!.height);
+  for (const name of ["Settings…", "Quit"]) {
+    const control = page.getByRole("button", { name, exact: true });
+    const bounds = await control.boundingBox();
+    expect(bounds).not.toBeNull();
+    expect(bounds!.y).toBeGreaterThanOrEqual(0);
+    expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(
+      page.viewportSize()!.height,
+    );
+  }
+  await page.getByRole("checkbox", { name: "Run EXO" }).focus();
+  const visited = new Set<string>();
+  for (let index = 0; index < 30; index++) {
+    await page.keyboard.press("Tab");
+    for (const name of ["Settings…", "Quit"]) {
+      if (
+        await page
+          .getByRole("button", { name, exact: true })
+          .evaluate((element) => element === document.activeElement)
+      )
+        visited.add(name);
+    }
+  }
+  expect([...visited].sort()).toEqual(["Quit", "Settings…"]);
+}
+for (const height of [650, 440]) {
+  test(`tray controls stay reachable with a long error at ${height}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 340, height });
+    await page.goto("/");
+    await page.evaluate(() => {
+      const desktopWindow = window as unknown as {
+        __EXO_TEST_BRIDGE__: (
+          command: string,
+          args: Record<string, unknown>,
+        ) => Promise<unknown>;
+      };
+      const bridge = desktopWindow.__EXO_TEST_BRIDGE__;
+      desktopWindow.__EXO_TEST_BRIDGE__ = (command, args) =>
+        command === "check_update"
+          ? Promise.reject(
+              "Backend could not complete the request. ".repeat(80),
+            )
+          : bridge(command, args);
+    });
+    await page
+      .getByRole("button", { name: "Check for Updates", exact: true })
+      .click();
+    await expect(page.getByRole("alert")).toContainText(
+      "Backend could not complete",
+    );
+    await expectTrayControlsWithinViewport(page);
+    await page.screenshot({
+      path: test.info().outputPath("tray-long-error.png"),
+    });
+    await page.getByRole("button", { name: "Dismiss error" }).click();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await expectTrayControlsWithinViewport(page);
+  });
+}
+test("tray controls stay reachable while the API copy notice is shown", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 340, height: 650 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Copy API URL" }).click();
+  await expect(page.getByRole("status")).toContainText("API URL copied");
+  await expectTrayControlsWithinViewport(page);
+  await page.screenshot({
+    path: test.info().outputPath("tray-copy-notice.png"),
+  });
+});
+test("unchanged or reverted active settings cannot be saved and About has no save", async ({
+  page,
+}) => {
+  await page.goto("/?view=settings");
+  const save = page.getByRole("button", { name: "Save & Restart" });
+  await expect(save).toBeDisabled();
+  await page.getByLabel("Cluster namespace").fill("changed");
+  await expect(save).toBeEnabled();
+  await page.getByLabel("Cluster namespace").fill("");
+  await expect(save).toBeDisabled();
+  await page.getByLabel("Hugging Face token").fill("   ");
+  await expect(save).toBeDisabled();
+  await page.getByRole("checkbox", { name: "Remove saved token" }).check();
+  await expect(save).toBeEnabled();
+  await page.getByRole("checkbox", { name: "Remove saved token" }).uncheck();
+  await expect(save).toBeDisabled();
+  await page.getByRole("button", { name: "Model", exact: true }).click();
+  await expect(save).toBeDisabled();
+  await page.getByRole("checkbox", { name: "Enable image models" }).check();
+  await expect(save).toBeEnabled();
+  await page.getByRole("checkbox", { name: "Enable image models" }).uncheck();
+  await expect(save).toBeDisabled();
+  await page.getByRole("button", { name: "Advanced", exact: true }).click();
+  await expect(save).toBeDisabled();
+  await page.getByRole("checkbox", { name: "Fast synchronization" }).uncheck();
+  await expect(save).toBeEnabled();
+  await page.getByRole("checkbox", { name: "Fast synchronization" }).check();
+  await expect(save).toBeDisabled();
+  await page.getByRole("button", { name: "Environment", exact: true }).click();
+  await expect(save).toBeDisabled();
+  await page.getByRole("button", { name: "Add Variable", exact: true }).click();
+  await expect(save).toBeDisabled();
+  await page.getByLabel("Variable name").fill("EXO_OFFLINE");
+  await expect(save).toBeEnabled();
+  await page.getByLabel("Variable name").fill("");
+  await expect(save).toBeDisabled();
+  await page.getByRole("button", { name: "About", exact: true }).click();
+  await expect(save).toHaveCount(0);
+});
+test("saving one settings tab preserves other drafts and submits only its fields", async ({
+  page,
+}) => {
+  await page.goto("/?view=settings");
+  await page.getByLabel("Cluster namespace").fill("general-draft");
+  await page.getByLabel("Hugging Face token").fill("secret-draft");
+  await page.getByRole("button", { name: "Environment", exact: true }).click();
+  await page.getByRole("button", { name: "Add Variable", exact: true }).click();
+  await page.getByLabel("Variable name").fill("Path");
+  await page.getByLabel("Variable value").fill("C:\\invalid-runtime");
+  await page.getByRole("button", { name: "Model", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Enable image models" }).check();
+  await page.getByRole("button", { name: "Save & Restart" }).click();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(page.getByRole("status")).toContainText("Model");
+  const modelSave = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __EXO_CALLS__: { command: string; args: Record<string, unknown> }[];
+        }
+      ).__EXO_CALLS__.find((call) => call.command === "save_settings")?.args,
+  );
+  expect(modelSave).toMatchObject({
+    settings: { namespace: "", enableImageModels: true, customEnvironment: {} },
+    hfToken: null,
+    clearHfToken: false,
+  });
+  await expect(
+    page.getByRole("button", { name: "Save & Restart" }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "General", exact: true }).click();
+  await expect(page.getByLabel("Cluster namespace")).toHaveValue(
+    "general-draft",
+  );
+  await expect(page.getByLabel("Hugging Face token")).toHaveValue(
+    "secret-draft",
+  );
+  await expect(
+    page.getByRole("button", { name: "Save & Restart" }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: "Save & Restart" }).click();
+  await expect(page.getByRole("status")).toContainText("General");
+  await page.getByRole("button", { name: "Environment", exact: true }).click();
+  await expect(page.getByLabel("Variable name")).toHaveValue("Path");
+  await page.getByRole("button", { name: "Save & Restart" }).click();
+  await expect(page.getByRole("alert")).toContainText("Path is managed by EXO");
+});
+test("stopped settings save copy does not promise a backend restart", async ({
+  page,
+}) => {
+  await page.addInitScript(() =>
+    Object.assign(window, { __EXO_STATUS_OVERRIDE__: "Stopped" }),
+  );
+  await page.goto("/?view=settings");
+  await page.getByLabel("Cluster namespace").fill("next-launch");
+  await expect(page.locator(".settings-footer")).toContainText(
+    "next backend launch",
+  );
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("next backend launch");
+  await expect(page.getByRole("status")).not.toContainText("restarted");
+});
+test("running token save does not claim a restart the response cannot confirm", async ({
+  page,
+}) => {
+  await page.goto("/?view=settings");
+  await page.getByLabel("Hugging Face token").fill("hf-already-saved");
+  await page.getByRole("button", { name: "Save & Restart" }).click();
+  await expect(page.getByRole("status")).toContainText(
+    "General settings saved",
+  );
+  await expect(page.getByRole("status")).not.toContainText("restarted");
+});
+for (const invalidToken of ["\thf-secret\t", "\n"]) {
+  test(`General submits token controls unchanged for backend rejection: ${JSON.stringify(invalidToken)}`, async ({
+    page,
+  }) => {
+    await page.goto("/?view=settings");
+    await page.evaluate(() => {
+      const desktopWindow = window as unknown as {
+        __EXO_TEST_BRIDGE__: (
+          command: string,
+          args: Record<string, unknown>,
+        ) => Promise<unknown>;
+      };
+      const bridge = desktopWindow.__EXO_TEST_BRIDGE__;
+      desktopWindow.__EXO_TEST_BRIDGE__ = async (command, args) => {
+        const result = await bridge(command, args);
+        if (
+          command === "save_settings" &&
+          typeof args.hfToken === "string" &&
+          /[\u0000-\u001f\u007f]/.test(args.hfToken)
+        )
+          throw new Error("The token contains invalid control characters.");
+        return result;
+      };
+    });
+    await page.getByLabel("Cluster namespace").fill("token-validation");
+    await page.getByLabel("Hugging Face token").fill(invalidToken);
+    // A single-line input strips literal line feeds. Simulate an untrusted
+    // programmatic value at the event boundary to keep this regression explicit.
+    if (invalidToken === "\n") {
+      await page.getByLabel("Hugging Face token").evaluate((element) => {
+        Object.defineProperty(element, "value", {
+          value: "\n",
+          configurable: true,
+        });
+        element.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    }
+    await page.getByRole("button", { name: "Save & Restart" }).click();
+    await expect(page.getByRole("alert")).toContainText(
+      "invalid control characters",
+    );
+    const submitted = await page.evaluate(
+      () =>
+        (
+          window as unknown as {
+            __EXO_CALLS__: { command: string; args: Record<string, unknown> }[];
+          }
+        ).__EXO_CALLS__.find((call) => call.command === "save_settings")?.args,
+    );
+    expect(submitted?.hfToken).toBe(invalidToken);
+    await expect(
+      page.getByRole("button", { name: "Save & Restart" }),
+    ).toBeEnabled();
+  });
+}
 test("About identifies the runtime source and native MLX build", async ({
   page,
 }) => {
@@ -162,6 +406,7 @@ test("five settings tabs persist namespace, secure token input and model directo
     await expect(page.getByRole("button", { name, exact: true })).toBeVisible();
   await page.getByLabel("Cluster namespace").fill("shared-cluster");
   await page.getByLabel("Hugging Face token").fill("test-secret");
+  await page.getByRole("button", { name: "Save & Restart" }).click();
   await page.getByRole("button", { name: "Environment", exact: true }).click();
   await page.getByRole("button", { name: "Add Read-only Directory" }).click();
   await page.getByRole("button", { name: "Save & Restart" }).click();
@@ -171,9 +416,11 @@ test("five settings tabs persist namespace, secure token input and model directo
         window as unknown as {
           __EXO_CALLS__: { command: string; args: Record<string, unknown> }[];
         }
-      ).__EXO_CALLS__.find((call) => call.command === "save_settings")?.args,
+      ).__EXO_CALLS__
+        .filter((call) => call.command === "save_settings")
+        .at(-1)?.args,
   );
-  expect(saved?.hfToken).toBe("test-secret");
+  expect(saved?.hfToken).toBeNull();
   expect(saved?.settings).toMatchObject({
     namespace: "shared-cluster",
     readOnlyModelsDirectories: ["D:\\Shared models"],
@@ -347,9 +594,9 @@ for (const scale of [1, 1.25, 1.5, 2]) {
         "About",
       ]) {
         await page.getByRole("button", { name, exact: true }).click();
-        await expect(
-          page.getByRole("button", { name: "Save & Restart" }),
-        ).toBeVisible();
+        const save = page.getByRole("button", { name: "Save & Restart" });
+        if (name === "About") await expect(save).toHaveCount(0);
+        else await expect(save).toBeVisible();
       }
       expect(
         await page.evaluate(

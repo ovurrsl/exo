@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Settings {
     pub schema_version: u32,
@@ -340,6 +340,22 @@ pub fn write_token(token: Option<&str>, clear: bool) -> Result<(), String> {
         Ok(())
     }
 }
+pub fn token_changed(
+    current: Option<&str>,
+    requested: Option<&str>,
+    clear: bool,
+) -> Result<bool, String> {
+    if !clear && requested.is_some_and(|token| token.chars().any(char::is_control)) {
+        return Err("The token contains invalid control characters.".into());
+    }
+    if clear {
+        return Ok(current.is_some());
+    }
+    Ok(requested
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .is_some_and(|token| Some(token) != current))
+}
 pub fn set_login_startup(enabled: bool) -> Result<(), String> {
     use winreg::{
         enums::{HKEY_CURRENT_USER, KEY_SET_VALUE},
@@ -370,6 +386,32 @@ pub fn set_login_startup(enabled: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unchanged_token_requests_do_not_require_a_save() {
+        for (current, requested, clear) in [
+            (None, None, false),
+            (Some("hf-secret"), None, false),
+            (Some("hf-secret"), Some("  "), false),
+            (Some("hf-secret"), Some(" hf-secret "), false),
+            (None, None, true),
+            (None, Some("ignored"), true),
+        ] {
+            assert!(!token_changed(current, requested, clear).unwrap());
+        }
+    }
+    #[test]
+    fn token_changes_and_invalid_requests_are_not_silently_skipped() {
+        for (current, requested, clear) in [
+            (None, Some("hf-new"), false),
+            (Some("hf-old"), Some("hf-new"), false),
+            (Some("hf-old"), None, true),
+        ] {
+            assert!(token_changed(current, requested, clear).unwrap());
+        }
+        for invalid in ["hf-secret\n", "\thf-secret\t", "\n", "\0"] {
+            assert!(token_changed(Some("hf-secret"), Some(invalid), false).is_err());
+        }
+    }
     #[test]
     fn windows_environment_precedence_and_directories() {
         let mut settings = Settings {
