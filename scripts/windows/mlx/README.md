@@ -150,6 +150,16 @@ uv pip install --python C:\tmp\mlx-official\Scripts\python.exe "mlx[cuda13]==0.3
 The earlier patch revision is not in this repository; it differs in the base commit,
 in not loading CUDA from the pip wheels, and in the details of the WDDM fix.
 
+The active candidate is `mlx-0.32.3.dev20261009+win.3`, wheel SHA-256
+`045831dade422768798c314e63d4a8324873d8b3f64c12097ba4a6d3841885b2`, patch SHA-256
+`15b57315406c4453956f1398bc3465cd7dd043575eb513dc9f419396fe28f779`.
+Its tracked provenance lists **120a-real;120-virtual**, so the current package
+targets the validated RTX 5070 and does not establish RTX 20–40 support. The
+older multi-architecture wheel in the table is a different immutable artifact.
+Physical single-M1/RTX 5070 results are scoped in
+[`windows-hardware-acceptance.md`](../../../docs/windows-hardware-acceptance.md);
+clean-machine and three-device release gates remain open.
+
 ### Files larger than 2 GiB
 
 The historical `0.32.0.dev20261003` wheel cannot load a safetensors file larger than

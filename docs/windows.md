@@ -1,165 +1,194 @@
-# Running exo on Windows (experimental)
+# Native Windows and NVIDIA support
 
-This branch runs exo natively on Windows (no WSL2) on PCs with an NVIDIA GPU, so a
-Windows PC can join a cluster of macOS nodes running upstream exo. Models are split
-across machines with MLX's ring (TCP) backend; each node computes its layers on its
-own GPU.
+This fork runs EXO natively on Windows with NVIDIA CUDA, alongside Mac nodes using
+Metal. The initial target is one RTX 5070 and two 8 GB M1 MacBook Airs. Run the
+same fork release on every node. Physical Mac–Windows acceptance remains a release
+requirement; local Windows ring tests do not establish mixed-device support.
 
-Status: single-node GPU inference through the exo API works (Qwen3-0.6B-4bit, about
-260-280 tokens/s streaming on an RTX 5070), and the ring backend passes 2, 3 and
-4 rank tests on one Windows machine. **A real macOS + Windows ring has not been
-tested yet.** With the MLX wheel pinned today, only models whose files are all
-smaller than 2 GiB load (see Known limitations).
+The default API and dashboard remains **http://localhost:52415** in both the CLI
+and Windows desktop. Acceptance scripts select temporary ports and a separate
+namespace to avoid joining or stopping an existing installation.
 
-## How it works
+## Windows desktop and installation
 
-Upstream MLX publishes Windows CUDA wheels but compiles the ring backend out on
-Windows. exo therefore installs its own MLX wheel on Windows: the same MLX source the
-macOS nodes use, with the ring backend ported to Winsock2 and two Windows CUDA fixes.
-The wire protocol is unchanged. How the wheel is built is described in
-[`scripts/windows/mlx/README.md`](../scripts/windows/mlx/README.md).
+The independent [Tauri and Svelte app](../app/windows/README.md) provides a compact
+system tray panel, live topology, devices, memory, instances, downloads and tasks.
+It opens the existing dashboard in the default browser. Its General, Model,
+Advanced, Environment and About settings include namespace, offline mode, model
+directories, Hugging Face endpoint and token, custom environment variables, start
+at login, diagnostics, restart and signed updates.
 
-Everything else is Windows-only code behind `sys.platform == "win32"` or
-`#[cfg(windows)]`; macOS and Linux behave exactly as upstream.
+The installer contains Python, Rust bindings, MLX, NVIDIA runtime libraries, CPU
+PyTorch, dashboard and model resources. The end user needs a CUDA 13 compatible
+NVIDIA display driver. Python, uv, Rust, Node, Visual Studio and CUDA Toolkit are
+build dependencies. Development hardware acceptance uses Windows 11, RTX 5070 and
+driver 617.42; other GPU generations still need physical qualification.
 
-## Requirements
+The per-user installer embeds the WebView2 offline installer. Application binaries
+go to `%LOCALAPPDATA%\Programs\EXO`; settings, logs, cache and default models go to
+`%LOCALAPPDATA%\exo`. Hugging Face tokens use Windows Credential Manager.
+Custom and read-only model directories remain outside the application directory.
+The uninstall flow offers to preserve downloaded models.
 
-- Windows 10/11 x64 with an NVIDIA GPU and a driver that supports CUDA 13: version
-  580.88 or newer. On RTX 50 with Windows 11 24H2, use 581.36 or newer: NVIDIA's
-  Nsight known issues list a system hang with earlier R576/R580 drivers there while
-  debugging CUDA with hardware-accelerated GPU scheduling on. Game Ready and Studio
-  drivers of the same version are the same driver as far as CUDA is concerned;
-  either works.
-- [uv](https://docs.astral.sh/uv/), Node.js (for the dashboard), Rust nightly
-  (`rustup`), and Visual Studio Build Tools with the C++ workload (for the Rust
-  bindings and MLX's CPU kernel compiler).
-- The LAN must carry IPv6: discovery uses IPv6 multicast and link-local addresses,
-  exactly as on macOS.
+The desktop starts its backend suspended and assigns it to a kill-on-close Job
+Object. Stop signals a random event restricted to the current user and SYSTEM.
+Python drains runner shutdown acknowledgements before cancelling the node. After
+ten seconds the desktop terminates only its owned process tree. Running appears
+after the API responds. An external process occupying 52415 is shown read-only and
+is never stopped by this app.
 
-## Install and run
+Unsigned review builds disable updater artifacts. A signed release requires the
+owner's signing keys and the compiled public key. Updates use this fork's fixed
+channel and install only on an explicit user action. Publication is separate from
+building a local installer.
+
+## Build and run from source
+
+Developers need Python 3.13, uv, Node, an MSVC Rust toolchain, Visual Studio C++
+Build Tools and the Windows SDK. Building MLX additionally needs the pinned CUDA
+and cuDNN build inputs in the [MLX guide](../scripts/windows/mlx/README.md).
+
+The Windows dependency points to a local reviewed wheel because the candidate has
+not been published. Tracked provenance pins its source commit, patch SHA256 and
+wheel SHA256. Staging refuses different bytes; a rebuild requires fresh gates and
+an explicit provenance and lock update. Do not substitute the historical wheel.
 
 ```powershell
 git clone https://github.com/ovurrsl/exo
 cd exo
 git checkout windows-native
-cd dashboard; npm install; npm run build; cd ..
-uv sync --python 3.13 --extra mlx-cuda13
+.\scripts\windows\prepare-runtime-wheel.ps1 -WheelPath C:\path\mlx-0.32.3.dev20261009-cp313-cp313-win_amd64.whl
+uv sync --frozen --python 3.13 --all-packages --extra mlx-cuda13
+Push-Location dashboard
+npm ci
+npm run build
+Pop-Location
+.\scripts\windows\run.ps1
 ```
 
-Once, from an administrator PowerShell, open the firewall for the cluster ports:
+`run.ps1` forwards explicit CLI arguments, including `--api-port` when requested.
+It retains CUDA's JIT cache under `%LOCALAPPDATA%\exo\mlx-kernel-cache`.
+First use can compile kernels. The native patch leaves CPU-stream operations
+unfused to avoid requiring an external compiler; CUDA fusion uses bundled NVRTC
+and headers.
+
+Build the complete runtime and installer with the
+[Windows packaging scripts](../packaging/windows/README.md):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\windows\allow-firewall.ps1
+.\scripts\windows\build-runtime.ps1 -MlxWheel C:\path\mlx-0.32.3.dev20261009-cp313-cp313-win_amd64.whl
+.\scripts\windows\build-installer.ps1 -MlxWheel C:\path\mlx-0.32.3.dev20261009-cp313-cp313-win_amd64.whl -SkipRuntimeBuild
 ```
 
-Start exo:
+The runtime manifest records source inputs, package versions, native binary hashes
+and gate results. It remains `release_ready: false` until physical cluster and
+clean-machine acceptance are recorded. Use `-RequireSignedUpdater` for builds
+intended for the signed release channel.
+
+## CUDA capacity and model contracts
+
+CUDA is advertised only after an isolated process executes a real MLX kernel,
+verifies ring availability and exits normally. Failed checks are retried.
+The first supported configuration has exactly one NVIDIA GPU; multiple GPUs
+produce a clear error instead of silently selecting GPU 0.
+
+Placement uses NVML VRAM with an initial 2.5 GiB reserve for context, activations,
+KV cache and workspace. NVML loss reports no new placement capacity and never
+substitutes host RAM. Swap performance counters are independent of GPU capacity.
+Before evaluation, the loader checks owned layers and replicated parameters
+against the measured budget. An override cannot raise capacity above that budget.
+
+For groups containing CUDA, all ranks jointly decide prefix cache eviction and
+check cache entry identity before removing the same entry in the same order.
+The initial free-VRAM threshold is 1 GiB. Local rank thresholds need not match.
+Disagreement produces an instance error. Failed or stalled runners remove the
+whole CUDA instance. Mac-only cache decisions retain their existing path.
+
+Before loading a CUDA group, ranks compare the immutable Hugging Face snapshot,
+tokenizer and processor files, precision and global shard assignments. Downloads
+save verified revision sidecars; pre-staged snapshots may use Hugging Face download
+metadata. Copy the same pinned snapshot and metadata onto every rank. Missing or
+different revision records cause a controlled error.
+
+## Mac and Windows clustering
+
+Namespace priority is explicit `--namespace`, then a nonempty
+`EXO_ZENOH_NAMESPACE`, then the package version. This makes the existing Mac
+app's environment setting effective without changing Swift sources.
+
+The first heterogeneous configuration uses pipeline parallelism with TCP ring.
+M1 Air ports support Thunderbolt 3/USB4; Apple's RDMA support requires Thunderbolt
+5. These M1 devices therefore use IP networking rather than JACCL. See
+[M1 specifications](https://support.apple.com/en-my/111883) and
+[Apple TN3205](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt).
+
+Use a working wired IP link with IPv6 discovery. Desktop diagnostics show USB4
+P2P adapters, IPv6 and firewall information. Verify the actual PC's adapter and
+cable support; a USB-C connector alone does not establish an IP link.
+Mark the intended trusted link Private before applying firewall rules.
+The normal app stays unelevated and invokes a narrow administrator helper.
+
+| Port | Protocol | Purpose |
+| --- | --- | --- |
+| 52413 | UDP | IPv6 multicast discovery |
+| 52414 | TCP | Zenoh cluster messaging |
+| **52415** | TCP | API and dashboard |
+| 49152–65535 | TCP | Per-instance MLX ring sockets |
+
+For source development, `allow-firewall.ps1` opens Private/Domain profiles.
+The packaged helper restricts ring access to its bundled backend and local subnet.
+For an API conflict, identify the occupying process, stop it yourself or explicitly
+choose a different CLI port. Global dynamic port ranges need not be changed.
+
+Mixed CUDA tensor parallelism is disabled by default pending validation of weight
+replication, loading peaks and cache reserves. The acceptance-test opt-in is
+`EXO_ENABLE_CUDA_TENSOR_PARALLEL=true`. Mac-only tensor parallelism is unchanged.
+
+## Vision and image models
+
+Windows uses CPU PyTorch for vision preprocessing and MLX CUDA for the language
+model. Initialization errors are returned explicitly. The first acceptance model
+is `mlx-community/Qwen3-VL-4B-Instruct-4bit`.
+
+The Windows mflux path stages text encoders and VAE on CPU, keeps owned transformer
+layers on GPU, tiles VAE work and restores stages after cancellation. Full
+FLUX.1-schnell generation and API-driven cancellation/recovery passed on the
+RTX 5070; its card advertises both Metal and CUDA. This qualification covers one
+Windows CUDA rank and text-to-image. Image editing, other image families and
+mixed image pipelines still require physical acceptance. Windows can also request
+image work from a qualified Mac.
+
+## Verification and release requirements
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\windows\run.ps1
+uv run --no-sync basedpyright --pythonplatform Windows
+uv run --no-sync basedpyright --pythonplatform Darwin
+uv run --no-sync ruff check
+uv run --no-sync ruff format --check
+uv run --no-sync pytest --import-mode=importlib
+.\scripts\windows\mlx\check-mlx-wheel.ps1 -Output build\acceptance\native-wheel.json
+.venv\Scripts\python.exe scripts\windows\check_inference.py --model-dir C:\pinned-models --output build\acceptance\source-inference --exercise-cancel
 ```
 
-`run.ps1` passes its arguments to `exo` (for example `-v` or `--api-port`), and on a
-CUDA node it sets `MLX_PTX_CACHE_DIR` unless you set it yourself: MLX compiles CUDA
-kernels on first use (the first request takes 20-30 s) and caches them under `%TEMP%`,
-which Storage Sense cleans. The script keeps the cache under
-`%LOCALAPPDATA%\exo\mlx-kernel-cache\<mlx version>-sm<compute cap>`.
+The import mode avoids collisions between separate repository `tests` namespace
+directories. Normal slow-test exclusions remain enabled. Hosted CPU CI uses
+`mlx-none` without the private wheel; full type checks resolve MLX model
+dependencies separately.
 
-### GPU memory
+Wheel gates require valid >2 GiB safetensors with tensor reads beyond that offset,
+normal GPU and spawned process exits, compiler-free CPU/CUDA compilation,
+2/3/4-rank collectives over four dtypes, and missing, disconnected and stalled-peer
+failures. `-LargeFile` also evaluates every tensor in a real model shard.
+The same gates run inside the frozen runtime. Real HTTP tests cover repeated chat,
+prefix cache, longer context, cancellation recovery and worker exit code 0.
 
-On a CUDA node the model weights and the KV cache live in GPU memory, and Windows does
-not fail an allocation that does not fit: it silently moves it to shared system memory
-and generation becomes very slow. So on Windows exo works with the GPU's memory, read
-through NVML (installed by `--extra mlx-cuda13`) every second:
+Before publication, validate RTX 5070 alone, two M1s, PC with each M1, then all
+three, changing master and rank order. Compare Mac-only baseline output, teardown
+and namespace behavior. A clean Windows system must verify installation,
+offline WebView2, Unicode/spaced paths, GPU inference, updates and model-preserving
+uninstall. Windows CI and packaging jobs remain separate from Mac releases.
+The previous Codex Security scan had zero source coverage; a functioning source
+audit is also required before a stable release.
 
-- It reports the GPU's total memory and its free memory minus 2.5 GiB (for the KV
-  cache, prefill activations and the CUDA context) to the master, which places models
-  by that. Set `OVERRIDE_MEMORY_MB` to report a fixed amount instead.
-- It evicts the prefix cache when less than 1 GiB of GPU memory is free
-  (`EXO_WINDOWS_GPU_MIN_FREE_MB`, keep it below the 2.5 GiB reserve), counting
-  buffers MLX keeps cached for reuse as free; every rank of the instance evicts with
-  it. The system RAM threshold (`EXO_MEMORY_THRESHOLD`) still applies as well.
-- Both assume one NVIDIA GPU: NVML's GPU 0 is used, which with several GPUs need not
-  be the one MLX runs on.
-
-Whether CUDA may spill into shared memory at all is the driver's "CUDA - Sysmem Fallback
-Policy" (NVIDIA Control Panel, Manage 3D settings, globally or for `python.exe`):
-"Prefer No Sysmem Fallback" makes an allocation that does not fit fail instead.
-
-Data, models and logs go to `%LOCALAPPDATA%\exo` unless `EXO_HOME` is set.
-`EXO_MODELS_DIRS` and `EXO_MODELS_READ_ONLY_DIRS` are separated with `;` on Windows.
-
-## Running the tests
-
-The tests also need the workspace packages, so sync with `--all-packages` and run
-the unit tests under `src` (the top-level `tests/` are cluster tests that need a
-POSIX host):
-
-```powershell
-uv sync --python 3.13 --all-packages --extra mlx-cuda13
-uv run pytest src
-```
-
-Image generation (mflux) is not installed on Windows, so its tests are not collected.
-`basedpyright` is configured for macOS (`pythonPlatform = "Darwin"`); on Windows it
-also reports that the macOS/Linux-only `python-daemon` is not installed.
-
-## Ports
-
-| Port | Protocol | Use |
-|---|---|---|
-| 52413 | UDP | discovery (IPv6 multicast `ff12::e0a1:de89`) |
-| 52414 | TCP | zenoh (cluster messaging) |
-| 52415 | TCP | API and dashboard; peers also probe it |
-| 49152-65535 | TCP | MLX ring; exo picks a random port per instance |
-
-`allow-firewall.ps1` opens these for Private and Domain networks (mark your LAN as
-Private); the ring range is allowed only for the Python interpreter and only from
-the local subnet.
-
-Windows' default dynamic port range (49152-65535) contains 52413-52415, so another
-program can hold one of them by chance (seen with SteelSeries GG on 52415). To keep
-them free, move the dynamic range above exo's ports from an administrator prompt:
-
-```powershell
-netsh int ipv4 set dynamicport tcp start=52500 num=13036
-netsh int ipv6 set dynamicport tcp start=52500 num=13036
-```
-
-## In a cluster with macOS nodes
-
-- Run the same exo commit on every node. This branch is based on upstream `main`;
-  the macOS nodes should run that commit too.
-- Set `EXO_MEMORY_THRESHOLD` on the Windows node to the Macs' default (0.70 below
-  32 GB, 0.75 for 32 GB, 0.80 for 64 GB, 0.85 for 128 GB or more), so every rank evicts
-  the prefix cache at the same point; otherwise ranks can disagree mid-collective and
-  stall.
-- Connect the PC to a Mac with a wired link; Wi-Fi adds milliseconds to every token.
-  The fastest is a USB4/Thunderbolt cable between the two computers' USB4 or
-  Thunderbolt ports: Windows 11 shows it as a "USB4(TM) P2P Network Adapter", which
-  exo reports as a Thunderbolt link so the ring backend prefers it, and the Mac sees
-  it as its Thunderbolt Bridge. (Others measured about 15 Gbit/s between a Mac and a
-  Windows PC this way with an MTU of 9000 on both sides; not yet tried with exo.)
-  Windows puts such an unidentified network in the Public firewall profile, which
-  `allow-firewall.ps1` does not open; mark it Private, e.g.
-  `Set-NetConnectionProfile -InterfaceAlias "Ethernet 3" -NetworkCategory Private`
-  with the adapter's name.
-
-## Known limitations
-
-- The MLX wheel this branch pins (`0.32.0.dev20261003`, downloaded from this fork's
-  `mlx-windows-0.32.0.dev20261003` release) contains CUDA code for RTX 50 series GPUs
-  (sm_120a) only, and looks for the CUDA libraries in the CUDA 13.0 Toolkit's default
-  install folder and for cuDNN in a folder of the machine it was built on. It has
-  only been run on that machine. The portable build (MLX v0.32.3: RTX 20-50, CUDA
-  libraries from NVIDIA's pip wheels, no CUDA Toolkit needed) made processes that ran
-  GPU work exit with code 2170; the patch now carries the fix, and the wheel will
-  replace this one once it has been rebuilt and tested (see the MLX README).
-- The pinned wheel cannot load a model file larger than 2 GiB (MLX's file reader used
-  32-bit seeks on Windows before ml-explore/mlx#4456), so most models above roughly
-  3B parameters fail to load with `The JSON header is ... bytes long but the file is
-  only 8 bytes`. The files are not corrupt. A rebuilt wheel with that fix is planned.
-- Only NVIDIA GPUs are supported. MLX's CPU backend works on Windows but is far too
-  slow on x86 to be useful (about 0.2 tokens/s for Qwen3-0.6B), and every extra
-  installs the CUDA build of MLX.
-- vLLM is not advertised on Windows, and `--legacy-daemon` is not supported.
-- Each idle runner keeps about two CPU cores busy; the cause is not known yet.
+The [physical hardware checklist](windows-hardware-acceptance.md) includes the
+Mac/Windows ring commands, model metadata requirements and acceptance matrix.
