@@ -1,0 +1,28 @@
+{
+  "scope": "Small offline Qwen3 control with a 128 MiB live weight cap; not an oversized-VRAM model or production planner/ring acceptance",
+  "mlx_version": "0.32.3.dev20261009+win.3",
+  "full_model_weight_bytes": 335372288,
+  "canonical_host_weight_bytes": 335372288,
+  "resident_embedding_norm_bytes": 87517184,
+  "largest_layer_bytes": 8851968,
+  "weight_cap_bytes": 134217728,
+  "observed_live_weight_peak_bytes": 96369152,
+  "stages_opened": 365,
+  "stages_closed": 365,
+  "active_weight_bytes_at_exit": 0,
+  "greedy_tokens": [1, 374, 264, 4185],
+  "maximum_absolute_logit_difference": 0.0,
+  "transfer_dtypes": [
+    "mlx.core.float32",
+    "mlx.core.float16",
+    "mlx.core.bfloat16",
+    "mlx.core.uint32"
+  ],
+  "failure_cleanup_and_recovery": true,
+  "nvml_free_before_bytes": 11458383872,
+  "nvml_lowest_free_during_staging_bytes": 11304177664,
+  "nvml_free_after_bytes": 11371286528,
+  "nvml_scope": "Device-wide samples include other processes; not a per-process peak or exact host residency measurement",
+  "seconds": 1.825684600014938,
+  "passed": true
+}
