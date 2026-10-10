@@ -49,7 +49,7 @@ every model fitting physical RAM is supported or that performance equals VRAM.
   including GPU/CPU computation, spawned processes, Unicode paths, a real
   5.346 GB safetensors file, and local two/three/four-process ring checks.
   These local ring checks do not establish Mac/Windows cluster acceptance.
-- An unsigned review installer is being packaged separately. Clean installation
+- An unsigned review installer was built successfully. Clean installation
   on a Windows machine without development tools, signing, and release/update
   publication remain pending.
 - Mac clustering remains deferred as requested. No Mac Swift files were changed.
@@ -142,5 +142,27 @@ The review desktop was launched with this corrected runtime via
 Qwen3-0.6B as `vram`, and Qwen3-30B-A3B as `unavailable`, after initial GPU
 discovery. Existing user settings were backed up before enabling offload and
 adding the acceptance model directory as read-only. The local test namespace is
-`windows-ram-local`; Mac clustering remains deferred. Corrected installer
-compression and clean-machine installation are separate pending checks.
+`windows-ram-local`; Mac clustering remains deferred.
+
+## Corrected review installer and normal desktop launch
+
+Tauri completed the corrected NSIS installer with exit code 0:
+`app/windows/src-tauri/target/release/bundle/nsis/EXO Windows_0.3.70_x64-setup.exe`.
+Size is 2,097,808,496 bytes (1.95 GiB), below the NSIS 2 GiB compressed-data limit.
+SHA-256:
+`20575cd3517453adab05d9f0ca4284a81ec7f696fc71d224aba3efe112749d49`.
+Authenticode status is `NotSigned`; this is a review artifact, not a signed release.
+The temporary build-only compression override selected zlib, without changing
+production packaging configuration. Override SHA-256:
+`eff5d7a06a0e58c15a1175f1a73a8a32f107745e188018cda12ad7f3b369c6e0`.
+Receipt: `build/windows-runtime/review-package-receipt-417be.json`.
+
+The desktop then started normally with development runtime/resource/dashboard,
+offload/model-directory and Python-path environment overrides cleared. Its child
+backend uses `target/release/runtime/exo.exe`; WebView2 uses the bundled
+`target/release/resources/webview2`. The live capacity response again qualified
+32B for RAM offload, 0.6B for VRAM, and rejected the 30B MoE entry. Offload is
+enabled through the existing user's saved desktop settings, not package defaults.
+Clean-machine installation, signing and publication remain pending. The earlier
+superseded 1d installer ended with a file sharing error and is not successful
+installer evidence.
