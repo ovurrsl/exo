@@ -22,6 +22,7 @@ def _make_api() -> API:
     api._event_log = MagicMock()  # pyright: ignore[reportPrivateUsage]
     api._text_generation_queues = {}  # pyright: ignore[reportPrivateUsage]
     api._image_generation_queues = {}  # pyright: ignore[reportPrivateUsage]
+    api._cancelled_command_ids = set()  # pyright: ignore[reportPrivateUsage]
     api._send = AsyncMock()  # pyright: ignore[reportPrivateUsage]
     api._system_id = SystemId()  # pyright: ignore[reportPrivateUsage]
     api.command_sender, _ = channel[ForwarderCommand]()

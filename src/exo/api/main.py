@@ -4,7 +4,7 @@ import hashlib
 import json
 import random
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from collections.abc import AsyncGenerator, Iterable
 from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
@@ -46,7 +46,9 @@ from exo.api.adapters.responses import (
     generate_responses_stream,
     responses_request_to_text_generation,
 )
+from exo.api.collected_response import CollectedResponse
 from exo.api.keepalive import with_sse_keepalive
+from exo.api.request_logger import RequestLogger
 from exo.api.types import (
     AddCustomModelParams,
     AdvancedImageParams,
@@ -213,10 +215,20 @@ from exo.utils.task_group import TaskGroup
 
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
+_GENERATION_INTERRUPTED_MESSAGE = (
+    "The model instance serving this request stopped before it finished"
+)
 
 
 def _format_to_content_type(image_format: Literal["png", "jpeg", "webp"] | None) -> str:
     return f"image/{image_format or 'png'}"
+
+
+def _image_stream_error_event(message: str) -> str:
+    error_response = ErrorResponse(
+        error=ErrorInfo(message=message, type="InternalServerError", code=500)
+    )
+    return f"data: {error_response.model_dump_json()}\n\n"
 
 
 def _ensure_seed(params: AdvancedImageParams | None) -> AdvancedImageParams:
@@ -268,13 +280,7 @@ class API:
 
         self.app = FastAPI()
 
-        @self.app.middleware("http")
-        async def _log_requests(  # pyright: ignore[reportUnusedFunction]
-            request: Request,
-            call_next: Callable[[Request], Awaitable[StreamingResponse]],
-        ) -> StreamingResponse:
-            logger.debug(f"API request: {request.method} {request.url.path}")
-            return await call_next(request)
+        self.app.add_middleware(RequestLogger)
 
         self._setup_exception_handlers()
         self._setup_cors()
@@ -296,6 +302,9 @@ class API:
         self._image_generation_queues: dict[
             CommandId, Sender[ImageChunk | ErrorChunk]
         ] = {}
+        # Cancelling closes a command's stream just like losing its instance
+        # does, but it was requested, so the stream should not report an error
+        self._cancelled_command_ids: set[CommandId] = set()
         self._image_store = ImageStore(EXO_IMAGE_CACHE_DIR)
         self._tg: TaskGroup = TaskGroup()
 
@@ -305,6 +314,10 @@ class API:
         self._event_log = DiskEventLog(_API_EVENT_LOG_DIR)
         self.state = State()
         self._system_id = SystemId()
+        # Nothing routes chunks to the old queues any more, so close them to
+        # end their requests with an error instead of leaving them hanging
+        self._shutdown_queues(self._text_generation_queues)
+        self._shutdown_queues(self._image_generation_queues)
         self._text_generation_queues = {}
         self._image_generation_queues = {}
         self.unpause(result_clock)
@@ -787,6 +800,7 @@ class API:
                 detail="Command not found or already completed",
             )
 
+        self._cancelled_command_ids.add(command_id)
         await self._send(TaskCancelled(cancelled_command_id=command_id))
         sender.close()
 
@@ -796,7 +810,7 @@ class API:
         )
 
     async def _token_chunk_stream(
-        self, command_id: CommandId
+        self, text_generation: TextGeneration
     ) -> AsyncGenerator[
         TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk, None
     ]:
@@ -804,6 +818,7 @@ class API:
 
         This is the internal low-level stream used by all API adapters.
         """
+        command_id = text_generation.command_id
         try:
             self._text_generation_queues[command_id], recv = channel[
                 TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
@@ -816,21 +831,27 @@ class API:
                         continue
                     if chunk.finish_reason is not None:
                         break
+                else:
+                    # The stream was closed before the generation finished
+                    if command_id not in self._cancelled_command_ids:
+                        yield ErrorChunk(
+                            model=text_generation.task_params.model,
+                            error_message=_GENERATION_INTERRUPTED_MESSAGE,
+                        )
 
         except anyio.get_cancelled_exc_class():
-            command = TaskCancelled(cancelled_command_id=command_id)
-            with anyio.CancelScope(shield=True):
-                await self.command_sender.send(
-                    ForwarderCommand(origin=self._system_id, command=command)
-                )
+            await self._send_from_cleanup(
+                TaskCancelled(cancelled_command_id=command_id)
+            )
             raise
         finally:
-            await self._send(TaskFinished(finished_command_id=command_id))
+            await self._send_from_cleanup(TaskFinished(finished_command_id=command_id))
             if command_id in self._text_generation_queues:
                 del self._text_generation_queues[command_id]
+            self._cancelled_command_ids.discard(command_id)
 
     async def _collect_text_generation_with_stats(
-        self, command_id: CommandId
+        self, text_generation: TextGeneration
     ) -> BenchChatCompletionResponse:
         sampler = PowerSampler(get_node_system=lambda: self.state.node_system)
         text_parts: list[str] = []
@@ -843,7 +864,7 @@ class API:
         async with anyio.create_task_group() as tg:
             tg.start_soon(sampler.run)
 
-            async for chunk in self._token_chunk_stream(command_id):
+            async for chunk in self._token_chunk_stream(text_generation):
                 if isinstance(chunk, PrefillProgressChunk):
                     continue
 
@@ -882,7 +903,7 @@ class API:
         assert model is not None
 
         return BenchChatCompletionResponse(
-            id=command_id,
+            id=text_generation.command_id,
             created=int(time.time()),
             model=model,
             choices=[
@@ -969,7 +990,7 @@ class API:
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
-                        self._token_chunk_stream(command.command_id),
+                        self._token_chunk_stream(command),
                     ),
                 ),
                 media_type="text/event-stream",
@@ -980,10 +1001,10 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return CollectedResponse(
                 collect_chat_response(
                     command.command_id,
-                    self._token_chunk_stream(command.command_id),
+                    self._token_chunk_stream(command),
                 ),
                 media_type="application/json",
             )
@@ -1012,7 +1033,7 @@ class API:
                 with_sse_keepalive(
                     generate_chat_stream(
                         command.command_id,
-                        self._token_chunk_stream(command.command_id),
+                        self._token_chunk_stream(command),
                     ),
                 ),
                 media_type="text/event-stream",
@@ -1023,7 +1044,7 @@ class API:
                 },
             )
 
-        return await self._collect_text_generation_with_stats(command.command_id)
+        return await self._collect_text_generation_with_stats(command)
 
     async def _validate_model_has_instance(self, model_id: ModelId) -> ModelId:
         """Validate a model has an active instance.
@@ -1157,14 +1178,9 @@ class API:
             with recv as chunks:
                 async for chunk in chunks:
                     if chunk.finish_reason == "error":
-                        error_response = ErrorResponse(
-                            error=ErrorInfo(
-                                message=chunk.error_message or "Internal server error",
-                                type="InternalServerError",
-                                code=500,
-                            )
+                        yield _image_stream_error_event(
+                            chunk.error_message or "Internal server error"
                         )
-                        yield f"data: {error_response.model_dump_json()}\n\n"
                         yield "data: [DONE]\n\n"
                         return
 
@@ -1236,18 +1252,22 @@ class API:
                         del image_chunks[key]
                         del image_total_chunks[key]
                         del image_metadata[key]
+                else:
+                    # The stream was closed before every image was generated
+                    if command_id not in self._cancelled_command_ids:
+                        yield _image_stream_error_event(_GENERATION_INTERRUPTED_MESSAGE)
+                        yield "data: [DONE]\n\n"
 
         except anyio.get_cancelled_exc_class():
-            command = TaskCancelled(cancelled_command_id=command_id)
-            with anyio.CancelScope(shield=True):
-                await self.command_sender.send(
-                    ForwarderCommand(origin=self._system_id, command=command)
-                )
+            await self._send_from_cleanup(
+                TaskCancelled(cancelled_command_id=command_id)
+            )
             raise
         finally:
-            await self._send(TaskFinished(finished_command_id=command_id))
+            await self._send_from_cleanup(TaskFinished(finished_command_id=command_id))
             if command_id in self._image_generation_queues:
                 del self._image_generation_queues[command_id]
+            self._cancelled_command_ids.discard(command_id)
 
     async def _collect_image_chunks(
         self,
@@ -1301,6 +1321,14 @@ class API:
 
                         if images_complete >= num_images:
                             break
+                    else:
+                        # The stream was closed before every image was generated
+                        raise HTTPException(
+                            status_code=500,
+                            detail="Command cancelled."
+                            if command_id in self._cancelled_command_ids
+                            else _GENERATION_INTERRUPTED_MESSAGE,
+                        )
 
             images: list[ImageData] = []
             for image_idx in range(num_images):
@@ -1324,16 +1352,15 @@ class API:
 
             return (images, stats if capture_stats else None)
         except anyio.get_cancelled_exc_class():
-            command = TaskCancelled(cancelled_command_id=command_id)
-            with anyio.CancelScope(shield=True):
-                await self.command_sender.send(
-                    ForwarderCommand(origin=self._system_id, command=command)
-                )
+            await self._send_from_cleanup(
+                TaskCancelled(cancelled_command_id=command_id)
+            )
             raise
         finally:
-            await self._send(TaskFinished(finished_command_id=command_id))
+            await self._send_from_cleanup(TaskFinished(finished_command_id=command_id))
             if command_id in self._image_generation_queues:
                 del self._image_generation_queues[command_id]
+            self._cancelled_command_ids.discard(command_id)
 
     async def _collect_image_generation(
         self,
@@ -1588,7 +1615,7 @@ class API:
                     generate_claude_stream(
                         command.command_id,
                         payload.model,
-                        self._token_chunk_stream(command.command_id),
+                        self._token_chunk_stream(command),
                     ),
                 ),
                 media_type="text/event-stream",
@@ -1599,11 +1626,11 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return CollectedResponse(
                 collect_claude_response(
                     command.command_id,
                     payload.model,
-                    self._token_chunk_stream(command.command_id),
+                    self._token_chunk_stream(command),
                 ),
                 media_type="application/json",
             )
@@ -1624,7 +1651,7 @@ class API:
                     generate_responses_stream(
                         command.command_id,
                         payload.model,
-                        self._token_chunk_stream(command.command_id),
+                        self._token_chunk_stream(command),
                     ),
                 ),
                 media_type="text/event-stream",
@@ -1636,11 +1663,11 @@ class API:
             )
 
         else:
-            return StreamingResponse(
+            return CollectedResponse(
                 collect_responses_response(
                     command.command_id,
                     payload.model,
-                    self._token_chunk_stream(command.command_id),
+                    self._token_chunk_stream(command),
                 ),
                 media_type="application/json",
             )
@@ -1667,7 +1694,7 @@ class API:
             return StreamingResponse(
                 generate_ollama_chat_stream(
                     command.command_id,
-                    self._token_chunk_stream(command.command_id),
+                    self._token_chunk_stream(command),
                 ),
                 media_type="application/x-ndjson",
                 headers={
@@ -1677,10 +1704,10 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return CollectedResponse(
                 collect_ollama_chat_response(
                     command.command_id,
-                    self._token_chunk_stream(command.command_id),
+                    self._token_chunk_stream(command),
                 ),
                 media_type="application/json",
             )
@@ -1703,7 +1730,7 @@ class API:
             return StreamingResponse(
                 generate_ollama_generate_stream(
                     command.command_id,
-                    self._token_chunk_stream(command.command_id),
+                    self._token_chunk_stream(command),
                 ),
                 media_type="application/x-ndjson",
                 headers={
@@ -1713,10 +1740,10 @@ class API:
                 },
             )
         else:
-            return StreamingResponse(
+            return CollectedResponse(
                 collect_ollama_generate_response(
                     command.command_id,
-                    self._token_chunk_stream(command.command_id),
+                    self._token_chunk_stream(command),
                 ),
                 media_type="application/json",
             )
@@ -2086,6 +2113,14 @@ class API:
         await self.command_sender.send(
             ForwarderCommand(origin=self._system_id, command=command)
         )
+
+    async def _send_from_cleanup(self, command: Command) -> None:
+        # A disconnected client cancels its stream. Cleanup must reach the master
+        # despite that cancellation, without waiting on an election to unpause.
+        with anyio.CancelScope(shield=True):
+            await self.command_sender.send(
+                ForwarderCommand(origin=self._system_id, command=command)
+            )
 
     async def _send_download(self, command: DownloadCommand):
         await self.download_command_sender.send(
