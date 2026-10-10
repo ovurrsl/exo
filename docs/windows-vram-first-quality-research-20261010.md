@@ -162,3 +162,32 @@ Ham kayıtlar ignored `build/acceptance/qwen3-32b-sampled-quality-a567c59b/` ve
 `qwen3-32b-thinking-cancel-quality-a567c59b/` dizinlerinde. Açık masaüstü uygulaması
 henüz bu yeni kaynağa paketlenmedi; runtime yenilenmeden aynı düzeltmeyi içerdiği
 söylenemez. Kalıcı VRAM yerleşimi ve paket kabulü açık kalıyor.
+
+### Düşünce kanalı düzeltmesi — `ff59455b`
+
+Terminal token artık açık düşünce bloğunu kendiliğinden kapatmıyor; tam kapanış
+etiketi varsa etiket yutulurken finish/usage olayı korunuyor. Default suite
+816 geçti, 8 atlandı, 195 dışlandı; Windows/Darwin strict types ve Ruff temiz.
+Gerçek 32B modelinde 8-token sınırıyla `finish_reason=length`, boş `content` ve
+`reasoning_content="\nOkay, the user is asking"` alındı. Düğüm ve runner exit 0.
+Bu, yarım düşüncenin cevaba sızmadığını doğrular; tamamlanmış thinking cevabı
+kabulü değildir. Ham kayıt: `build/acceptance/qwen3-32b-truncated-reasoning-ff59455b/`.
+
+### Windows paket kabulü — kaynak `693f3eba`
+
+Yeni frozen runtime 32 zorunlu CUDA/ring/normal çıkış kontrolünü geçti; gerçek
+5,36 GB safetensors dosyası da kapsandı. Manifest 11.441 dosyayı kaydediyor;
+`exo.exe` SHA256: `9a4d938a23037c7e9adf9410edbfd63842f0546ca0bf2f560268262d118fd890`.
+Bu pakette yukarıdaki dört Türkçe cevap aynı şekilde doğru ve `stop` ile bitti;
+uzun elma bağlamına cevap `The color of the apple is **red**.` oldu. Streaming
+iptal sonrası toparlanma, düğüm ve runner çıkış kodu 0 ile doğrulandı. Ayrı
+8-token thinking testinde `content` boş, düşünce yalnız `reasoning_content`
+alanında ve bitiş `length`; bu yine tamamlanmış nihai cevap kabulü değildir.
+
+Frozen sohbet koşusunda peak owned-process RSS 21.097.095.168 bayt, peak global
+GPU 3.229.089.792 bayt, minimum host available 10.182.000.640 bayt. Bu paket
+doğruluk düzeltmelerini içerir; VRAM kalıcı yerleşim entegrasyonunu içermez.
+Açık masaüstünün eski runtime'ı henüz değiştirilmedi. Yeni runtime ve installer
+aynı şey değildir; imzalı yayın/temiz tüketici sistemi kabulü açık kalıyor.
+Ham kayıtlar `build/acceptance/qwen3-32b-frozen-sampled-quality-693f3eba/` ve
+`qwen3-32b-frozen-truncated-reasoning-693f3eba/` dizinlerinde.
