@@ -50,6 +50,8 @@ class MlxBuilder(Builder):
         )
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
+        if self.group is None:
+            self.cuda_cache_group = discover_cuda_cache_group(None)
         if self.cuda_cache_group and self.group is not None:
             verify_cuda_group_contract(bound_instance, self.group)
         (

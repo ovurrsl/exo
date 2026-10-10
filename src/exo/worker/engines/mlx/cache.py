@@ -62,6 +62,10 @@ _WINDOWS_GPU_MIN_FREE = Memory.from_mb(
     else 1024
 )
 
+# Bound token lookup and metadata work even while CUDA has ample free memory.
+# All members of a CUDA-containing group apply the same limit and LRU order.
+_MAX_CUDA_PREFIX_CACHE_ENTRIES = 32
+
 
 def is_cuda_device() -> bool:
     return (
@@ -310,7 +314,27 @@ class KVPrefixCache:
         prefill_tps: float = 0.0,
     ):
         """Add a new cache entry. Evicts LRU entries if memory is high."""
-        self._evict_if_needed()
+        if self._cuda_group:
+            # Validate shared identities before branching into refresh or append.
+            self._evict_if_needed()
+            identity = self._entry_identity(prompt_tokens, media_regions)
+            if identity in self._identities:
+                index = self._identities.index(identity)
+                # Identical tokens and media make retained restore points valid,
+                # but only up to the new cache's actual prefilled position.
+                self.update_kv_cache(
+                    index,
+                    prompt_tokens,
+                    cache,
+                    ssm_snapshots,
+                    restore_pos=cache_length(cache),
+                    media_regions=media_regions,
+                    prefill_tps=prefill_tps,
+                )
+                return
+            self._evict_cuda_group(reserve_entry=True)
+        else:
+            self._evict_if_needed()
         self.prompts.append(prompt_tokens)
         self.caches.append(deepcopy(cache))
         self._snapshots.append(
@@ -577,11 +601,12 @@ class KVPrefixCache:
             raise RuntimeError("Prefix caches diverged across CUDA cluster ranks")
         return count, any(record[2] != 0 for record in records)
 
-    def _evict_cuda_group(self) -> None:
+    def _evict_cuda_group(self, *, reserve_entry: bool = False) -> None:
         evicted_any = False
+        max_entries = _MAX_CUDA_PREFIX_CACHE_ENTRIES - int(reserve_entry)
         while True:
             count, evict = self._cuda_eviction_state()
-            if count == 0 or not evict:
+            if count == 0 or (not evict and count <= max_entries):
                 break
             index = self._last_used.index(min(self._last_used))
             for values in (
@@ -595,7 +620,9 @@ class KVPrefixCache:
             ):
                 _ = values.pop(index)
             evicted_any = True
-            logger.info("KV cache evicted by joint CUDA cluster memory pressure")
+            logger.info(
+                "KV cache evicted by joint CUDA cluster pressure or entry limit"
+            )
         if evicted_any:
             gc.collect()
             mx.clear_cache()
