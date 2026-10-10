@@ -51,7 +51,8 @@ def _overflow_capacity(
         + 3 * max(offload.parameter_bytes(layer) for layer in original.model.layers)
     )
     return (
-        policy.gpu_reserve_bytes
+        256 * 1024**2  # Physical headroom is planning-only, separate from reserves.
+        + policy.gpu_reserve_bytes
         + layer_kv * (len(original.model.layers) + 2)
         + max(required, 3 * offload.parameter_bytes(head))
     )
@@ -847,3 +848,83 @@ def test_wrapper_construction_failure_restores_allocator_limit(
     with pytest.raises(RuntimeError, match="wrapper-construction"):
         _prepare(_model(), _policy())
     assert events == [0, 123]
+
+
+def test_physical_headroom_keeps_logical_fit_from_filling_resident_prefix(
+    cpu_staging: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _model(4)
+    inner = cast(offload._QwenModel, cast(object, model)).model  # pyright: ignore[reportPrivateUsage]
+    layer_bytes = offload.parameter_bytes(inner.layers[0])
+    logical_free = (
+        _overflow_capacity(model, _policy()) - 256 * 1024**2 + 2 * layer_bytes
+    )
+    monkeypatch.setattr(
+        offload,
+        "read_gpu_memory",
+        lambda: GpuMemory(
+            Memory.from_gb(12), Memory.from_bytes(256 * 1024**2 + logical_free)
+        ),
+    )
+    wrapped = _prepare(model, _policy())
+    assert wrapped.residency_plan.resident_component_ids == (
+        "head",
+        "norm",
+        "layer0",
+        "layer1",
+    )
+    assert wrapped.residency_plan.overflow_component_ids == ("layer2", "layer3")
+    assert wrapped.residency_plan.reserve_bytes == (
+        _policy().gpu_reserve_bytes
+        + wrapped.staging.kv_bytes
+        + wrapped.staging.kv_scratch_bytes
+    )
+    monkeypatch.setattr(
+        offload,
+        "read_gpu_memory",
+        lambda: GpuMemory(
+            Memory.from_gb(12),
+            Memory.from_bytes(wrapped.residency_plan.reserve_bytes - 1),
+        ),
+    )
+    with pytest.raises(MemoryError, match="remaining dedicated"):
+        wrapped(mx.array([[1]]))
+
+
+@pytest.mark.parametrize("reclaimed_free", [50, 49, None])
+def test_capacity_shortfall_reclaims_once_and_rechecks_actual_free(
+    monkeypatch: pytest.MonkeyPatch, reclaimed_free: int | None
+) -> None:
+    samples = iter([49, reclaimed_free])
+    events: list[str] = []
+    def read() -> GpuMemory | None:
+        events.append("read")
+        value = next(samples)
+        return None if value is None else GpuMemory(Memory.from_gb(12), Memory.from_bytes(value))
+    monkeypatch.setattr(offload, "read_gpu_memory", read)
+    monkeypatch.setattr(mx, "clear_cache", lambda: events.append("trim"))
+    if reclaimed_free == 50:
+        offload._check_gpu_capacity(10, _policy(), 20)  # pyright: ignore[reportPrivateUsage]
+    else:
+        with pytest.raises(MemoryError):
+            offload._check_gpu_capacity(10, _policy(), 20)  # pyright: ignore[reportPrivateUsage]
+    assert events == ["read", "trim", "read"]
+
+
+@pytest.mark.parametrize("free", [50, None])
+def test_capacity_fit_or_missing_nvml_does_not_trim(
+    monkeypatch: pytest.MonkeyPatch, free: int | None
+) -> None:
+    events: list[str] = []
+    def read() -> GpuMemory | None:
+        events.append("read")
+        return None if free is None else GpuMemory(Memory.from_gb(12), Memory.from_bytes(free))
+    monkeypatch.setattr(offload, "read_gpu_memory", read)
+    monkeypatch.setattr(mx, "clear_cache", lambda: events.append("trim"))
+    if free is None:
+        with pytest.raises(MemoryError):
+            offload._check_gpu_capacity(10, _policy(), 20)  # pyright: ignore[reportPrivateUsage]
+    else:
+        offload._check_gpu_capacity(10, _policy(), 20)  # pyright: ignore[reportPrivateUsage]
+    assert events == ["read"]

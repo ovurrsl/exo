@@ -33,6 +33,13 @@ from exo.worker.engines.mlx.types import KVCacheType
 type ParameterTree = mx.array | list[ParameterTree] | dict[str, ParameterTree]
 type AttentionMask = mx.array | str | None
 
+# Planning-only slack for physical CUDA allocation overhead. The RTX 5070
+# acceptance probe measured ~39 MB beyond parameter bytes and a ~28 MB stage
+# deficit at an otherwise logical fit. This bounded allowance is not a universal
+# driver guarantee; every stage still checks actual free VRAM. Do not also add it
+# to the remaining reserve, which would consume the slack a second time.
+_PHYSICAL_GPU_HEADROOM_BYTES = 256 * 1024**2
+
 
 class _CudaCacheLease:
     """Exclusive process allocator ownership for a dedicated offload runner.
@@ -714,7 +721,10 @@ def prepare_windows_qwen3_offload(
         )
     plan = plan_residency(
         specifications,
-        CapacitySnapshot(memory.free.in_bytes, _host_available_bytes()),
+        CapacitySnapshot(
+            max(0, memory.free.in_bytes - _PHYSICAL_GPU_HEADROOM_BYTES),
+            _host_available_bytes(),
+        ),
         BudgetPolicy(
             policy.gpu_reserve_bytes,
             kv_bytes,
