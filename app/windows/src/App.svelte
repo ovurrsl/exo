@@ -28,6 +28,7 @@
   let snapshot = $state<Snapshot | null>(null);
   let cluster = $state<Cluster>(parseCluster({}));
   let settings = $state<Settings | null>(null);
+  let savedSettings = $state<Settings | null>(null);
   let token = $state("");
   let tokenPresent = $state(false);
   let clearToken = $state(false);
@@ -49,6 +50,43 @@
   let welcomeShown = false;
   const running = $derived(snapshot?.status === "Running");
   const owned = $derived(snapshot?.owned === true);
+  const restartsOnSave = $derived(
+    snapshot?.status === "Running" || snapshot?.status === "Starting",
+  );
+  const tabFields: Record<(typeof tabs)[number], (keyof Settings)[]> = {
+    General: ["namespace", "hfEndpoint", "offline", "startOnLogin"],
+    Model: ["enableImageModels"],
+    Advanced: ["fastSynch"],
+    Environment: [
+      "defaultModelsDirectory",
+      "additionalModelsDirectories",
+      "readOnlyModelsDirectories",
+      "customEnvironment",
+    ],
+    About: [],
+  };
+  const hasChanges = $derived.by(() => {
+    if (!settings || !savedSettings || tab === "About") return false;
+    if (tab === "General" && (token.trim() || (clearToken && tokenPresent)))
+      return true;
+    if (tab === "Environment") {
+      const rows = environment
+        .map(({ key, value }) => ({ key: key.trim(), value }))
+        .filter(({ key, value }) => key || value)
+        .sort((left, right) => left.key.localeCompare(right.key));
+      const savedRows = Object.entries(savedSettings.customEnvironment)
+        .map(([key, value]) => ({ key, value }))
+        .sort((left, right) => left.key.localeCompare(right.key));
+      if (JSON.stringify(rows) !== JSON.stringify(savedRows)) return true;
+    }
+    return tabFields[tab]
+      .filter((field) => field !== "customEnvironment")
+      .some(
+        (field) =>
+          JSON.stringify(settings![field]) !==
+          JSON.stringify(savedSettings![field]),
+      );
+  });
   const showCluster = $derived(
     snapshot !== null && snapshot.status !== "Stopped",
   );
@@ -119,27 +157,43 @@
   async function loadSettings() {
     const saved = await call<SavedSettings>("get_settings");
     settings = saved.settings;
+    savedSettings = structuredClone(saved.settings);
     tokenPresent = saved.hfTokenPresent;
     environment = Object.entries(saved.settings.customEnvironment).map(
       ([key, value]) => ({ key, value }),
     );
   }
   async function saveSettings() {
-    if (!settings) return;
-    await action(async () => {
-      const saved = await call<SavedSettings>("save_settings", {
-        settings: {
-          ...settings!,
-          customEnvironment: validateEnvironment(environment),
-        },
-        hfToken: token || null,
-        clearHfToken: clearToken,
-      });
-      settings = saved.settings;
-      tokenPresent = saved.hfTokenPresent;
-      token = "";
-      clearToken = false;
-    }, "Saved. The running backend restarts with these settings.");
+    if (!settings || !savedSettings || !hasChanges || tab === "About") return;
+    const activeTab = tab;
+    const restart = restartsOnSave;
+    await action(
+      async () => {
+        const submitted = { ...savedSettings! };
+        for (const field of tabFields[activeTab])
+          Object.assign(submitted, { [field]: settings![field] });
+        if (activeTab === "Environment")
+          submitted.customEnvironment = validateEnvironment(environment);
+        const saved = await call<SavedSettings>("save_settings", {
+          settings: submitted,
+          hfToken: activeTab === "General" ? token || null : null,
+          clearHfToken: activeTab === "General" && clearToken,
+        });
+        savedSettings = structuredClone($state.snapshot(saved.settings));
+        for (const field of tabFields[activeTab])
+          Object.assign(settings!, { [field]: saved.settings[field] });
+        if (activeTab === "Environment")
+          environment = Object.entries(saved.settings.customEnvironment).map(
+            ([key, value]) => ({ key, value }),
+          );
+        tokenPresent = saved.hfTokenPresent;
+        if (activeTab === "General") {
+          token = "";
+          clearToken = false;
+        }
+      },
+      `${activeTab} settings saved.${restart ? "" : " Changes apply on the next backend launch."}`,
+    );
   }
   async function dashboard(section = "") {
     welcome = false;
@@ -871,17 +925,20 @@
         {/if}
       {:else}<p>Loading settings…</p>{/if}
     </main>
-    <footer class="settings-footer">
-      <span
-        >{busy
-          ? "Applying…"
-          : "Settings apply on the next backend launch."}</span
-      ><button
-        class="primary"
-        disabled={busy || !settings}
-        onclick={saveSettings}>Save &amp; Restart</button
-      >
-    </footer>
+    {#if tab !== "About"}<footer class="settings-footer">
+        <span
+          >{busy
+            ? "Applying…"
+            : restartsOnSave
+              ? `Saves ${tab} settings and restarts the backend.`
+              : `Saves ${tab} settings for the next backend launch.`}</span
+        ><button
+          class="primary"
+          disabled={busy || !hasChanges}
+          onclick={saveSettings}
+          >{restartsOnSave ? "Save & Restart" : "Save"}</button
+        >
+      </footer>{/if}
   {/if}
 </div>
 {#if task}

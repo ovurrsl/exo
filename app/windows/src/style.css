@@ -57,9 +57,12 @@ label { display: block; margin: 12px 0; font-weight: 400; }
 label > input { margin-top: 5px; }
 .check { display: flex; align-items: center; gap: 7px; }
 .check > input { margin: 0; }
+.desktop { height: 100vh; display: flex; flex-direction: column; }
+.desktop > .message { flex-shrink: 0; max-height: 25vh; overflow: auto; }
+.desktop > .message button { flex-shrink: 0; align-self: flex-start; position: sticky; top: 0; }
 .popover {
   display: flex; flex-direction: column; gap: 12px;
-  padding: 16px; height: 100vh; overflow: hidden;
+  padding: 16px; flex: 1; min-height: 0; overflow: hidden;
 }
 .popover > * { flex-shrink: 0; }
 .status-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
@@ -134,7 +137,6 @@ hr { border: 0; border-top: 1px solid var(--separator); margin: 8px 0; }
 .welcome { border: 1px solid var(--separator); border-radius: 6px; padding: 12px; }
 .welcome p { font-size: 12px; line-height: 1.5; }
 .task { display: flex; justify-content: space-between; width: 100%; padding: 6px; margin: 5px 0; font-size: 11px; }
-.settings-window { height: 100vh; display: flex; flex-direction: column; }
 .tabs { display: flex; justify-content: center; gap: 4px; padding: 10px 16px; border-bottom: 1px solid var(--separator); }
 .tabs button { display: flex; flex-direction: column; align-items: center; gap: 4px; border: 0; background: transparent; padding: 6px 12px; font-size: 11px; }
 .tabs button.active { background: var(--material); }

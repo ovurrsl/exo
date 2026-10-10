@@ -57,6 +57,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop(discovery);
         controller.refresh_process_status().await;
         assert_eq!(controller.snapshot().status, "Stopped");
+        controller.save(controller.settings(), None, false).await?;
+        assert!(!controller.settings_path.exists(), "Unchanged stopped settings were persisted");
+        assert_eq!(controller.snapshot().status, "Stopped");
         let starting = Instant::now();
         controller.start().await?;
         let start_seconds = starting.elapsed().as_secs_f64();
@@ -64,6 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(ready.status, "Running");
         assert!(ready.owned);
         assert!(ready.node_id.as_ref().is_some_and(|node| !node.is_empty()));
+        controller.save(controller.settings(), Some("  ".into()), false).await?;
+        assert!(controller.last_stop.lock().map_err(|e| e.to_string())?.is_none(), "Unchanged running settings restarted the backend");
+        assert!(!controller.settings_path.exists(), "Unchanged running settings were persisted");
+        assert_eq!(controller.snapshot().node_id, ready.node_id);
+        assert_eq!(controller.snapshot().status, "Running");
         controller.require_owned()?;
         let mut state = controller.cluster().await?;
         let node_id = ready.node_id.as_ref().ok_or("Missing node id")?;
@@ -100,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for forced_warning in ["Child process didn't shut down successfully, terminating", "Child process didn't respond to SIGTERM, killing"] {
             assert!(!log.contains(forced_warning), "Python child shutdown used forced termination: {forced_warning}");
         }
-        Ok::<_, String>(serde_json::json!({"runtime":runtime,"data":data,"namespace":namespace,"apiPort":ports.api,"zenohPort":ports.zenoh,"discoveryPort":ports.discovery,"ready":ready,"reportedBackends":reported_backends,"startSeconds":start_seconds,"restartSeconds":restart_seconds,"restartStop":restart_stop,"stopSeconds":stop_seconds,"stop":stop,"pythonForcedShutdownWarnings":false,"foreignPortReadOnly":true,"startupRegistryChanged":false,"credentialsRead":false,"guiWindowsCreated":false,"webviewsCreated":0,"trayCreated":false}))
+        Ok::<_, String>(serde_json::json!({"runtime":runtime,"data":data,"namespace":namespace,"apiPort":ports.api,"zenohPort":ports.zenoh,"discoveryPort":ports.discovery,"ready":ready,"reportedBackends":reported_backends,"startSeconds":start_seconds,"restartSeconds":restart_seconds,"restartStop":restart_stop,"stopSeconds":stop_seconds,"stop":stop,"unchangedSettingsNoOpStopped":true,"unchangedSettingsNoOpRunning":true,"pythonForcedShutdownWarnings":false,"foreignPortReadOnly":true,"startupRegistryChanged":false,"credentialsRead":false,"guiWindowsCreated":false,"webviewsCreated":0,"trayCreated":false}))
     });
     match report {
         Ok(report) => {

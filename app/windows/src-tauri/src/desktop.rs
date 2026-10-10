@@ -179,7 +179,7 @@ impl Desktop {
     pub fn saved_settings(&self) -> Result<SavedSettings, String> {
         Ok(SavedSettings {
             settings: self.settings(),
-            hf_token_present: settings::read_token()?.is_some(),
+            hf_token_present: self.read_credentials && settings::read_token()?.is_some(),
         })
     }
     pub fn mark_onboarding(&self, completed: bool) -> Result<(), String> {
@@ -208,8 +208,26 @@ impl Desktop {
     ) -> Result<SavedSettings, String> {
         let _save = self.settings_save.lock().await;
         settings.validate()?;
-        settings::write_token(token.as_deref(), clear)?;
-        settings::set_login_startup(settings.start_on_login)?;
+        let current = self.settings();
+        let current_token = if self.read_credentials {
+            settings::read_token()?
+        } else {
+            None
+        };
+        let token_changed =
+            settings::token_changed(current_token.as_deref(), token.as_deref(), clear)?;
+        if settings == current && !token_changed {
+            return Ok(SavedSettings {
+                settings: current,
+                hf_token_present: current_token.is_some(),
+            });
+        }
+        if token_changed {
+            settings::write_token(token.as_deref(), clear)?;
+        }
+        if settings.start_on_login != current.start_on_login {
+            settings::set_login_startup(settings.start_on_login)?;
+        }
         {
             let mut current = self.settings.lock().map_err(|e| e.to_string())?;
             settings.save(&self.settings_path)?;
