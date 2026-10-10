@@ -126,5 +126,21 @@ private capacity response. Strict actual architecture validation remains in the
 loader, so a custom misleading card cannot bypass loading checks.
 
 The earlier 1d357 runtime's successful 32B inference remains evidence for that
-unchanged inference path, but its desktop MoE label is superseded. A new runtime
-must include this admission correction before distributing the candidate.
+unchanged inference path, but its desktop MoE label is superseded. The corrected
+runtime from `417be25981f52d1e0875ea68dafb5f67fb1604ab` was rebuilt and validated:
+all 32 frozen gates passed again, 160 collected EXO modules originated in this
+worktree, and 11,441 runtime files passed validation. Default offload remains off.
+
+Runtime executable SHA-256:
+`585f83ce95a8ecca83a831f612b913d64e049329db2b34a3c872bb4fdee09761`.
+Manifest SHA-256:
+`e91d549e2b5a11401cad89929cd326b61f80c6c8553be31f98af305437d9528d`.
+The manifest explicitly records `release_ready=false`.
+
+The review desktop was launched with this corrected runtime via
+`EXO_RUNTIME_DIR`. Its live API at port 52415 reported Qwen3-32B as `ram_offload`,
+Qwen3-0.6B as `vram`, and Qwen3-30B-A3B as `unavailable`, after initial GPU
+discovery. Existing user settings were backed up before enabling offload and
+adding the acceptance model directory as read-only. The local test namespace is
+`windows-ram-local`; Mac clustering remains deferred. Corrected installer
+compression and clean-machine installation are separate pending checks.
