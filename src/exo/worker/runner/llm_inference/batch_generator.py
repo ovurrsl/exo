@@ -307,6 +307,14 @@ class SequentialGenerator(Engine):
         )
 
     def close(self) -> None:
+        if (
+            isinstance(cast(object, self.model), WindowsQwen3OffloadModel)
+            and self._active is not None
+        ):
+            # Close the request while its model can still settle GPU/CPU work.
+            # The output parser owns only queued responses, not the KV cache.
+            self._active[1].close()
+            self._active = None
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
