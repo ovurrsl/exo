@@ -85,5 +85,28 @@ kapalı. Peak owned-process RSS **15.857.582.080 bayt**, peak **global** GPU
 Global NVML değeri yalnız EXO sürecine atfedilmez. Kayıt:
 `build/acceptance/qwen3-32b-resident-sampled-quality/inference.json`.
 
-Paket, açık masaüstü runtime ve tam 8K context kabulü ayrıca doğrulanmalıdır.
-Açık uygulama bu rapor yazılırken hâlâ eski runtime'ı kullanıyor.
+## Frozen paket ve açık masaüstü
+
+`be621d52` kaynağından yeniden üretilen Windows runtime, 32 zorunlu
+compilerless/CUDA/ring/yükleme/normal çıkış kontrolünü geçti. Büyük dosya
+kontrolünde gerçek 5,36 GB safetensors shard'ı kullanıldı; atlanan test başarı
+sayılmadı. Runtime SHA-256:
+`c6a9e32f50d6fc9054e2d122bca08e752cdc7fcadc66922e5a751904da33554b`.
+
+Frozen runtime üzerinde aynı dört Türkçe doğruluk girdisi, 1.222-token bağlam,
+streaming iptal ve sonraki istekte toparlanma tekrar geçti; düğüm/runner exit 0.
+Peak owned-process RSS **15.734.513.664 bayt**, peak **global** GPU
+**7.332.331.520 bayt**, minimum host available **15.416.815.616 bayt**.
+Kayıt: `build/acceptance/qwen3-32b-vram-frozen-quality-be621d52/inference.json`.
+
+Paketin 11.441 dosyası hem masaüstü kaynaklarına hem çalıştırılan runtime
+dizinine kopyalandı ve manifest hash kontrolünü geçti. Firewall yardımcısı
+yeni runtime hash'iyle, ardından masaüstü uygulaması yeniden derlendi.
+Normal kullanıcı uygulaması **52415** üzerinde API hazır durumuna ulaştı;
+dinleyici backend'in GUI alt süreci olduğu, çalıştırılan dosya yolu ve runtime
+hash'i doğrulandı. Tasarım kaynakları, ayarlar ve sohbet geçmişi değiştirilmedi.
+Eski sayısal cevapların sonraki isteme taşınmaması için yeni sohbetle denenmeli.
+
+Tam 8K context/stres testi, diğer mimariler, temiz son kullanıcı kurulumu,
+imzalı kurulum/güncelleme paketi ve Mac kümesi hâlâ ayrı kabul gerektirir.
+Bu derleme yayın hazır kabul edilmez; eski installer yeni runtime diye sunulmaz.
