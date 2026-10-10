@@ -29,7 +29,11 @@ Windows rotası **Ethernet / 192.168.1.101**, Mac rotası **en0 / 192.168.1.105*
 | Aktif `/v1/cancel`                  | Geçti | Canlı stream command'ı iptal edildi; aynı instance sonraki sohbeti üretti. İptal ve sonraki üretim toplam 6,716 saniye.                                                                                    |
 | Açık prefix cache seçeneği          | Geçti | `/bench/chat/completions` üzerinde `use_prefix_cache=true`; üç üretimde `generation_stats` doğrulandı, cache sonucu sırasıyla `none`, `partial`, `partial`. Instance drain ve tüm worker/node çıkışları 0. |
 
-Küçük modelde 17 tamamlanmış sohbet yanıtı ve iki kesilmiş üretim sınandı. Aynı istemde “hello”, “two plus two is four”, ardından yeniden “hello” sonuçları değerlendirildi; bit düzeyinde backend eşitliği iddia edilmedi. `use_prefix_cache` seçeneği benchmark request şemasında tanınır; normal chat request'inde bu ek alan dikkate alınmadığından, açık seçenek kabulü ayrı benchmark deneyiyle doğrulandı. CUDA grubunda ortak eviction logları da görüldü; uzun-context ve yüksek VRAM basıncı matrisi ayrıca gereklidir.
+Ek uzun-prompt benchmark deneyi de geçti: **2.825 token** iki kez işlendi, 128 çıktı tokenı bütçesinde yanıt kontrolleri ve `none`, `partial`, `exact` cache sonuçları doğrulandı. Instance drain ve tüm worker/node çıkışları 0 oldu. İlk 24-token çıktı bütçeli deney, yanıt erken kesildiğinden başarısız olarak ayrı dizinde korundu; kabul sayılmadı.
+
+Başarılı deneylerde 20 tamamlanmış sohbet yanıtı ve iki kesilmiş üretim sınandı. Aynı istemde “hello”, “two plus two is four”, ardından yeniden “hello” sonuçları değerlendirildi; bit düzeyinde backend eşitliği iddia edilmedi. `use_prefix_cache` seçeneği benchmark request şemasında tanınır; normal chat request'inde bu ek alan dikkate alınmadığından, açık seçenek kabulü ayrı benchmark deneyiyle doğrulandı. CUDA grubunda ortak eviction logları da görüldü; maksimum context ve yüksek VRAM basıncı matrisi ayrıca gereklidir.
+
+Benchmark yolu EOS tokenlarını bilinçli olarak yasaklayıp sabit çıktı uzunluğu ölçer (`generate.py` içindeki `is_bench` logits processor); `finish_reason=length` normal sohbetin EOS kabulü değildir. Normal Windows-master sohbetlerinin üçü `stop` ile sonlandı. Aynı yerel snapshot'ın ayrı tek-CUDA kontrolünde de normal EOS'lu uzun prompt ve aritmetik üretimi `stop` verdi. Bu kontrol, EOS'u yasaklayan benchmark ile aynı koşulda karşılaştırma değildir.
 
 ## Test ortamındaki düzeltmeler ve açık bulgular
 
@@ -39,7 +43,7 @@ Mac'te ilk pytest girişimi `exo_tools` import yolu eksik olduğundan başlayama
 
 Başarılı tekrarın cleanup logunda, instance zaten silindikten sonra ulaşan ikinci `DeleteInstance` komutu için `Instance ... not found` uyarısı görüldü. Command processor çalışmaya devam etti ve drain/çıkış kapıları geçti; retry/idempotence kaynaklı bu gürültü takip işi olarak açık tutulur. Bu test aktif peer kablosunu kesme, uzun-context kill veya bütün stalled-peer matrisini kapatmaz.
 
-Hosted Windows checks **[38058351187](https://github.com/ovurrsl/exo/actions/runs/38058351187)**, `7d11c690` için beş job'ın tamamında başarı verdi: Windows CPU/Rust, desktop/UI, Dashboard, Windows ve Darwin Python tip kontrolü. Sonraki iki topic commit için hosted sonuç ayrıca beklenir. Mac Nix build `87ca16ff` üzerinde tamamlandı; treefmt ayrı Windows Cargo TOML biçimine takıldı. **`07c7e2b5`** Taplo biçimini uygular, TOML semantik eşliği ve formatter idempotence doğrulandı; Windows `cargo fmt --check` ve 19 native test geçti. Yerel Nix yok; hosted Nix başarısı henüz iddia edilmez. Önceki Linux NVSHMEM native dependency hatası bu batch'te çözülmedi.
+Hosted Windows checks **[38058351187](https://github.com/ovurrsl/exo/actions/runs/38058351187)**, `7d11c690` için beş job'ın tamamında başarı verdi: Windows CPU/Rust, desktop/UI, Dashboard, Windows ve Darwin Python tip kontrolü. **[38059626301](https://github.com/ovurrsl/exo/actions/runs/38059626301)** üzerinde `07c7e2b5` için aynı beş job da geçti. Mac Nix build tamamlandı; önce Windows Cargo TOML biçimi, sonra `.typings/mlx_lm/tokenizer_utils.pyi` satır sarımı treefmt'i durdurdu. **`07c7e2b5`** Taplo biçimini, **`02b5604f`** stub biçimini düzeltir. TOML ve Python AST semantik eşliği, formatter idempotence ve 285 stub biçimi doğrulandı. Son düzeltmede Windows 728 test, her iki platform tipi ve Ruff kontrolleri geçti. `02b5604f` üzerinde **[Darwin Nix job'ı](https://github.com/ovurrsl/exo/actions/runs/38061185950/job/114239608181)** hem build hem `nix flake check` ile başarılı tamamlandı. Aynı workflow'daki iki Linux job'ı NVSHMEM native bağımlılık hatasıyla başarısız kaldı; bütün CI yeşil değildir.
 
 ## Kanıt dosyaları ve temizleme
 
@@ -50,10 +54,13 @@ Yerel kanıtlar `build/acceptance/` altında tutulur ve source repository'ye mod
 - `mixed-model-integrated-lan-{windows-master,mac-master,node-stop}-20261010/mixed-model.json`;
 - `mixed-model-integrated-lan-cancel-recovery-retry-20261010/mixed-model.json`; ilk başarısız deney ayrı dizinde;
 - `mixed-model-integrated-lan-prefix-cache-20261010/mixed-model.json` ve üç üretimin cache istatistikleri;
+- `mixed-model-integrated-lan-long-context-retry-20261010/mixed-model.json`; ilk 24-token çıktı bütçeli başarısız deney ayrı dizinde;
+- `long-context-single-cuda-reference-20261010.json`: normal EOS'lu, benchmark ile koşulları farklı tek-CUDA kontrolü;
 - `mac-platform-fixture-{windows,mac}-suite-20261010.log`, `integration-review-platform-gates-20261010.md`;
 - `upstream-integrated-{mac,windows}-lan-cleanup-20261010.*`.
 - `mac-after-prefix-lan-cleanup-20261010.log`, `windows-after-prefix-lan-cleanup-20261010.json`.
+- `windows-lan-final-owned-process-check-20261010.json`: uzun-prompt ve kurucu derlemesi sonrasında frozen test runtime yolunda sıfır süreç; salt okunur kontrol.
 
 Test sonunda Windows frozen runtime'ına ve Mac izole Python node'una ait süreç kalmadığı doğrulandı; ayrı prefix cache deneyi sonrasında aynı süreç ve Mac uygulama kaynak kontrolleri yeniden geçti. Yalnız bu çalışmanın PID ve başlangıç zamanı doğrulanan süreli `caffeinate` yardımcısı kapatıldı. Prefix cache deneyinin uyku önleyicisi node PID'sine bağlıydı ve node çıkınca normal kapandı. Kullanıcının mevcut Mac EXO uygulaması değiştirilmedi.
 
-Sırada Windows panel/Settings P1 düzeltmeleri ve native kabul, yeni installer, temiz Windows kurulum, ikinci M1/üç cihaz, uzun context ve gerçek bellek baskısı, production RAM offload admission, karma offload/ileri dağıtık özellikler ve çalışan güvenlik taraması var. Thunderbolt testi kullanıcı kararıyla ertelenmiş durumda.
+Windows panel/Settings P1 düzeltmeleri **`de85b2cf`** ile tamamlandı ve **`f99234db`** ile `windows-native`'e birleştirildi. Bu birleşik commit'in **[Windows checks](https://github.com/ovurrsl/exo/actions/runs/38061981735)** workflow'unda beş job da geçti; ayrıntılı kanıt ve kalan native kabul [masaüstü raporunda](windows-desktop-acceptance-20261010.md). Sırada temiz Windows kurulum, native Settings/DPI, ikinci M1/üç cihaz, maksimum context ve gerçek bellek baskısı, production RAM offload admission, karma offload/ileri dağıtık özellikler ve çalışan güvenlik taraması var. Thunderbolt testi kullanıcı kararıyla ertelenmiş durumda.

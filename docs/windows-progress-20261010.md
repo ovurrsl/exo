@@ -5,7 +5,8 @@ en yeni ayrı konu dalları, inceleme bulguları ve entegrasyon durumları
 [güncel dal entegrasyon raporunda](upstream-integration-20261010.md) izlenir.
 Windows çekirdeği, CUDA runtime ve masaüstü uygulaması geliştirildi. Önceki yeni
 runtime 32 native kontrolü geçti; sonraki kurucu derlemesi dosya kilidi nedeniyle
-başarısız oldu. Yeni installer ve native Settings kabulü tamamlanmadı.
+başarısız oldu. Güncel imzasız kurucunun derlemesi aşağıdaki yeni kanıtla tamamlandı;
+kurulum ve native Settings kabulü henüz tamamlanmadı.
 **Tüm plan ve kararlı sürüm tamamlanmış değildir.** Varsayılan API portu **52415**.
 
 Yeni ilerleme: API hata/iptal düzeltmeleri, runner lifecycle, cache retention,
@@ -19,9 +20,18 @@ strict tip kontrolü temiz. Küçük fiziksel Qwen RAM–CUDA katman aktarımı 
 32 frozen runtime kapısı ve 3,09 GB safetensors yükleme; PC + tek M1'de iki ring
 rank sırası, Windows/Mac master üretimi, node stop ve iki iptal/toparlanma geçti.
 Windows 728, gerçek Mac 687 test geçti; atlanan ve slow kapsamlar raporda ayrıdır.
-Test fixture ve Windows Cargo biçimi ayrı commitlerde düzeltildi. `7d11c690`
-için hosted Windows checks beş job'ın tamamında başarılı; sonraki kaynakların
-hosted Nix sonucu ayrıca beklenir. Native Settings ve yeni installer kapıları açık.
+Test fixture, Windows Cargo ve tip stub biçimi ayrı commitlerde düzeltildi.
+`7d11c690` ve `07c7e2b5` için hosted Windows checks beş job'ın tamamında başarılı;
+`02b5604f` için Darwin Nix build ve flake check geçti. Linux NVSHMEM hataları açık.
+LAN'da 20 başarılı sohbet, iki aktif iptal/toparlanma ve 2.825-token tekrar/cache
+deneyi doğrulandı. Panel/Settings P1 düzeltmesi `de85b2cf` ayrı dalında tutulup
+`f99234db` ile birleştirildi; açık/koyu temada 22'şer UI testi ve gerçek frozen
+controller unchanged-save/graceful restart testleri geçti.
+`f99234db` için hosted Windows checks beş job'ın tamamında geçti.
+Güncel GUI/CUDA/WebView2 review kurucusu derlendi: 1,67 GiB, Authenticode
+`NotSigned`; taze dosya SHA-256 ve source/runtime kimlikleri kaydedildi.
+[Masaüstü kabul raporu](windows-desktop-acceptance-20261010.md) kurucu durumunu
+ve native Settings/DPI/temiz kurulum için kalan kapıları açıklar.
 [GPU Gen5 x16 ölçümü ve BIOS/ALT_PCIE_MODE rehberi](windows-bios-pcie-20261010.md).
 Thunderbolt kablo bağlantısı OS seviyesinde aktif eş/NIC oluşturmadı;
 [anakart ve Claude dal incelemesi](claude-fork-thunderbolt-20261010.md) mevcut kanıtı içerir.
@@ -73,7 +83,10 @@ gönderildi. Upstream'e merge veya kararlı yayın yapılmadı.
    `0412c817a9628ef63a833c47c143fc871b0a62c5c2ba4308dc90b1c7ed2cb363`.
    Yeni manifest SHA-256:
    `52d6f804b53121d846d1b59a11f7d519febc9d7aabac17eece9d1272058d0f67`.
-   Yeni kurucu ve native Settings kabulü henüz tamamlanmadı.
+   Bu dosya kilidi önceki girişime aittir. `f99234db` GUI ve `7d11c690` runtime
+   kullanan yeni imzasız review kurucusu başarıyla derlendi; yeni paket kurulumu
+   ve native Settings/DPI kabulü ayrıca bekliyor. Yeni artefakt SHA-256:
+   `975cc62d04053edf3d6724831039fca9f541821bae13d09b850926ef872f76c3`.
 2. EXO upstream'in mevcut **280 dalının incelemesi tamamlandı**. Her dalın amacı,
    `main` farkı, commit/dosya kanıtı ve Windows katkısı
    [ayrı raporda](upstream-branches-20261010.md). Dallardaki kodlar çalıştırılmadı;
