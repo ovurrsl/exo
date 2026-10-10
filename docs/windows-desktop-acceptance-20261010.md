@@ -24,7 +24,7 @@ Panel ve Settings düzeltmeleri ayrı **`work/windows-panel-controls`** dalında
 | Bağımsız kod incelemesi                                   | Final immutable patch/commit eşliği doğrulandı; P2 kapandı, başka uygulanabilir gerileme bulunmadı |
 | Gerçek Windows frozen controller probe                    | Running/Stopped unchanged save no-op; API hazır ve MlxCuda; explicit restart/stop graceful exit 0  |
 
-Güncel birleşik **`f99234db`** kaynağı için hosted **[Windows checks](https://github.com/ovurrsl/exo/actions/runs/38061981735)** beş job'ın tamamında başarılı tamamlandı: desktop/UI, Windows CPU/Rust, Dashboard ve Windows/Darwin Python tip kontrolü. Bu workflow fiziksel GPU veya kurulum kabulü değildir.
+Güncel birleşik **`f99234db`** kaynağı için hosted **[Windows checks](https://github.com/ovurrsl/exo/actions/runs/38061981735)** beş job'ın tamamında başarılı tamamlandı: desktop/UI, Windows CPU/Rust, Dashboard ve Windows/Darwin Python tip kontrolü. Aynı commit'in **[Darwin Nix build/flake check](https://github.com/ovurrsl/exo/actions/runs/38061981729/job/114241917205)** job'ı da geçti; iki Linux job'ı NVSHMEM/cuFile native bağımlılık hatalarıyla açık kaldı. Bu workflow'lar fiziksel GPU veya kurulum kabulü değildir.
 
 Controller probe rastgele test portları ve izole namespace/veri dizini kullandı. Kullanıcı Credential Manager'ını veya startup kaydını okumadı/değiştirmedi; GUI, tepsi ve WebView oluşturmadı. Bu kanıt gerçek Settings penceresinin render kabulü değildir. Browser yoğunlukları 1 / 1,25 / 1,5 / 2 ve headless screenshot'lar fiziksel Windows DPI/monitör kabulü yerine geçmez.
 
@@ -37,5 +37,7 @@ Güncel arayüz ve yeniden üretilmiş GPU runtime'ı bir araya getiren **imzas�
 Artefakt `app/windows/src-tauri/target/release/bundle/nsis/EXO Windows_0.3.70_x64-setup.exe`, **1.795.266.962 bayt / 1,67 GiB**. Son yazım 10 Ekim 2026 **18:26:30 +03:00**, SHA-256 **`975cc62d04053edf3d6724831039fca9f541821bae13d09b850926ef872f76c3`**; Authenticode sonucu `NotSigned`. Logdaki `Finished 1 bundle` sonucu ve taze dosya kimliği birlikte doğrulandı; eski 15:36 kurucusu bu kanıt değildir. Yeni paket henüz kurulmadı ve `release_ready=false` olarak tutulur.
 
 Derleme logu `build/acceptance/windows-panel-controls-installer-build-20261010.log`; GUI/runtime/wheel/executable/build hash'lerini bağlayan yerel kayıt `build/acceptance/windows-panel-controls-installer-artifact-20261010.json`.
+
+Bu kurucudaki runtime'ın [güncel tek-CUDA media kabulü](windows-runtime-media-acceptance-20261010.md) de geçti: iki Qwen3-VL görüntülü yanıt, FLUX üretim/düzenleme, iki iptal ve toparlanma, normal node/worker kapanışları. Bu, kurulum veya karma image pipeline kabulü değildir.
 
 Kararlı sürüm kabulü açık: native Settings beş sekme/klavye/DPI/monitör, kurulum ve model koruyan kaldırma, geliştirme araçları olmayan temiz Windows'ta GPU üretimi, imzalı updater ve çalışan güvenlik taraması. [LAN raporu](windows-lan-acceptance-20261010.md) iki cihazlı ring/üretim/iptal/cache sonuçlarını ve daha büyük donanım/bellek sınırlarını ayrıca kaydeder.

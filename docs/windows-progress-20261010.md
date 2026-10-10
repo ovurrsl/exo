@@ -22,7 +22,8 @@ rank sırası, Windows/Mac master üretimi, node stop ve iki iptal/toparlanma ge
 Windows 728, gerçek Mac 687 test geçti; atlanan ve slow kapsamlar raporda ayrıdır.
 Test fixture, Windows Cargo ve tip stub biçimi ayrı commitlerde düzeltildi.
 `7d11c690` ve `07c7e2b5` için hosted Windows checks beş job'ın tamamında başarılı;
-`02b5604f` için Darwin Nix build ve flake check geçti. Linux NVSHMEM hataları açık.
+`02b5604f` ve `f99234db` için Darwin Nix build ve flake check geçti.
+Linux NVSHMEM/cuFile native bağımlılık hataları açık.
 LAN'da 20 başarılı sohbet, iki aktif iptal/toparlanma ve 2.825-token tekrar/cache
 deneyi doğrulandı. Panel/Settings P1 düzeltmesi `de85b2cf` ayrı dalında tutulup
 `f99234db` ile birleştirildi; açık/koyu temada 22'şer UI testi ve gerçek frozen
@@ -30,6 +31,9 @@ controller unchanged-save/graceful restart testleri geçti.
 `f99234db` için hosted Windows checks beş job'ın tamamında geçti.
 Güncel GUI/CUDA/WebView2 review kurucusu derlendi: 1,67 GiB, Authenticode
 `NotSigned`; taze dosya SHA-256 ve source/runtime kimlikleri kaydedildi.
+[Aynı runtime'ın vision/görüntü kabulü](windows-runtime-media-acceptance-20261010.md)
+iki Qwen3-VL yanıtı ile FLUX üretim/düzenleme/iptal/toparlanma ve normal worker
+kapanışını doğruladı; kapsam tek RTX 5070'dir.
 [Masaüstü kabul raporu](windows-desktop-acceptance-20261010.md) kurucu durumunu
 ve native Settings/DPI/temiz kurulum için kalan kapıları açıklar.
 [GPU Gen5 x16 ölçümü ve BIOS/ALT_PCIE_MODE rehberi](windows-bios-pcie-20261010.md).
