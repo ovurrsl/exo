@@ -28,6 +28,10 @@ param(
     # Where mlx.dll looks for the CUDA DLLs, relative to site-packages\mlx. The CUDA 13
     # pip wheels install them to nvidia\cu13\bin\x86_64; cuDNN keeps nvidia\cudnn\bin.
     [string]$CudaBinDir = '../nvidia/cu13/bin/x86_64',
+    [string]$VsInstallPath,
+    [string]$Python,
+    [string]$Uv,
+    [string]$BuildVersion = '0.32.3.dev20261009+win.3',
     # Write the source tree's diff to the patch file and stop.
     [switch]$UpdatePatch
 )
@@ -47,8 +51,13 @@ $DiffArgs = @('-c', 'core.autocrlf=false', '-c', 'diff.suppressBlankEmpty=false'
 
 function Step([string]$Message) { Write-Host "==> $Message" -ForegroundColor Cyan }
 
-$uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
-if (-not $uv) { throw 'uv not found' }
+$uv = $Uv
+if (-not $uv) { $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source }
+if (-not $uv) {
+    $localUv = Join-Path (Split-Path $ExoRoot -Parent) 'deps\uv\uv.exe'
+    if (Test-Path -LiteralPath $localUv) { $uv = $localUv }
+}
+if (-not $uv) { throw 'uv not found; pass -Uv' }
 
 # 1. The source must be the pinned commit with exactly this patch on top, otherwise the
 #    Windows ring could drift from the protocol the Macs speak.
@@ -72,17 +81,22 @@ if ($UpdatePatch) {
 }
 # Compare bytes, not PowerShell strings: Windows PowerShell decodes git output and files
 # with different code pages, which mangles the non-ASCII characters in MLX.
-$currentDiff = Join-Path $env:TEMP 'mlx-src-current.patch'
+$MlxSrc = (Resolve-Path -LiteralPath $MlxSrc).Path
+$currentDiff = Join-Path $env:TEMP ("mlx-src-current-" + [guid]::NewGuid().ToString('N') + '.patch')
 git -C $MlxSrc @DiffArgs --output=$currentDiff
 if ($LASTEXITCODE -ne 0) { throw "git diff failed ($LASTEXITCODE)" }
 if ((Get-FileHash $currentDiff).Hash -ne (Get-FileHash $Patch).Hash) {
     throw "mlx-src working tree does not match $Patch (see $currentDiff)"
 }
+$sourcePatchHash = (Get-FileHash $Patch -Algorithm SHA256).Hash.ToLower()
 
 # 2. MSVC environment (cl, rc, ninja) from the newest VS/Build Tools install.
 Step 'Importing MSVC environment'
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+$vs = $VsInstallPath
+if (-not $vs -and (Test-Path -LiteralPath $vswhere)) {
+    $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+}
 if (-not $vs) { throw 'Visual Studio Build Tools with the C++ workload not found' }
 # 2>NUL: vcvarsall prints "'vswhere.exe' is not recognized" to stderr on Build Tools
 # installs, which aborts the script under -ErrorAction Stop when output is redirected.
@@ -90,6 +104,13 @@ cmd /c "`"$vs\VC\Auxiliary\Build\vcvarsall.bat`" x64 >NUL 2>NUL && set" | ForEac
     if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
 }
 if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw "vcvarsall.bat did not set up cl.exe ($vs)" }
+if ($Python) {
+    if (-not (Test-Path -LiteralPath $Python)) { throw "Python not found: $Python" }
+    $Python = (Resolve-Path -LiteralPath $Python).Path
+    $pythonScripts = Split-Path $Python -Parent
+    $env:Path = "$pythonScripts;$env:Path"
+}
+if (-not (Get-Command cmake.exe -ErrorAction SilentlyContinue)) { throw 'cmake.exe not found in build environment' }
 
 # 3. Backend specific CMake arguments (setup.py splits CMAKE_ARGS on spaces, so the
 #    values must not contain spaces).
@@ -107,13 +128,23 @@ if ($Backend -eq 'cuda13') {
     $cudnn = $CudnnDir -replace '\\', '/'
     # Forward slashes: the value ends up in a C string literal.
     $cudaBin = $CudaBinDir -replace '\\', '/'
-    $cmakeArgs = @('-G', 'Ninja', '-DCMAKE_C_COMPILER=cl', '-DCMAKE_CXX_COMPILER=cl', '-DCMAKE_RC_COMPILER=rc',
+    $cmakeArgs = @('-G', 'Ninja', '-DCMAKE_RC_COMPILER=rc', '-DCMAKE_LINKER=link', '-DCMAKE_MT=mt',
+        '-DMLX_USE_CCACHE=OFF',
         '-DMLX_BUILD_METAL=OFF', '-DMLX_BUILD_CUDA=ON',
         "-DCUDNN_INCLUDE_PATH=$cudnn/include", "-DCUDNN_LIBRARY_PATH=$cudnn/lib/x64",
         "-DMLX_CUDA_ARCHITECTURES=$CudaArchitectures",
         # Resolve the delay-loaded CUDA/cuDNN DLLs relative to mlx.dll (the NVIDIA pip
         # wheels) instead of this machine's CUDA Toolkit and cuDNN directories.
         '-DMLX_LOAD_CUDA_LIBS_FROM_PYTHON=ON', "-DMLX_CUDA_BIN_DIR=$cudaBin")
+    $ninja = (Get-Command ninja.exe -ErrorAction SilentlyContinue).Source
+    if (-not $ninja) { throw 'ninja.exe not found in build environment' }
+    $cmakeArgs += "-DCMAKE_MAKE_PROGRAM=$($ninja -replace '\\', '/')"
+    foreach ($compiler in @(@('C', 'cl.exe'), @('CXX', 'cl.exe'))) {
+        $compilerPath = (Get-Command $compiler[1]).Source -replace '\\', '/'
+        $cmakeArgs += "-DCMAKE_$($compiler[0])_COMPILER=$compilerPath"
+    }
+    $cmakeArgs += @('-DCMAKE_C_COMPILER_LAUNCHER=', '-DCMAKE_CXX_COMPILER_LAUNCHER=',
+        '-DCMAKE_CUDA_COMPILER_LAUNCHER=')
 } else {
     $cmakeArgs += '-DMLX_BUILD_CUDA=OFF'
 }
@@ -123,28 +154,45 @@ if ($Backend -eq 'cuda13') {
 # previous build was made by this script for this backend.
 $marker = Join-Path $MlxSrc 'build\.exo-backend'
 $buildDir = Join-Path $MlxSrc 'build'
+function Assert-SourceChild([string]$Path) {
+    $absolute = [System.IO.Path]::GetFullPath($Path)
+    if (-not $absolute.StartsWith($MlxSrc.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing recursive file operation outside MLX source: $absolute"
+    }
+    return $absolute
+}
 $sameBackend = (Test-Path $marker) -and ((Get-Content $marker -Raw).Trim() -eq $Backend)
 if ((Test-Path $buildDir) -and -not $sameBackend) {
     Step 'Cleaning previous build (different or unknown backend)'
-    Remove-Item -Recurse -Force $buildDir
+    $safeBuildDir = Assert-SourceChild $buildDir
+    Remove-Item -LiteralPath $safeBuildDir -Recurse -Force
 }
 
 Step "Building MLX wheel ($Backend)"
 # One self-contained 'mlx' wheel: Python bindings and libmlx from the same build, not
 # the split frontend ('mlx') + backend ('mlx-cuda-13') packages of upstream releases.
 # MLX's setup.py derives the dev version from today's date.
-$dist = Join-Path $MlxSrc "dist\$Backend"
+$dist = Join-Path $MlxSrc ("dist\$Backend-" + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))
 $env:MLX_BUILD_FRONTEND_PACKAGE = '0'
 $env:MLX_BUILD_BACKEND_PACKAGE = '0'
 $env:DEV_RELEASE = '1'
+$env:MLX_WINDOWS_BUILD_VERSION = $BuildVersion
 $env:CMAKE_ARGS = $cmakeArgs -join ' '
 if (-not $env:CMAKE_BUILD_PARALLEL_LEVEL) { $env:CMAKE_BUILD_PARALLEL_LEVEL = "$([Environment]::ProcessorCount)" }
-Remove-Item -Recurse -Force $dist -ErrorAction SilentlyContinue
 Push-Location $MlxSrc
 try {
-    & $uv build --wheel --python 3.13 --out-dir $dist
+    if ($Python) {
+        & $uv build --wheel --no-build-isolation --python $Python --out-dir $dist
+    } else {
+        & $uv build --wheel --python 3.13 --out-dir $dist
+    }
     if ($LASTEXITCODE -ne 0) { throw "uv build failed ($LASTEXITCODE)" }
 } finally { Pop-Location }
+git -C $MlxSrc @DiffArgs --output=$currentDiff
+if ($LASTEXITCODE -ne 0 -or (Get-FileHash $currentDiff -Algorithm SHA256).Hash.ToLower() -ne $sourcePatchHash -or
+    (Get-FileHash $Patch -Algorithm SHA256).Hash.ToLower() -ne $sourcePatchHash) {
+    throw 'MLX source or patch changed during the build; rerun the incremental build before using its output'
+}
 New-Item -ItemType Directory -Force (Split-Path $marker) | Out-Null
 Set-Content -Path $marker -Value $Backend
 
@@ -153,3 +201,16 @@ if (-not $wheel) { throw "No wheel in $dist" }
 $sha = (Get-FileHash $wheel.FullName -Algorithm SHA256).Hash.ToLower()
 Write-Host "Built $($wheel.FullName)"
 Write-Host "sha256 $sha"
+$attestation = [ordered]@{
+    schema = 1
+    upstream_commit = $PinnedCommit
+    patch_sha256 = $sourcePatchHash
+    wheel_filename = $wheel.Name
+    wheel_sha256 = $sha
+    backend = $Backend
+    architectures = $CudaArchitectures
+    built_at_utc = [DateTime]::UtcNow.ToString('o')
+    release_gates = 'pending: wheel checks and physical Mac/Windows cluster validation'
+}
+$attestation | ConvertTo-Json | Set-Content -LiteralPath ($wheel.FullName + '.provenance.json') -Encoding utf8
+Remove-Item -LiteralPath $currentDiff -Force

@@ -1,0 +1,2 @@
+# Reviewed wheel artifacts are staged locally until release publication.
+*.whl

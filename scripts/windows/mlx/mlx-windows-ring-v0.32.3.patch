@@ -1,3 +1,52 @@
+diff --git a/mlx/backend/common/utils.cpp b/mlx/backend/common/utils.cpp
+index 66764173e230c3dbcb2dd2d91cd88e6bf1c1308f..03e417fc4de177440bf0ac7f7139ad8a0f8954b4 100644
+--- a/mlx/backend/common/utils.cpp
++++ b/mlx/backend/common/utils.cpp
+@@ -4,16 +4,44 @@
+ #include <numeric>
+ 
+ #include "mlx/backend/common/utils.h"
++#ifdef _WIN32
++#include "mlx/windows_utils.h"
++#endif
+ 
+ namespace mlx::core {
+ 
+ std::filesystem::path current_binary_dir() {
+   static std::filesystem::path binary_dir = []() {
++#ifdef _WIN32
++    HMODULE module = nullptr;
++    if (!::GetModuleHandleExW(
++            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++            reinterpret_cast<LPCWSTR>(&current_binary_dir), &module)) {
++      throw std::runtime_error("Unable to get current binary dir.");
++    }
++    std::wstring filename(1024, L'\0');
++    while (true) {
++      DWORD length = ::GetModuleFileNameW(module, filename.data(), DWORD(filename.size()));
++      if (length == 0) {
++        throw std::runtime_error("Unable to get current binary dir.");
++      }
++      if (length < filename.size()) {
++        filename.resize(length);
++        return std::filesystem::path(filename).parent_path();
++      }
++      if (filename.size() >= 32768) {
++        throw std::runtime_error("Current binary path is too long.");
++      }
++      filename.resize(std::min<size_t>(filename.size() * 2, 32768));
++    }
++#else
+     Dl_info info;
+     if (!dladdr(reinterpret_cast<void*>(&current_binary_dir), &info)) {
+       throw std::runtime_error("Unable to get current binary dir.");
+     }
+     return std::filesystem::path(info.dli_fname).parent_path();
++#endif
+   }();
+   return binary_dir;
+ }
 diff --git a/mlx/backend/cpu/jit_compiler.cpp b/mlx/backend/cpu/jit_compiler.cpp
 index 530637e551d437838f3c40d1f0e39f089807aecb..8b21f509ee0d8fc409c2e69d34f1001c54bd417a 100644
 --- a/mlx/backend/cpu/jit_compiler.cpp
@@ -42,7 +91,7 @@ index 50be6f404fc98d67615db5e758306e154f7be2af..8b140aa6709c681a98d30bb3e3e62b93
  
    function(mlx_add_dir_definition name)
 diff --git a/mlx/backend/cuda/delayload.cpp b/mlx/backend/cuda/delayload.cpp
-index 44f6d163c6e9b65e6acf84dc2012fdef4b6b9cc5..28637e04d10d0a328eb7eddef76c100904dae26b 100644
+index 44f6d163c6e9b65e6acf84dc2012fdef4b6b9cc5..8ded7e704dcfcb73e6f3479a54070a37144c91cb 100644
 --- a/mlx/backend/cuda/delayload.cpp
 +++ b/mlx/backend/cuda/delayload.cpp
 @@ -2,6 +2,9 @@
@@ -55,7 +104,25 @@ index 44f6d163c6e9b65e6acf84dc2012fdef4b6b9cc5..28637e04d10d0a328eb7eddef76c1009
  // clang-format off
  #include <windows.h> // must be included first
  #include <delayimp.h>
-@@ -26,6 +29,45 @@ inline fs::path cublas_dir() {
+@@ -10,8 +13,8 @@
+ namespace mlx::core::cu {
+ 
+ // Defined in dirs.cpp to avoid invalidating compile cache.
+-const char* cuda_bin_dir();
+-const char* cudnn_bin_dir();
++const wchar_t* cuda_bin_dir();
++const wchar_t* cudnn_bin_dir();
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -20,15 +23,54 @@ inline fs::path relative_to_current_binary(const char* relative) {
+ }
+ 
+ inline fs::path cublas_dir() {
+-  if (const char* dir = cuda_bin_dir()) {
++  if (const wchar_t* dir = cuda_bin_dir()) {
+     return fs::path(dir);
+   }
    return relative_to_current_binary("../nvidia/cublas/bin");
  }
  
@@ -65,12 +132,12 @@ index 44f6d163c6e9b65e6acf84dc2012fdef4b6b9cc5..28637e04d10d0a328eb7eddef76c1009
 +  static std::once_flag flag;
 +  std::call_once(flag, []() {
 +    std::vector<fs::path> dirs;
-+    if (const char* dir = cudnn_bin_dir()) {
++    if (const wchar_t* dir = cudnn_bin_dir()) {
 +      dirs.emplace_back(dir);
 +    } else {
 +      dirs.push_back(relative_to_current_binary("../nvidia/cudnn/bin"));
 +    }
-+    if (const char* dir = cuda_bin_dir()) {
++    if (const wchar_t* dir = cuda_bin_dir()) {
 +      dirs.emplace_back(dir);
 +    } else {
 +      for (const char* name :
@@ -100,7 +167,29 @@ index 44f6d163c6e9b65e6acf84dc2012fdef4b6b9cc5..28637e04d10d0a328eb7eddef76c1009
 +
  fs::path load_nvrtc() {
    fs::path nvrtc_dir;
-   if (const char* dir = cuda_bin_dir()) {
+-  if (const char* dir = cuda_bin_dir()) {
++  if (const wchar_t* dir = cuda_bin_dir()) {
+     nvrtc_dir = fs::path(dir);
+   } else {
+     nvrtc_dir = relative_to_current_binary("../nvidia/cuda_nvrtc/bin");
+@@ -40,7 +82,7 @@ fs::path load_nvrtc() {
+ 
+ fs::path load_cudnn() {
+   fs::path cudnn_dir;
+-  if (const char* dir = cudnn_bin_dir()) {
++  if (const wchar_t* dir = cudnn_bin_dir()) {
+     cudnn_dir = fs::path(dir);
+   } else {
+     cudnn_dir = relative_to_current_binary("../nvidia/cudnn/bin");
+@@ -63,7 +105,7 @@ fs::path load_cudnn() {
+ 
+ fs::path load_cusolver() {
+   fs::path cusolver_dir;
+-  if (const char* dir = cuda_bin_dir()) {
++  if (const wchar_t* dir = cuda_bin_dir()) {
+     cusolver_dir = dir;
+   } else {
+     cusolver_dir = relative_to_current_binary("../nvidia/cusolver/bin");
 @@ -81,6 +123,7 @@ fs::path load_cusolver() {
  FARPROC WINAPI delayload_helper(unsigned dliNotify, PDelayLoadInfo pdli) {
    HMODULE mod = NULL;
@@ -109,7 +198,15 @@ index 44f6d163c6e9b65e6acf84dc2012fdef4b6b9cc5..28637e04d10d0a328eb7eddef76c1009
      std::string dll = pdli->szDll;
      if (dll.starts_with("cudnn")) {
        static auto cudnn_dir = load_cudnn();
-@@ -100,7 +143,24 @@ FARPROC WINAPI delayload_helper(unsigned dliNotify, PDelayLoadInfo pdli) {
+@@ -93,14 +136,31 @@ FARPROC WINAPI delayload_helper(unsigned dliNotify, PDelayLoadInfo pdli) {
+     } else if (dll.starts_with("nvrtc")) {
+       static auto nvrtc_dir = load_nvrtc();
+       mod = ::LoadLibraryW((nvrtc_dir / dll).c_str());
+-    } else if (const char* dir = cuda_bin_dir()) {
++    } else if (const wchar_t* dir = cuda_bin_dir()) {
+       mod = ::LoadLibraryW((fs::path(dir) / dll).c_str());
+     }
+   }
    return reinterpret_cast<FARPROC>(mod);
  }
  
@@ -134,11 +231,110 @@ index 44f6d163c6e9b65e6acf84dc2012fdef4b6b9cc5..28637e04d10d0a328eb7eddef76c1009
      mlx::core::cu::delayload_helper;
 +extern "C" const PfnDliHook __pfnDliFailureHook2 =
 +    mlx::core::cu::delayload_failure;
+diff --git a/mlx/backend/cuda/dirs.cpp b/mlx/backend/cuda/dirs.cpp
+index bd24853dd83247e2ee3c912438d43608f0fb6d07..ac11083acaa97afaa06f2aaff3e4a8c3a3bd4245 100644
+--- a/mlx/backend/cuda/dirs.cpp
++++ b/mlx/backend/cuda/dirs.cpp
+@@ -10,6 +10,15 @@ namespace {
+ 
+ namespace fs = std::filesystem;
+ 
++#ifdef _WIN32
++std::wstring resolve_bin_dir(const char* dir) {
++  fs::path path(dir);
++  if (path.is_absolute()) {
++    return path.wstring();
++  }
++  return fs::absolute(current_binary_dir() / path).wstring();
++}
++#else
+ std::string resolve_bin_dir(const char* dir) {
+   fs::path path(dir);
+   if (path.is_absolute()) {
+@@ -17,6 +26,7 @@ std::string resolve_bin_dir(const char* dir) {
+   }
+   return fs::absolute(current_binary_dir() / path).string();
+ }
++#endif
+ 
+ } // namespace
+ 
+@@ -28,18 +38,34 @@ const char* cccl_dir() {
+ #endif
+ }
+ 
++#ifdef _WIN32
++const wchar_t* cuda_bin_dir() {
++#else
+ const char* cuda_bin_dir() {
++#endif
+ #if defined(MLX_CUDA_BIN_DIR)
++#ifdef _WIN32
++  static const std::wstring dir = resolve_bin_dir(MLX_CUDA_BIN_DIR);
++#else
+   static const std::string dir = resolve_bin_dir(MLX_CUDA_BIN_DIR);
++#endif
+   return dir.c_str();
+ #else
+   return nullptr;
+ #endif
+ }
+ 
++#ifdef _WIN32
++const wchar_t* cudnn_bin_dir() {
++#else
+ const char* cudnn_bin_dir() {
++#endif
+ #if defined(MLX_CUDNN_BIN_DIR)
++#ifdef _WIN32
++  static const std::wstring dir = resolve_bin_dir(MLX_CUDNN_BIN_DIR);
++#else
+   static const std::string dir = resolve_bin_dir(MLX_CUDNN_BIN_DIR);
++#endif
+   return dir.c_str();
+ #else
+   return nullptr;
 diff --git a/mlx/backend/cuda/event.cu b/mlx/backend/cuda/event.cu
-index bcea005443f0831a0211efbcf83b2403ec327037..0ed1812fa1a91b851bf07eea1ed6c99d4773c901 100644
+index bcea005443f0831a0211efbcf83b2403ec327037..2796553b3115ff3378948e8387d0947befc7ec30 100644
 --- a/mlx/backend/cuda/event.cu
 +++ b/mlx/backend/cuda/event.cu
-@@ -275,6 +275,11 @@ void AtomicEvent::signal(uint32_t value) {
+@@ -9,6 +9,9 @@
+ 
+ #include <map>
+ #include <vector>
++#ifdef _WIN32
++#include <chrono>
++#endif
+ 
+ #include <nvtx3/nvtx3.hpp>
+ 
+@@ -242,6 +245,17 @@ AtomicEvent::AtomicEvent(Device& d) {
+ 
+ void AtomicEvent::wait(uint32_t value) {
+   nvtx3::scoped_range r("cu::AtomicEvent::wait");
++#ifdef _WIN32
++  // GPU writes cannot wake a host atomic wait. Bound polling on Windows.
++  unsigned int polls = 0;
++  while (!is_signaled(value)) {
++    if (++polls < 32) {
++      std::this_thread::yield();
++    } else {
++      std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++  }
++#else
+   if (coherent_) {
+     event_wait(ptr(), value);
+   } else {
+@@ -249,6 +263,7 @@ void AtomicEvent::wait(uint32_t value) {
+       std::this_thread::yield();
+     }
+   }
++#endif
+ }
+ 
+ void AtomicEvent::wait(cudaStream_t stream, uint32_t value) {
+@@ -275,6 +290,11 @@ void AtomicEvent::signal(uint32_t value) {
  
  void AtomicEvent::signal(cudaStream_t stream, uint32_t value) {
    event_signal_kernel<<<1, 1, 0, stream>>>(ptr(), value);
@@ -150,6 +346,229 @@ index bcea005443f0831a0211efbcf83b2403ec327037..0ed1812fa1a91b851bf07eea1ed6c99d
  }
  
  void AtomicEvent::signal(Stream s, uint32_t value) {
+diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
+index 0d107a8e18bce331741feeeb45e2001398e65ffa..4576577da05844766d25d2ce3f19f54161153775 100644
+--- a/mlx/backend/cuda/jit_module.cpp
++++ b/mlx/backend/cuda/jit_module.cpp
+@@ -3,6 +3,9 @@
+ #include "mlx/backend/cuda/jit_module.h"
+ #include "mlx/backend/cuda/device.h"
+ #include "mlx/version.h"
++#ifdef _WIN32
++#include "mlx/windows_utils.h"
++#endif
+ 
+ #include "cuda_jit_sources.h"
+ 
+@@ -10,6 +13,12 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <shared_mutex>
++#ifdef _WIN32
++#include <algorithm>
++#include <iterator>
++#include <regex>
++#include <unordered_set>
++#endif
+ 
+ #include <fmt/format.h>
+ #include <nvrtc.h>
+@@ -63,6 +72,80 @@ inline const char* cudart_dirname() {
+ #endif
+ }
+ 
++#ifdef _WIN32
++struct VirtualHeaders {
++  std::vector<std::string> names;
++  std::vector<std::string> contents;
++  std::unordered_set<std::string> seen;
++};
++
++VirtualHeaders& virtual_headers() {
++  static VirtualHeaders headers;
++  return headers;
++}
++
++std::string virtual_header_contents(
++    const std::filesystem::path& file,
++    const std::filesystem::path& root,
++    const std::string& contents) {
++  // NVRTC virtual headers do not retain filesystem-relative quoted includes.
++  // Qualify only existing sibling headers inside this same include root.
++  static const std::regex include_pattern(
++      R"pattern((^|\n)[ \t]*#[ \t]*include[ \t]*"([^"]+)")pattern",
++      std::regex_constants::ECMAScript);
++  std::string rewritten;
++  size_t copied = 0;
++  for (std::sregex_iterator it(contents.begin(), contents.end(), include_pattern), end;
++       it != end; ++it) {
++    const auto& match = *it;
++    auto sibling = (file.parent_path() / windows::utf8_path(match[2].str())).lexically_normal();
++    auto relative = sibling.lexically_relative(root);
++    if (relative.empty() || *relative.begin() == ".." ||
++        !std::filesystem::is_regular_file(sibling)) {
++      continue;
++    }
++    auto name = windows::path_utf8(relative);
++    std::replace(name.begin(), name.end(), '\\', '/');
++    const auto offset = static_cast<size_t>(match.position(2));
++    rewritten.append(contents, copied, offset - copied);
++    rewritten += name;
++    copied = offset + static_cast<size_t>(match.length(2));
++  }
++  rewritten.append(contents, copied, contents.size() - copied);
++  return rewritten;
++}
++
++void append_include_path_arg(
++    std::vector<std::string>& args, const std::filesystem::path& path) {
++  // NVRTC on Windows uses the process ANSI codepage for filesystem includes.
++  // Supply unrepresentable paths as virtual headers through its public API.
++  if (auto ansi = windows::path_ansi(path); ansi) {
++    args.push_back(fmt::format("--include-path={}", *ansi));
++    return;
++  }
++  auto& headers = virtual_headers();
++  for (const auto& entry : std::filesystem::recursive_directory_iterator(path)) {
++    if (!entry.is_regular_file()) {
++      continue;
++    }
++    auto relative = entry.path().lexically_relative(path);
++    auto name = windows::path_utf8(relative);
++    std::replace(name.begin(), name.end(), '\\', '/');
++    if (!headers.seen.insert(name).second) {
++      continue;
++    }
++    std::ifstream input(entry.path(), std::ios::binary);
++    if (!input) {
++      throw std::runtime_error("Unable to read bundled CUDA header: " + name);
++    }
++    headers.names.push_back(std::move(name));
++    std::string contents(
++        std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>{});
++    headers.contents.push_back(virtual_header_contents(entry.path(), path, contents));
++  }
++}
++#endif
++
+ // Return the --include-path args used for invoking NVRTC.
+ const std::vector<std::string>& include_path_args() {
+   static std::vector<std::string> cached_args = []() {
+@@ -74,7 +157,11 @@ const std::vector<std::string>& include_path_args() {
+ #endif
+     auto path = root_dir / "include";
+     if (std::filesystem::exists(path)) {
++#ifdef _WIN32
++      append_include_path_arg(args, path);
++#else
+       args.push_back(fmt::format("--include-path={}", path.string()));
++#endif
+     }
+     // Add path to CCCL headers.
+     path = path / "cccl";
+@@ -82,17 +169,29 @@ const std::vector<std::string>& include_path_args() {
+       path = cccl_dir();
+     }
+     if (std::filesystem::exists(path)) {
++#ifdef _WIN32
++      append_include_path_arg(args, path);
++#else
+       args.push_back(fmt::format("--include-path={}", path.string()));
++#endif
+     }
+     // Add path to CUDA runtime headers, try local-installed python package
+     // first and then system-installed headers.
+     path = root_dir.parent_path() / "nvidia" / cudart_dirname() / "include";
+     if (!std::filesystem::exists(path)) {
++#ifdef _WIN32
++      auto home = windows::getenv_utf8(L"CUDA_HOME");
++      if (!home) {
++        home = windows::getenv_utf8(L"CUDA_PATH");
++      }
++      path = home ? windows::utf8_path(*home) : default_cuda_toolkit_path();
++#else
+       const char* home = std::getenv("CUDA_HOME");
+       if (!home) {
+         home = std::getenv("CUDA_PATH");
+       }
+       path = home ? std::filesystem::path(home) : default_cuda_toolkit_path();
++#endif
+       if (!path.empty()) {
+         path = path / "include";
+       }
+@@ -102,7 +201,11 @@ const std::vector<std::string>& include_path_args() {
+             "variable CUDA_HOME or CUDA_PATH.");
+       }
+     }
++#ifdef _WIN32
++    append_include_path_arg(args, path);
++#else
+     args.push_back(fmt::format("--include-path={}", path.string()));
++#endif
+     return args;
+   }();
+   return cached_args;
+@@ -112,8 +215,13 @@ const std::vector<std::string>& include_path_args() {
+ const std::filesystem::path& ptx_cache_dir() {
+   static std::filesystem::path cache = []() -> std::filesystem::path {
+     std::filesystem::path cache;
++#ifdef _WIN32
++    if (auto c = windows::getenv_utf8(L"MLX_PTX_CACHE_DIR"); c) {
++      cache = windows::utf8_path(*c);
++#else
+     if (auto c = std::getenv("MLX_PTX_CACHE_DIR"); c) {
+       cache = c;
++#endif
+     } else {
+       cache =
+           std::filesystem::temp_directory_path() / "mlx" / version() / "ptx";
+@@ -311,6 +419,26 @@ void compile(
+     std::vector<std::pair<std::string, std::string>>& ptx_kernels) {
+   // Create the program
+   nvrtcProgram prog;
++#ifdef _WIN32
++  // Build the include list first: it initializes virtual headers once under
++  // the static include-path initializer's thread-safety guarantee.
++  const auto& includes = include_path_args();
++  const auto& virtuals = virtual_headers();
++  std::vector<const char*> header_names(std::begin(g_include_names), std::end(g_include_names));
++  std::vector<const char*> header_contents(std::begin(g_headers), std::end(g_headers));
++  std::unordered_set<std::string> header_seen(
++      std::begin(g_include_names), std::end(g_include_names));
++  for (size_t index = 0; index < virtuals.names.size(); ++index) {
++    if (!header_seen.insert(virtuals.names[index]).second) {
++      continue;
++    }
++    header_names.push_back(virtuals.names[index].c_str());
++    header_contents.push_back(virtuals.contents[index].c_str());
++  }
++  CHECK_NVRTC_ERROR(nvrtcCreateProgram(
++      &prog, source.c_str(), (module_name + ".cu").c_str(),
++      int(header_contents.size()), header_contents.data(), header_names.data()));
++#else
+   CHECK_NVRTC_ERROR(nvrtcCreateProgram(
+       &prog,
+       source.c_str(),
+@@ -318,6 +446,7 @@ void compile(
+       std::size(g_headers),
+       g_headers,
+       g_include_names));
++#endif
+   std::unique_ptr<nvrtcProgram, void (*)(nvrtcProgram*)> prog_freer(
+       &prog,
+       [](nvrtcProgram* p) { CHECK_NVRTC_ERROR(nvrtcDestroyProgram(p)); });
+@@ -340,7 +469,11 @@ void compile(
+       device.compute_capability_minor(),
+       arch_tag);
+   args.push_back(compute.c_str());
++#ifdef _WIN32
++  for (const auto& include : includes) {
++#else
+   for (const auto& include : include_path_args()) {
++#endif
+     args.push_back(include.c_str());
+   }
+ 
 diff --git a/mlx/backend/cuda/wddm.cpp b/mlx/backend/cuda/wddm.cpp
 index 71027f77c426dfac6b62732b25fefa398970eadd..eb5c6c068b1149581826721c83ec036aabc46188 100644
 --- a/mlx/backend/cuda/wddm.cpp
@@ -168,6 +587,25 @@ index 71027f77c426dfac6b62732b25fefa398970eadd..eb5c6c068b1149581826721c83ec036a
  }
  
  } // namespace mlx::core::cu
+diff --git a/mlx/compile.cpp b/mlx/compile.cpp
+index 3cab4c05d744f3426c863d4124edc94298a5507e..a2ba2e01418e00c7bad4037a33a790d09d3cd26c 100644
+--- a/mlx/compile.cpp
++++ b/mlx/compile.cpp
+@@ -831,6 +831,14 @@ void compile_fuse(
+       continue;
+     }
+ 
++#ifdef _WIN32
++    // CPU fusion requires MSVC at runtime. Keep CPU primitives unfused.
++    if (arr.has_primitive() && arr.primitive().stream().device == Device::cpu) {
++      new_tape.push_back(arr);
++      continue;
++    }
++#endif
++
+     // Two pass recursion:
+     // First pass:
+     //  - Collect all the primitives which we can fuse with
 diff --git a/mlx/distributed/CMakeLists.txt b/mlx/distributed/CMakeLists.txt
 index 807fd0fbdb791211d6517ded4f57857c2841eb92..7e783f7b95ede989106001e45e4fc86f35427fab 100644
 --- a/mlx/distributed/CMakeLists.txt
@@ -196,7 +634,7 @@ index 346f7cdb7e6bcf9671a4717be5efe24ae53647b6..e94ca11426776981dc29ec98d8da1620
  else()
    target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/no_ring.cpp)
 diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
-index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a35cb85ebe 100644
+index 9a81010e34370ebc5c342fe808c5d9ad20d32401..f8685ffd5c20d4ec9dabfb262fae613fe1ce7eb4 100644
 --- a/mlx/distributed/ring/ring.cpp
 +++ b/mlx/distributed/ring/ring.cpp
 @@ -1,9 +1,11 @@
@@ -211,7 +649,29 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
  
  #include <algorithm>
  #include <chrono>
-@@ -43,6 +45,7 @@ constexpr const char* RING_TAG = "[ring]";
+@@ -16,6 +18,11 @@
+ #include <thread>
+ #include <unordered_map>
+ 
++#ifdef _WIN32
++#include <atomic>
++#include <cstdlib>
++#endif
++
+ #include <json.hpp>
+ 
+ #include "mlx/backend/cpu/encoder.h"
+@@ -25,6 +32,9 @@
+ #include "mlx/distributed/utils.h"
+ #include "mlx/dtype_utils.h"
+ #include "mlx/threadpool.h"
++#ifdef _WIN32
++#include "mlx/windows_utils.h"
++#endif
+ 
+ #ifndef SOL_TCP
+ #define SOL_TCP IPPROTO_TCP
+@@ -43,6 +53,7 @@ constexpr const char* RING_TAG = "[ring]";
  constexpr const size_t MAX_IO_BYTES = 1024 * 1024 * 1024;
  
  using GroupImpl = mlx::core::distributed::detail::GroupImpl;
@@ -219,16 +679,21 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
  using json = nlohmann::json;
  using namespace std::chrono_literals;
  
-@@ -74,17 +77,15 @@ decltype(T() * U()) ceildiv(T a, U b) {
+@@ -74,17 +85,20 @@ decltype(T() * U()) ceildiv(T a, U b) {
  
  class SocketThread {
   public:
 -  SocketThread(int fd) : fd_(fd), stop_(false) {
 +  SocketThread(socket_t fd) : fd_(fd), stop_(false) {
++#ifdef _WIN32
++    detail::set_socket_nonblocking(fd, true);
++    worker_ = std::thread(&SocketThread::worker, this);
++#else
      worker_ = std::thread(&SocketThread::worker, this);
 -    int flags = fcntl(fd, F_GETFL, 0);
 -    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 +    detail::set_socket_nonblocking(fd, true);
++#endif
    }
    ~SocketThread() {
      stop_ = true;
@@ -240,7 +705,43 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
    }
  
    template <typename T>
-@@ -179,8 +180,8 @@ class SocketThread {
+@@ -118,6 +132,12 @@ class SocketThread {
+ 
+     {
+       std::unique_lock lock(queue_mutex_);
++#ifdef _WIN32
++      if (failure_) {
++        send_completed_promise.set_exception(failure_);
++        return send_completed_future;
++      }
++#endif
+       sends_.emplace_back(SocketTask(
+           const_cast<char*>(buffer), size, std::move(send_completed_promise)));
+     }
+@@ -135,6 +155,12 @@ class SocketThread {
+ 
+     {
+       std::unique_lock lock(queue_mutex_);
++#ifdef _WIN32
++      if (failure_) {
++        recv_completed_promise.set_exception(failure_);
++        return recv_completed_future;
++      }
++#endif
+       recvs_.emplace_back(
+           SocketTask(buffer, size, std::move(recv_completed_promise)));
+     }
+@@ -147,6 +173,9 @@ class SocketThread {
+   }
+ 
+   void worker() {
++#ifdef _WIN32
++    worker_windows();
++#else
+     int error_count = 0;
+     bool delete_recv = false;
+     bool delete_send = false;
+@@ -179,8 +208,8 @@ class SocketThread {
  
        if (!recvs_.empty()) {
          auto& task = recvs_.front();
@@ -251,7 +752,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
          if (r > 0) {
            task.buffer = static_cast<char*>(task.buffer) + r;
            task.size -= r;
-@@ -189,16 +190,17 @@ class SocketThread {
+@@ -189,16 +218,17 @@ class SocketThread {
          } else if (r == 0) {
            error_count++;
            log_info(true, "Socket", fd_, "was closed by the peer");
@@ -273,7 +774,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
          if (r > 0) {
            task.buffer = static_cast<char*>(task.buffer) + r;
            task.size -= r;
-@@ -207,9 +209,10 @@ class SocketThread {
+@@ -207,9 +237,10 @@ class SocketThread {
          } else if (r == 0) {
            error_count++;
            log_info(true, "Sending to socket", fd_, "made no progress");
@@ -286,16 +787,135 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
          }
        }
  
-@@ -231,7 +234,7 @@ class SocketThread {
+@@ -229,10 +260,126 @@ class SocketThread {
+         return;
+       }
      }
++#endif
++  }
++
++#ifdef _WIN32
++  void worker_windows() {
++    // Socket readiness waits avoid burning a CPU core while the other rank is
++    // computing. A bounded stalled transfer is necessary for runner cancellation.
++    // This changes local scheduling only; the ring's byte protocol is unchanged.
++    int timeout_seconds = 120;
++    if (const char* value = std::getenv("MLX_RING_IO_TIMEOUT_SECONDS")) {
++      char* end = nullptr;
++      long parsed = std::strtol(value, &end, 10);
++      if (end != value && *end == '\0' && parsed > 0 && parsed <= 86400) {
++        timeout_seconds = static_cast<int>(parsed);
++      }
++    }
++    auto last_progress = std::chrono::steady_clock::now();
++    auto fail_pending = [&](const char* message) {
++      auto error = std::make_exception_ptr(std::runtime_error(message));
++      failure_ = error;
++      for (auto& task : recvs_) {
++        task.promise.set_exception(error);
++      }
++      for (auto& task : sends_) {
++        task.promise.set_exception(error);
++      }
++      recvs_.clear();
++      sends_.clear();
++    };
++    while (true) {
++      bool reading = false;
++      bool writing = false;
++      bool progress = false;
++      {
++        std::unique_lock lock(queue_mutex_);
++        if (!have_tasks() && !stop_) {
++          condition_.wait(lock, [this] { return stop_ || have_tasks(); });
++          last_progress = std::chrono::steady_clock::now();
++        }
++        if (stop_) {
++          fail_pending("[ring] socket worker stopped");
++          return;
++        }
++        if (!recvs_.empty()) {
++          auto& task = recvs_.front();
++          auto count = detail::socket_recv(
++              fd_, task.buffer, std::min(task.size, MAX_IO_BYTES));
++          if (count > 0) {
++            task.buffer = static_cast<char*>(task.buffer) + count;
++            task.size -= count;
++            progress = true;
++            if (task.size == 0) {
++              task.promise.set_value();
++              recvs_.pop_front();
++            }
++          } else if (count == 0 ||
++                     !detail::socket_would_block(detail::last_socket_error())) {
++            fail_pending("[ring] connection to a peer was lost");
++            return;
++          }
++        }
++        if (!sends_.empty()) {
++          auto& task = sends_.front();
++          auto count = detail::socket_send(
++              fd_, task.buffer, std::min(task.size, MAX_IO_BYTES));
++          if (count > 0) {
++            task.buffer = static_cast<char*>(task.buffer) + count;
++            task.size -= count;
++            progress = true;
++            if (task.size == 0) {
++              task.promise.set_value();
++              sends_.pop_front();
++            }
++          } else if (count == 0 ||
++                     !detail::socket_would_block(detail::last_socket_error())) {
++            fail_pending("[ring] connection to a peer was lost");
++            return;
++          }
++        }
++        if (progress) {
++          last_progress = std::chrono::steady_clock::now();
++        } else if (std::chrono::steady_clock::now() - last_progress >=
++                   std::chrono::seconds(timeout_seconds)) {
++          fail_pending("[ring] socket transfer timed out");
++          return;
++        }
++        reading = !recvs_.empty();
++        writing = !sends_.empty();
++      }
++      if (!progress && (reading || writing)) {
++        fd_set read_set;
++        fd_set write_set;
++        FD_ZERO(&read_set);
++        FD_ZERO(&write_set);
++        if (reading) {
++          FD_SET(fd_, &read_set);
++        }
++        if (writing) {
++          FD_SET(fd_, &write_set);
++        }
++        timeval timeout{0, 50000};
++        if (::select(0, reading ? &read_set : nullptr,
++                     writing ? &write_set : nullptr, nullptr, &timeout) ==
++            SOCKET_ERROR) {
++          std::unique_lock lock(queue_mutex_);
++          fail_pending("[ring] socket readiness wait failed");
++          return;
++        }
++      }
++    }
    }
++#endif
  
 -  int fd_;
 +  socket_t fd_;
++#ifdef _WIN32
++  std::atomic<bool> stop_;
++  std::exception_ptr failure_;
++#else
    bool stop_;
++#endif
    std::thread worker_;
    std::mutex queue_mutex_;
-@@ -242,24 +245,24 @@ class SocketThread {
+   std::condition_variable condition_;
+@@ -242,24 +389,24 @@ class SocketThread {
  
  class CommunicationThreads {
   public:
@@ -325,7 +945,19 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
  };
  
  /**
-@@ -294,9 +297,9 @@ std::vector<std::vector<detail::address_t>> load_nodes(const char* hostfile) {
+@@ -276,7 +423,11 @@ class CommunicationThreads {
+  */
+ std::vector<std::vector<detail::address_t>> load_nodes(const char* hostfile) {
+   std::vector<std::vector<detail::address_t>> nodes;
++#ifdef _WIN32
++  std::ifstream f(windows::utf8_path(hostfile));
++#else
+   std::ifstream f(hostfile);
++#endif
+ 
+   json hosts = json::parse(f);
+   for (auto& h : hosts) {
+@@ -294,9 +445,9 @@ std::vector<std::vector<detail::address_t>> load_nodes(const char* hostfile) {
   * Create a socket and accept one connection for each of the provided
   * addresses.
   */
@@ -337,7 +969,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
    int success;
  
    for (auto& address : addresses) {
-@@ -312,10 +315,10 @@ std::vector<int> accept_connections(
+@@ -312,10 +463,10 @@ std::vector<int> accept_connections(
   * The counterpoint of `accept_connections`. Basically connect to each of the
   * provided addresses.
   */
@@ -350,7 +982,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
    int success;
  
    for (auto& address : addresses) {
-@@ -333,7 +336,7 @@ std::vector<int> make_connections(
+@@ -333,7 +484,7 @@ std::vector<int> make_connections(
                    "waiting",
                    wait,
                    "ms (error:",
@@ -359,7 +991,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
                    ")");
              })
              .detach());
-@@ -398,9 +401,10 @@ class RingGroup : public GroupImpl {
+@@ -398,9 +549,10 @@ class RingGroup : public GroupImpl {
  
      // Configure all sockets to use TCP no delay.
      int one = 1;
@@ -372,7 +1004,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
      }
  
      // Start the all reduce threads. One all reduce per direction per ring.
-@@ -420,11 +424,11 @@ class RingGroup : public GroupImpl {
+@@ -420,11 +572,11 @@ class RingGroup : public GroupImpl {
    ~RingGroup() {
      for (auto s : sockets_right_) {
        shutdown(s, 2);
@@ -386,7 +1018,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
      }
    }
  
-@@ -632,13 +636,13 @@ class RingGroup : public GroupImpl {
+@@ -632,13 +784,13 @@ class RingGroup : public GroupImpl {
        T* buffer,
        T* data,
        size_t data_size,
@@ -404,7 +1036,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
  
      // We split the data into `size_` segments of size `segment_size` and each
      // of these in smaller segments of ALL_SUM_SIZE which we 'll call packets.
-@@ -735,12 +739,12 @@ class RingGroup : public GroupImpl {
+@@ -735,12 +887,12 @@ class RingGroup : public GroupImpl {
        char* output,
        size_t input_size,
        size_t data_size,
@@ -421,7 +1053,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
  
      // Initial segments
      int send_segment = rank_;
-@@ -766,8 +770,10 @@ class RingGroup : public GroupImpl {
+@@ -766,8 +918,10 @@ class RingGroup : public GroupImpl {
      }
    }
  
@@ -434,7 +1066,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
      size_t segment_size =
          std::max(size_t(1024), ceildiv(data_size, sockets.size()));
      std::vector<std::future<void>> sends;
-@@ -785,7 +791,8 @@ class RingGroup : public GroupImpl {
+@@ -785,7 +939,8 @@ class RingGroup : public GroupImpl {
      }
    }
  
@@ -444,7 +1076,7 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
      size_t segment_size =
          std::max(size_t(1024), ceildiv(data_size, sockets.size()));
      std::vector<std::future<void>> recvs;
-@@ -811,8 +818,8 @@ class RingGroup : public GroupImpl {
+@@ -811,8 +966,8 @@ class RingGroup : public GroupImpl {
    ThreadPool pool_;
    CommunicationThreads comm_;
  
@@ -455,16 +1087,30 @@ index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a3
  
    std::vector<char> buffers_;
  };
+@@ -822,7 +977,12 @@ bool is_available() {
+ }
+ 
+ std::shared_ptr<GroupImpl> init(bool strict /* = false */) {
++#ifdef _WIN32
++  auto hostfile_value = windows::getenv_utf8(L"MLX_HOSTFILE");
++  const char* hostfile = hostfile_value ? hostfile_value->c_str() : nullptr;
++#else
+   const char* hostfile = std::getenv("MLX_HOSTFILE");
++#endif
+   const char* rank_str = std::getenv("MLX_RANK");
+   const char* ring_verbose = std::getenv("MLX_RING_VERBOSE");
+ 
 diff --git a/mlx/distributed/utils.cpp b/mlx/distributed/utils.cpp
-index 11f8df85c4ae29fafd90a7e95fb23dc3c5712001..97c8ad7701adbe9ddded5f4e654a1c8b2c85df7a 100644
+index 11f8df85c4ae29fafd90a7e95fb23dc3c5712001..0ffb435f14d5c27e279bfc8553ef432c02e79154 100644
 --- a/mlx/distributed/utils.cpp
 +++ b/mlx/distributed/utils.cpp
-@@ -1,7 +1,14 @@
+@@ -1,7 +1,15 @@
  // Copyright © 2025 Apple Inc.
  
 +#ifdef _WIN32
 +#include <algorithm>
 +#include <climits>
++#include <cstdlib>
 +#else
 +#include <fcntl.h>
  #include <netdb.h>
@@ -474,7 +1120,7 @@ index 11f8df85c4ae29fafd90a7e95fb23dc3c5712001..97c8ad7701adbe9ddded5f4e654a1c8b
  #include <cstring>
  #include <sstream>
  #include <thread>
-@@ -12,18 +19,105 @@ namespace mlx::core::distributed::detail {
+@@ -12,18 +20,105 @@ namespace mlx::core::distributed::detail {
  
  namespace {
  
@@ -581,7 +1227,7 @@ index 11f8df85c4ae29fafd90a7e95fb23dc3c5712001..97c8ad7701adbe9ddded5f4e654a1c8b
    struct addrinfo hints, *res;
    std::memset(&hints, 0, sizeof(hints));
    hints.ai_family = AF_UNSPEC;
-@@ -61,37 +155,39 @@ address_t parse_address(const std::string& ip_port) {
+@@ -61,37 +156,39 @@ address_t parse_address(const std::string& ip_port) {
  }
  
  TCPSocket::TCPSocket(const char* tag) {
@@ -630,7 +1276,7 @@ index 11f8df85c4ae29fafd90a7e95fb23dc3c5712001..97c8ad7701adbe9ddded5f4e654a1c8b
    return s;
  }
  
-@@ -101,14 +197,19 @@ void TCPSocket::listen(const char* tag, const address_t& addr) {
+@@ -101,14 +198,19 @@ void TCPSocket::listen(const char* tag, const address_t& addr) {
    // Make sure we can launch immediately after shutdown by setting the
    // reuseaddr option so that we don't get address already in use errors
    int enable = 1;
@@ -652,18 +1298,41 @@ index 11f8df85c4ae29fafd90a7e95fb23dc3c5712001..97c8ad7701adbe9ddded5f4e654a1c8b
  
    // Bind the socket to the address and port
    success = bind(sock_, addr.get(), addr.len);
-@@ -124,8 +225,8 @@ void TCPSocket::listen(const char* tag, const address_t& addr) {
+@@ -124,8 +226,31 @@ void TCPSocket::listen(const char* tag, const address_t& addr) {
  }
  
  TCPSocket TCPSocket::accept(const char* tag) {
 -  int peer = ::accept(sock_, nullptr, nullptr);
 -  if (peer < 0) {
++#ifdef _WIN32
++  int timeout_seconds = 120;
++  if (const char* value = std::getenv("MLX_RING_IO_TIMEOUT_SECONDS")) {
++    char* end = nullptr;
++    long parsed = std::strtol(value, &end, 10);
++    if (end != value && *end == '\0' && parsed > 0 && parsed <= 86400) {
++      timeout_seconds = static_cast<int>(parsed);
++    }
++  }
++  fd_set read_set;
++  FD_ZERO(&read_set);
++  FD_SET(sock_, &read_set);
++  timeval timeout{timeout_seconds, 0};
++  int ready = ::select(0, &read_set, nullptr, nullptr, &timeout);
++  if (ready == 0) {
++    std::ostringstream message;
++    message << tag << " Accept timed out waiting for a peer";
++    throw std::runtime_error(message.str());
++  }
++  if (ready == SOCKET_ERROR) {
++    throw_socket_error(tag, "Accept readiness wait failed");
++  }
++#endif
 +  socket_t peer = ::accept(sock_, nullptr, nullptr);
 +  if (!socket_is_valid(peer)) {
      throw_socket_error(tag, "Accept failed");
    }
  
-@@ -134,10 +235,10 @@ TCPSocket TCPSocket::accept(const char* tag) {
+@@ -134,10 +259,10 @@ TCPSocket TCPSocket::accept(const char* tag) {
  
  void TCPSocket::send(const char* tag, const void* data, size_t len) {
    while (len > 0) {
@@ -676,7 +1345,7 @@ index 11f8df85c4ae29fafd90a7e95fb23dc3c5712001..97c8ad7701adbe9ddded5f4e654a1c8b
        throw std::runtime_error(msg.str());
      }
      len -= n;
-@@ -147,10 +248,10 @@ void TCPSocket::send(const char* tag, const void* data, size_t len) {
+@@ -147,10 +272,10 @@ void TCPSocket::send(const char* tag, const void* data, size_t len) {
  
  void TCPSocket::recv(const char* tag, void* data, size_t len) {
    while (len > 0) {
@@ -689,7 +1358,7 @@ index 11f8df85c4ae29fafd90a7e95fb23dc3c5712001..97c8ad7701adbe9ddded5f4e654a1c8b
        throw std::runtime_error(msg.str());
      }
      len -= n;
-@@ -164,13 +265,16 @@ TCPSocket TCPSocket::connect(
+@@ -164,13 +289,16 @@ TCPSocket TCPSocket::connect(
      int num_retries,
      int wait,
      std::function<void(int, int)> cb) {
@@ -770,3 +1439,201 @@ index 213dd59a21a90b70d1542e82a594b76caf870de6..4ac29dd5080f13e88d585ce0ade2e0c3
  };
  
  } // namespace mlx::core::distributed::detail
+diff --git a/mlx/io/load.h b/mlx/io/load.h
+index 6b9c9f477b8912ce79afb809866cfddbe242b89d..8f805ea49af8048f7edf833ac69736fedde9c876 100644
+--- a/mlx/io/load.h
++++ b/mlx/io/load.h
+@@ -10,6 +10,7 @@
+ #include <fcntl.h>
+ #ifdef _WIN32
+ #include <io.h>
++#include "mlx/windows_utils.h"
+ #else
+ #include <sys/stat.h>
+ #include <unistd.h>
+@@ -63,15 +64,29 @@ class Writer {
+ class ParallelFileReader : public Reader {
+  public:
+   explicit ParallelFileReader(std::string file_path)
++#ifdef _WIN32
++      : fd_(windows::open_utf8(file_path, O_RDONLY | O_BINARY)),
++#else
+       : fd_(open(file_path.c_str(), O_RDONLY | O_BINARY)),
++#endif
+         label_(std::move(file_path)) {}
+ 
+   ~ParallelFileReader() override {
++#ifdef _WIN32
++    if (fd_ >= 0) {
++      close(fd_);
++    }
++#else
+     close(fd_);
++#endif
+   }
+ 
+   bool is_open() const override {
++#ifdef _WIN32
++    return fd_ >= 0;
++#else
+     return fd_ > 0;
++#endif
+   }
+ 
+   bool good() const override {
+@@ -154,8 +169,13 @@ class FileWriter : public Writer {
+   // they may still read from the file.
+   void open() override {
+     if (fd_ < 0 && !file_path_.empty()) {
++#ifdef _WIN32
++      fd_ = windows::open_utf8(
++          file_path_, O_CREAT | O_WRONLY | O_TRUNC | O_BINARY);
++#else
+       fd_ = ::open(
+           file_path_.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_BINARY, 0644);
++#endif
+     }
+   }
+ 
+diff --git a/mlx/windows_utils.h b/mlx/windows_utils.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5dbd3020e5ebf2b9523b821dbc9c6b1e3949885f
+--- /dev/null
++++ b/mlx/windows_utils.h
+@@ -0,0 +1,123 @@
++// Windows paths exposed by Python are UTF-8; use the wide Win32/CRT APIs.
++#pragma once
++
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <io.h>
++#include <sys/stat.h>
++
++#include <climits>
++#include <filesystem>
++#include <optional>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++
++namespace mlx::core::windows {
++
++inline std::wstring utf8_to_wide(std::string_view text) {
++  if (text.empty()) {
++    return {};
++  }
++  if (text.size() > INT_MAX) {
++    throw std::invalid_argument("Windows UTF-8 path is too long.");
++  }
++  int size = ::MultiByteToWideChar(
++      CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), int(text.size()), nullptr, 0);
++  if (size == 0) {
++    throw std::invalid_argument("Invalid UTF-8 Windows path.");
++  }
++  std::wstring result(size, L'\0');
++  if (::MultiByteToWideChar(
++          CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), int(text.size()),
++          result.data(), size) != size) {
++    throw std::invalid_argument("Invalid UTF-8 Windows path.");
++  }
++  return result;
++}
++
++inline std::string wide_to_utf8(std::wstring_view text) {
++  if (text.empty()) {
++    return {};
++  }
++  if (text.size() > INT_MAX) {
++    throw std::invalid_argument("Windows wide path is too long.");
++  }
++  int size = ::WideCharToMultiByte(
++      CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), int(text.size()), nullptr, 0,
++      nullptr, nullptr);
++  if (size == 0) {
++    throw std::invalid_argument("Invalid Windows wide path.");
++  }
++  std::string result(size, '\0');
++  if (::WideCharToMultiByte(
++          CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), int(text.size()),
++          result.data(), size, nullptr, nullptr) != size) {
++    throw std::invalid_argument("Invalid Windows wide path.");
++  }
++  return result;
++}
++
++inline std::filesystem::path utf8_path(std::string_view path) {
++  return std::filesystem::path(utf8_to_wide(path));
++}
++
++inline std::string path_utf8(const std::filesystem::path& path) {
++  return wide_to_utf8(path.native());
++}
++
++inline std::optional<std::string> path_ansi(const std::filesystem::path& path) {
++  const auto& text = path.native();
++  if (text.empty()) {
++    return std::string();
++  }
++  if (text.size() > INT_MAX) {
++    throw std::invalid_argument("Windows include path is too long.");
++  }
++  UINT codepage = ::GetACP();
++  BOOL substituted = FALSE;
++  BOOL* used_default = codepage == CP_UTF8 ? nullptr : &substituted;
++  DWORD flags = codepage == CP_UTF8 ? 0 : WC_NO_BEST_FIT_CHARS;
++  int size = ::WideCharToMultiByte(
++      codepage, flags, text.data(), int(text.size()), nullptr, 0, nullptr,
++      used_default);
++  if (size == 0 || substituted) {
++    return std::nullopt;
++  }
++  std::string result(size, '\0');
++  if (::WideCharToMultiByte(
++          codepage, flags, text.data(), int(text.size()), result.data(), size,
++          nullptr, used_default) != size || substituted) {
++    return std::nullopt;
++  }
++  return result;
++}
++
++inline std::optional<std::string> getenv_utf8(const wchar_t* name) {
++  DWORD size = ::GetEnvironmentVariableW(name, nullptr, 0);
++  if (size == 0) {
++    return std::nullopt;
++  }
++  std::wstring value(size, L'\0');
++  DWORD length = ::GetEnvironmentVariableW(name, value.data(), size);
++  if (length == 0 || length >= size) {
++    return std::nullopt;
++  }
++  value.resize(length);
++  return wide_to_utf8(value);
++}
++
++inline int open_utf8(std::string_view path, int flags) {
++  auto wide_path = utf8_to_wide(path);
++  // POSIX 0644 has invalid group/other bits for the Microsoft CRT pmode.
++  return ::_wopen(wide_path.c_str(), flags, _S_IREAD | _S_IWRITE);
++}
++
++} // namespace mlx::core::windows
++#endif
+diff --git a/setup.py b/setup.py
+index ad258d8af57625c1164d714d481d7bdeaeef5997..633132585d53ff5619d47696d5bdd8f581a3a4ee 100644
+--- a/setup.py
++++ b/setup.py
+@@ -24,6 +24,8 @@ def cuda_toolkit_major_version():
+ 
+ 
+ def get_version():
++    if platform.system() == "Windows" and os.environ.get("MLX_WINDOWS_BUILD_VERSION"):
++        return os.environ["MLX_WINDOWS_BUILD_VERSION"]
+     with open("mlx/version.h", "r") as fid:
+         for l in fid:
+             if "#define MLX_VERSION_MAJOR" in l:

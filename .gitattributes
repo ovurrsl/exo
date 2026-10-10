@@ -2,3 +2,4 @@
 # turn it into CRLF, and git apply and build-mlx-wheel.ps1 need it as committed).
 # Unified diff blank context lines contain a required leading space.
 scripts/windows/mlx/*.patch -text -whitespace
+vendor/windows/*.patch -text -whitespace
