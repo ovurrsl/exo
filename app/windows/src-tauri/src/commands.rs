@@ -178,7 +178,7 @@ fn build_settings_window(app: &AppHandle) -> Result<(), String> {
         WebviewUrl::App("index.html?view=settings".into()),
     )
     .title("EXO Settings")
-    .inner_size(680.0, 630.0)
+    .inner_size(640.0, 560.0)
     .min_inner_size(640.0, 520.0)
     .resizable(true)
     .build()

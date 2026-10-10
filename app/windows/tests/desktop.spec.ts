@@ -103,19 +103,31 @@ test.beforeEach(async ({ page }) => {
     { settings },
   );
 });
-test("About identifies the runtime source and native MLX build", async ({ page }) => {
+test("About identifies the runtime source and native MLX build", async ({
+  page,
+}) => {
   await page.goto("/?view=settings");
   await page.getByRole("button", { name: "About", exact: true }).click();
-  await expect(page.getByText("931e0ff4a4fcdb0a5f04f7a71f3a5e4201867df3", { exact: false })).toBeVisible();
+  await expect(
+    page.getByText("931e0ff4a4fcdb0a5f04f7a71f3a5e4201867df3", {
+      exact: false,
+    }),
+  ).toBeVisible();
   await expect(page.getByText("Working tree changes included.")).toBeVisible();
-  await expect(page.getByText("0.32.3.dev20261009+win.3", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("0.32.3.dev20261009+win.3", { exact: true }),
+  ).toBeVisible();
 });
 
 test("tray shows real cluster data and opens the existing dashboard", async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 360, height: 650 });
+  await page.setViewportSize({ width: 340, height: 650 });
   await page.goto("/");
+  await page.getByRole("button", { name: "Show nodes", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Show instances", exact: true })
+    .click();
   await expect(page.getByText("CUDA PC").last()).toBeVisible();
   await expect(page.getByText("Qwen3")).toBeVisible();
   await page.getByRole("button", { name: "Web Dashboard" }).click();
@@ -133,11 +145,18 @@ test("tray shows real cluster data and opens the existing dashboard", async ({
   await expect(
     page.getByRole("checkbox", { name: "Run EXO" }),
   ).not.toBeChecked();
+  await expect(page.getByRole("button", { name: "Web Dashboard" })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByRole("img", { name: "Cluster network topology" }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Settings…" })).toBeVisible();
 });
 test("five settings tabs persist namespace, secure token input and model directories", async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 680, height: 630 });
+  await page.setViewportSize({ width: 640, height: 560 });
   await page.goto("/?view=settings");
   for (const name of ["General", "Model", "Advanced", "Environment", "About"])
     await expect(page.getByRole("button", { name, exact: true })).toBeVisible();
@@ -172,6 +191,9 @@ test("external processes remain read-only and offline settings disable update co
   );
   await page.goto("/");
   await expect(page.getByRole("checkbox", { name: "Run EXO" })).toBeDisabled();
+  await page
+    .getByRole("button", { name: "Show instances", exact: true })
+    .click();
   await page.getByText("Qwen3").click();
   await expect(
     page.getByRole("button", { name: "Stop instance" }),
@@ -204,7 +226,7 @@ test("protected runtime variables are rejected before credentials or settings ar
 test("local-network setup exposes only a fixed owned-backend action", async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 680, height: 630 });
+  await page.setViewportSize({ width: 640, height: 560 });
   await page.goto("/?view=settings");
   await page.getByRole("button", { name: "Advanced", exact: true }).click();
   await page
@@ -240,26 +262,50 @@ test("local-network setup exposes only a fixed owned-backend action", async ({
   ])
     await expect(page.getByRole("button", { name })).toBeDisabled();
 });
-test("uninstall confirmation contains keyboard focus and Escape returns to its trigger", async ({ page }) => {
+test("uninstall confirmation contains keyboard focus and Escape returns to its trigger", async ({
+  page,
+}) => {
   await page.goto("/?view=settings");
   await page.getByRole("button", { name: "Advanced", exact: true }).click();
   const trigger = page.getByRole("button", { name: "Uninstall EXO…" });
   await trigger.focus();
   await page.keyboard.press("Enter");
-  const dialog = page.getByRole("dialog", { name: "Uninstall EXO", exact: true });
+  const dialog = page.getByRole("dialog", {
+    name: "Uninstall EXO",
+    exact: true,
+  });
   await expect(dialog).toBeVisible();
-  await expect.poll(() => dialog.evaluate(element => element.contains(document.activeElement))).toBe(true);
+  await expect
+    .poll(() =>
+      dialog.evaluate((element) => element.contains(document.activeElement)),
+    )
+    .toBe(true);
   for (let index = 0; index < 16; index++) {
     await page.keyboard.press(index < 8 ? "Tab" : "Shift+Tab");
-    await expect.poll(() => dialog.evaluate(element => element.contains(document.activeElement))).toBe(true);
+    await expect
+      .poll(() =>
+        dialog.evaluate((element) => element.contains(document.activeElement)),
+      )
+      .toBe(true);
   }
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
   await expect(trigger).toBeFocused();
-  expect(await page.evaluate(() => (window as unknown as { __EXO_CALLS__: { command: string }[] }).__EXO_CALLS__.some(call => call.command === "uninstall_app"))).toBe(false);
+  expect(
+    await page.evaluate(() =>
+      (
+        window as unknown as { __EXO_CALLS__: { command: string }[] }
+      ).__EXO_CALLS__.some((call) => call.command === "uninstall_app"),
+    ),
+  ).toBe(false);
 });
-test("task details Escape closes the dialog without hiding the tray", async ({ page }) => {
+test("task details Escape closes the dialog without hiding the tray", async ({
+  page,
+}) => {
   await page.goto("/");
+  await page
+    .getByRole("button", { name: "Show instances", exact: true })
+    .click();
   await page.getByText("Qwen3").click();
   const trigger = page.getByRole("button", { name: /TextGeneration/ });
   await trigger.click();
@@ -268,23 +314,51 @@ test("task details Escape closes the dialog without hiding the tray", async ({ p
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
   await expect(trigger).toBeFocused();
-  expect(await page.evaluate(() => (window as unknown as { __EXO_CALLS__: { command: string }[] }).__EXO_CALLS__.some(call => call.command === "hide_window"))).toBe(false);
+  expect(
+    await page.evaluate(() =>
+      (
+        window as unknown as { __EXO_CALLS__: { command: string }[] }
+      ).__EXO_CALLS__.some((call) => call.command === "hide_window"),
+    ),
+  ).toBe(false);
   await page.keyboard.press("Escape");
-  expect(await page.evaluate(() => (window as unknown as { __EXO_CALLS__: { command: string }[] }).__EXO_CALLS__.some(call => call.command === "hide_window"))).toBe(true);
+  expect(
+    await page.evaluate(() =>
+      (
+        window as unknown as { __EXO_CALLS__: { command: string }[] }
+      ).__EXO_CALLS__.some((call) => call.command === "hide_window"),
+    ),
+  ).toBe(true);
 });
 for (const scale of [1, 1.25, 1.5, 2]) {
   test.describe(`browser pixel density ${scale}`, () => {
     test.use({ deviceScaleFactor: scale });
-    test("settings remain reachable at the minimum logical window size", async ({ page }) => {
+    test("settings remain reachable at the minimum logical window size", async ({
+      page,
+    }) => {
       await page.setViewportSize({ width: 640, height: 520 });
       await page.goto("/?view=settings");
       expect(await page.evaluate(() => window.devicePixelRatio)).toBe(scale);
-      for (const name of ["General", "Model", "Advanced", "Environment", "About"]) {
+      for (const name of [
+        "General",
+        "Model",
+        "Advanced",
+        "Environment",
+        "About",
+      ]) {
         await page.getByRole("button", { name, exact: true }).click();
-        await expect(page.getByRole("button", { name: "Save & Restart" })).toBeVisible();
+        await expect(
+          page.getByRole("button", { name: "Save & Restart" }),
+        ).toBeVisible();
       }
-      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-      await page.screenshot({ path: `test-results/settings-density-${scale}.png` });
+      expect(
+        await page.evaluate(
+          () => document.documentElement.scrollWidth <= window.innerWidth,
+        ),
+      ).toBe(true);
+      await page.screenshot({
+        path: `test-results/settings-density-${scale}.png`,
+      });
     });
   });
 }
@@ -305,8 +379,9 @@ test("captured frozen runtime data renders in the tray with N/A system metrics",
       }),
     { state, nodeId },
   );
-  await page.setViewportSize({ width: 360, height: 650 });
+  await page.setViewportSize({ width: 340, height: 650 });
   await page.goto("/");
+  await page.getByRole("button", { name: "Show nodes", exact: true }).click();
   await expect(page.locator(".node summary").first()).toContainText(
     state.nodeIdentities[nodeId].friendlyName,
   );

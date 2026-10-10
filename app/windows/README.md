@@ -1,5 +1,12 @@
 # EXO Windows desktop
 
+The tray panel follows `app/EXO/EXO/ContentView.swift`: 340 logical pixels,
+compact status and memory summary, device glyphs, collapsed node/instance lists
+and plain menu rows. Settings follow the Mac five-tab layout at 640×560.
+Light/dark semantic colors match the AppKit values sampled on the reference M1;
+Windows supplies its native window chrome and available fonts. The original Mac
+black/yellow app icon is reused. Mac sources are never changed by this build.
+
 Independent Windows-only Tauri 2 / Svelte 5 workspace. The Swift app, Mac
 packaging, and root Cargo workspace are not changed by this app.
 

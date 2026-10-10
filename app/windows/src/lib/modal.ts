@@ -7,9 +7,16 @@ export function modal(dialog: HTMLDialogElement, dismiss: () => void) {
   };
   const keyboard = (event: KeyboardEvent) => {
     if (event.key !== "Tab") return;
-    const controls = Array.from(dialog.querySelectorAll<HTMLElement>(
-      'button, input, textarea, select, a[href], summary, [tabindex]',
-    )).filter(element => element.tabIndex >= 0 && !element.matches(":disabled") && element.getClientRects().length > 0);
+    const controls = Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        "button, input, textarea, select, a[href], summary, [tabindex]",
+      ),
+    ).filter(
+      (element) =>
+        element.tabIndex >= 0 &&
+        !element.matches(":disabled") &&
+        element.getClientRects().length > 0,
+    );
     const first = controls[0];
     const last = controls.at(-1);
     if (!first || !last) {
@@ -31,7 +38,8 @@ export function modal(dialog: HTMLDialogElement, dismiss: () => void) {
       dialog.removeEventListener("cancel", cancel);
       dialog.removeEventListener("keydown", keyboard);
       dialog.close();
-      if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus();
+      if (trigger instanceof HTMLElement && trigger.isConnected)
+        trigger.focus();
     },
   };
 }

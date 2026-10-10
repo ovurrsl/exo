@@ -108,7 +108,7 @@ fn main() {
                                     let work = monitor.work_area();
                                     let scale = monitor.scale_factor();
                                     let width =
-                                        ((360.0 * scale) as i32).min(work.size.width as i32);
+                                        ((340.0 * scale) as i32).min(work.size.width as i32);
                                     let height =
                                         ((650.0 * scale) as i32).min(work.size.height as i32);
                                     let (x, y) = popover_position(
