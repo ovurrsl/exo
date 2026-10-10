@@ -44,6 +44,10 @@ class _InnerModel(Protocol):
     embed_tokens: nn.Module
     norm: nn.Module
 
+    def __call__(
+        self, inputs: mx.array, cache: KVCacheType | None = None
+    ) -> mx.array: ...
+
 
 class _QwenModel(_ParameterModule, Protocol):
     model: _InnerModel
@@ -58,6 +62,37 @@ class _Quantization(Protocol):
     mode: str
     bits: int
     group_size: int
+
+
+class _EmbeddingProjection(Protocol):
+    def as_linear(self, hidden: mx.array) -> mx.array: ...
+
+
+def _cpu_output_projection(
+    hidden: mx.array, projection: nn.Module, *, tied: bool
+) -> mx.array:
+    if isinstance(projection, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+        quantization = cast(_Quantization, cast(object, projection))
+        parameters = cast(dict[str, mx.array], projection.parameters())
+        biases = parameters.get("biases")
+        # Windows' scalar CPU QMM accumulates in its input dtype. A BF16
+        # reduction over Qwen3-32B's 5120 features changes the token ranking.
+        # Promote this operation while retaining canonical packed/BF16 weights.
+        logits = mx.quantized_matmul(
+            hidden.astype(mx.float32),
+            parameters["weight"],
+            scales=parameters["scales"].astype(mx.float32),
+            biases=biases.astype(mx.float32) if biases is not None else None,
+            transpose=True,
+            group_size=quantization.group_size,
+            bits=quantization.bits,
+            mode=quantization.mode,
+        )
+        bias = parameters.get("bias")
+        return logits + bias.astype(mx.float32) if bias is not None else logits
+    if tied:
+        return cast(_EmbeddingProjection, cast(object, projection)).as_linear(hidden)
+    return cast(Callable[[mx.array], mx.array], projection)(hidden)
 
 
 def _modules(value: object) -> Iterator[nn.Module]:
@@ -312,7 +347,15 @@ class WindowsQwen3OffloadModel(nn.Module):
         # The real Qwen3 forward runs CPU embedding, final norm and its tied or
         # untied head. Only the replacement decoder layers enter the GPU stream.
         with mx.stream(mx.Device(mx.cpu)):
-            logits = cast(_QwenModel, cast(object, self.original))(inputs, cache=cache)
+            original = cast(_QwenModel, cast(object, self.original))
+            hidden = original.model(inputs, cache=cache)
+            tied = "lm_head" not in self.original
+            projection = (
+                original.model.embed_tokens
+                if tied
+                else cast(nn.Module, cast(dict[str, object], self.original)["lm_head"])
+            )
+            logits = _cpu_output_projection(hidden, projection, tied=tied)
         # MLX discards intermediate prefill logits. Decoder/cache evaluation is
         # already complete; keep the canonical CPU head and final copy lazy so
         # discarded results do not evaluate a vocabulary-sized projection.
