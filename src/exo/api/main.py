@@ -431,6 +431,12 @@ class API:
             ) from e
 
     async def place_instance(self, payload: PlaceInstanceParams):
+        await self.get_placement(
+            payload.model_id,
+            payload.sharding,
+            payload.instance_meta,
+            payload.min_nodes,
+        )
         command = PlaceInstance(
             model_card=await ModelCard.load(payload.model_id),
             sharding=payload.sharding,
@@ -2012,7 +2018,7 @@ class API:
                     if queue := self._image_generation_queues.get(
                         event.command_id, None
                     ):
-                        assert isinstance(event.chunk, ImageChunk)
+                        assert isinstance(event.chunk, (ImageChunk, ErrorChunk))
                         try:
                             await queue.send(event.chunk)
                         except (BrokenResourceError, ClosedResourceError):
