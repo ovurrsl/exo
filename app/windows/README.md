@@ -126,10 +126,14 @@ public key clearly report that update support is unconfigured.
 Update signatures must include the release version in the signed trusted
 comment; current pinned Tauri CLI signing provides it. Downgrades are rejected.
 
-Bug Report exports a local ZIP with bounded log tails, redacted cluster state,
-adapter/firewall/NVIDIA diagnostics and version metadata. The UI opens a draft
-issue in `ovurrsl/exo`; it never uploads diagnostics automatically. Inspect
-logs before attaching the ZIP.
+Bug Report exports a local ZIP with redacted cluster state,
+adapter/firewall/NVIDIA diagnostics and version metadata. It omits raw logs,
+complete generation request payloads, free-form errors and runner evidence,
+environment values and local paths from JSON snapshots. `PRIVACY.txt` explains
+the included and omitted data. Device names, model identifiers and network
+details can remain. The UI opens a draft issue in `ovurrsl/exo`; it never
+uploads diagnostics automatically. Inspect the ZIP before attaching it. Open
+Logs still provides local logs; review those separately before sharing them.
 
 The IPC bridge exposes fixed desktop actions and fixed loopback EXO requests.
 It has no arbitrary shell, filesystem or URL command. Only the packaged local

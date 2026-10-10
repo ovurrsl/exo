@@ -4,7 +4,7 @@ use crate::{
 };
 use serde_json::Value;
 use std::{
-    io::{Read, Seek, SeekFrom, Write},
+    io::Write,
     os::windows::{ffi::OsStringExt, fs::MetadataExt},
     path::{Path, PathBuf},
     sync::Arc,
@@ -346,19 +346,46 @@ pub fn redact_json(value: &mut Value) {
     match value {
         Value::Object(values) => {
             for (key, value) in values.iter_mut() {
-                let name = key.to_ascii_lowercase();
+                let name = key.to_ascii_lowercase().replace(['_', '-'], "");
                 if [
                     "token",
                     "password",
                     "authorization",
                     "apikey",
-                    "api_key",
                     "messages",
                     "prompt",
                     "attachments",
+                    "environment",
+                    "path",
                 ]
                 .iter()
                 .any(|secret| name.contains(secret))
+                    || matches!(
+                        name.as_str(),
+                        // Omit the whole request, including future content fields.
+                        "taskparams"
+                            | "input"
+                            | "instructions"
+                            | "content"
+                            | "images"
+                            | "imagehashes"
+                            | "imagedata"
+                            | "imageurl"
+                            | "b64json"
+                            | "tools"
+                            | "stop"
+                            // Errors and runner evidence may echo request content.
+                            | "error"
+                            | "errormessage"
+                            | "errordescription"
+                            | "message"
+                            | "detail"
+                            | "body"
+                            | "evidence"
+                            | "modeldirectory"
+                            | "files"
+                            | "fileprogress"
+                    )
                 {
                     *value = Value::String("[redacted]".into());
                 } else {
@@ -400,40 +427,42 @@ fn redact_known_secret(content: &[u8], token: Option<&str>) -> Vec<u8> {
         None => content.to_vec(),
     }
 }
-fn collect_logs(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
-    if !directory.exists() {
-        return Ok(());
+const DIAGNOSTICS_PRIVACY_NOTICE: &str = "Local export only. Raw logs, generation request payloads, free-form error text, environment values and local paths are omitted. Device and network information remains. Inspect this ZIP before sharing.";
+const DIAGNOSTICS_PRIVACY_MANIFEST: &str = "EXO Windows diagnostics privacy\n\nThis ZIP is saved locally. EXO does not upload it automatically.\n\nIncluded: version and backend status, redacted cluster state, and Windows adapter, firewall and NVIDIA diagnostics. Task status and identifiers remain.\n\nOmitted: raw backend and runner logs; complete generation request parameters (including prompts, instructions, images and tools); free-form errors and runner evidence; environment values and local paths from JSON snapshots. Known saved credentials are also redacted. Raw logs cannot be reliably sanitized and are never read for this export.\n\nDevice names, model identifiers, IP and MAC addresses, network names, and other system/network details may remain. Inspect every included file before attaching this ZIP to a public issue or sharing it with support. Local logs remain available through Open Logs; review them separately before sharing.\n";
+
+fn write_diagnostics_archive(
+    destination: &Path,
+    mut metadata: Value,
+    mut state: Value,
+    network: &str,
+    token: Option<&str>,
+) -> Result<(), String> {
+    // The archive accepts only explicit diagnostic inputs, never a log directory.
+    redact_json(&mut metadata);
+    redact_json(&mut state);
+    let file = std::fs::File::create(destination).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipWriter::new(file);
+    zip_entry(
+        &mut archive,
+        "PRIVACY.txt",
+        DIAGNOSTICS_PRIVACY_MANIFEST.as_bytes(),
+    )?;
+    for (name, value) in [("metadata.json", metadata), ("cluster-state.json", state)] {
+        zip_entry(
+            &mut archive,
+            name,
+            &redact_known_secret(
+                &serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?,
+                token,
+            ),
+        )?;
     }
-    let metadata = std::fs::symlink_metadata(directory).map_err(|e| e.to_string())?;
-    if metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0 {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let kind = entry.file_type().map_err(|e| e.to_string())?;
-        if kind.is_symlink()
-            || std::fs::symlink_metadata(entry.path())
-                .map_err(|e| e.to_string())?
-                .file_attributes()
-                & 0x400
-                != 0
-        {
-            continue;
-        }
-        if paths.len() >= 20 {
-            break;
-        }
-        if kind.is_dir() {
-            collect_logs(&entry.path(), paths)?;
-        } else if kind.is_file()
-            && entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "log")
-        {
-            paths.push(entry.path());
-        }
-    }
+    zip_entry(
+        &mut archive,
+        "network.txt",
+        &redact_known_secret(network.as_bytes(), token),
+    )?;
+    archive.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
 #[tauri::command]
@@ -458,61 +487,22 @@ pub async fn export_diagnostics(
         return Ok(None);
     };
     let path = destination.into_path().map_err(|e| e.to_string())?;
-    let mut state = desktop
+    let state = desktop
         .cluster()
         .await
         .unwrap_or_else(|error| serde_json::json!({"error": error}));
-    redact_json(&mut state);
-    let metadata = serde_json::json!({"desktop": desktop.snapshot(), "windows": std::env::consts::OS, "architecture": std::env::consts::ARCH, "notice": "Local export only. Prompts and known secrets are redacted. Inspect logs before sharing."});
+    let metadata = serde_json::json!({"desktop": desktop.snapshot(), "windows": std::env::consts::OS, "architecture": std::env::consts::ARCH, "notice": DIAGNOSTICS_PRIVACY_NOTICE, "privacy": {"rawLogsIncluded": false, "generationRequestPayloadsIncluded": false, "freeformErrorsIncluded": false, "deviceAndNetworkInformationIncluded": true}});
     let token = crate::settings::read_token()?;
     let network = collect_network().await;
-    let log_root = desktop.data.join("exo_log");
     let path_for_archive = path.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let file = std::fs::File::create(&path_for_archive).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipWriter::new(file);
-        zip_entry(
-            &mut archive,
-            "metadata.json",
-            &redact_known_secret(
-                &serde_json::to_vec_pretty(&metadata).map_err(|e| e.to_string())?,
-                token.as_deref(),
-            ),
-        )?;
-        zip_entry(
-            &mut archive,
-            "cluster-state.json",
-            &redact_known_secret(
-                &serde_json::to_vec_pretty(&state).map_err(|e| e.to_string())?,
-                token.as_deref(),
-            ),
-        )?;
-        zip_entry(
-            &mut archive,
-            "network.txt",
-            &redact_known_secret(network.as_bytes(), token.as_deref()),
-        )?;
-        let mut paths = vec![];
-        collect_logs(&log_root, &mut paths)?;
-        for path in paths {
-            let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-            let length = file.metadata().map_err(|e| e.to_string())?.len();
-            file.seek(SeekFrom::Start(length.saturating_sub(1024 * 1024)))
-                .map_err(|e| e.to_string())?;
-            let mut bytes = vec![];
-            file.take(1024 * 1024)
-                .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
-            let text = redact_known_secret(&bytes, token.as_deref());
-            let relative = path
-                .strip_prefix(&log_root)
-                .map_err(|e| e.to_string())?
-                .to_string_lossy()
-                .replace('\\', "/");
-            zip_entry(&mut archive, &format!("logs/{relative}"), &text)?;
-        }
-        archive.finish().map_err(|e| e.to_string())?;
-        Ok::<(), String>(())
+        write_diagnostics_archive(
+            &path_for_archive,
+            metadata,
+            state,
+            &network,
+            token.as_deref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -868,6 +858,147 @@ mod tests {
         }
         assert!(!data.join("models").exists());
         assert!(!data.join("cache").exists());
+        assert!(root
+            .canonicalize()
+            .unwrap()
+            .starts_with(allowed.canonicalize().unwrap()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diagnostics_omit_canonical_generation_payloads_even_with_unknown_content_fields() {
+        // These are the serialized TextGenerationTaskParams fields, not API messages.
+        for (params_name, error_name) in [
+            ("task_params", "error_message"),
+            ("taskParams", "errorMessage"),
+        ] {
+            let mut value = serde_json::json!({
+                "tasks": {"task-id": {"TextGeneration": {
+                    "taskId": "task-id", "taskStatus": "Failed", "instanceId": "instance-id",
+                    "commandId": "command-id", "errorType": "ValueError",
+                    error_name: "private-input echoed by inference",
+                    params_name: {
+                        "model": "fixture/model", "input": [{"role": "user", "content": "private-input"}],
+                        "instructions": "private-instructions", "max_output_tokens": 128,
+                        "chat_template_messages": [{"content": [{"type": "image", "image_url": {"url": "private-image"}}]}],
+                        "images": ["private-image"], "image_hashes": {"0": "private-image-hash"},
+                        "tools": [{"description": "private-tool"}], "stop": "private-stop",
+                        "future_request_field": "private-future-content"
+                    }
+                }}}
+            });
+            redact_json(&mut value);
+            let task = &value["tasks"]["task-id"]["TextGeneration"];
+            assert_eq!(task[params_name], "[redacted]");
+            assert_eq!(task[error_name], "[redacted]");
+            assert_eq!(task["errorType"], "ValueError");
+            assert_eq!(task["taskStatus"], "Failed");
+            assert_eq!(task["instanceId"], "instance-id");
+            assert!(!value.to_string().contains("private-"));
+        }
+    }
+
+    #[test]
+    fn diagnostics_remove_nested_content_and_freeform_error_evidence() {
+        let mut value = serde_json::json!({
+            "input": [{"content": "private-input"}], "instructions": "private-instructions",
+            "nested": [{"content": [{"text": "private-content", "image_data": "private-image"}]}],
+            "runners": {"runner-id": {"RunnerFailed": {
+                "errorMessage": "private-error", "diagnostics": [{"RunnerMetalGpuTimeout": {
+                    "message": "private-error", "evidence": ["private-prompt"], "error_number": 5
+                }}]
+            }}},
+            "error": "private-error", "detail": "private-detail", "authorization": "private-secret",
+            "runtimePath": "C:\\Users\\private-user\\runtime", "custom_environment": {"UNNAMED": "private-secret"},
+            "nodeMemory": {"node-id": {"ramAvailable": {"inBytes": 2048}}}, "lastEventAppliedIdx": 19
+        });
+        redact_json(&mut value);
+        assert_eq!(
+            value["nodeMemory"]["node-id"]["ramAvailable"]["inBytes"],
+            2048
+        );
+        assert_eq!(value["lastEventAppliedIdx"], 19);
+        assert_eq!(
+            value["runners"]["runner-id"]["RunnerFailed"]["diagnostics"][0]
+                ["RunnerMetalGpuTimeout"]["error_number"],
+            5
+        );
+        assert!(!value.to_string().contains("private-"));
+    }
+
+    #[test]
+    fn diagnostics_archive_never_includes_unstructured_logs_and_sanitizes_every_snapshot() {
+        use std::io::Read;
+
+        let allowed = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/diagnostics-tests");
+        let root = allowed.join(uuid::Uuid::new_v4().simple().to_string());
+        let logs = root.join("exo_log/runner");
+        std::fs::create_dir_all(&logs).unwrap();
+        // More logs than the former 20-file limit, with request repr and arbitrary text.
+        for index in 0..21 {
+            std::fs::write(logs.join(format!("runner-{index}.log")), b"INFO Starting task TextGeneration(input='private-raw-prompt')\nprivate-unstructured-text\n").unwrap();
+        }
+        let path = root.join("diagnostics.zip");
+        write_diagnostics_archive(
+            &path,
+            serde_json::json!({
+                "desktop": {"status": "Failed", "version": "0.3.70", "owned": true,
+                    "detail": "private-error", "runtimePath": "C:\\Users\\private-user\\runtime",
+                    "dataPath": "private-data", "logPath": "private-log", "sourceModified": false},
+                "notice": DIAGNOSTICS_PRIVACY_NOTICE,
+                "privacy": {"rawLogsIncluded": false, "generationRequestPayloadsIncluded": false}
+            }),
+            serde_json::json!({"tasks": {"task-id": {"ImageEdits": {
+                "task_status": "Failed", "error_type": "RuntimeError", "error_message": "private-error",
+                "task_params": {"prompt": "private-prompt", "image_data": "private-image"}
+            }}}, "error": "private-error", "nodeMemory": {"node-id": {"available": 2048}},
+                "topology": {"node-id": {"address": "192.0.2.1", "label": "hf-fixture-secret"}}}),
+            "Fixture adapter 192.0.2.1 credential=hf-fixture-secret",
+            Some("hf-fixture-secret"),
+        ).unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 4);
+        let mut names = vec![];
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            names.push(entry.name().to_owned());
+            let mut content = String::new();
+            entry.read_to_string(&mut content).unwrap();
+            assert!(!content.contains("private-"), "{}", entry.name());
+            assert!(!content.contains("hf-fixture-secret"), "{}", entry.name());
+            match entry.name() {
+                "metadata.json" => {
+                    let value: Value = serde_json::from_str(&content).unwrap();
+                    assert_eq!(value["desktop"]["status"], "Failed");
+                    assert_eq!(value["desktop"]["owned"], true);
+                    assert_eq!(value["desktop"]["version"], "0.3.70");
+                    assert_eq!(value["privacy"]["rawLogsIncluded"], false);
+                    assert_eq!(value["privacy"]["generationRequestPayloadsIncluded"], false);
+                }
+                "cluster-state.json" => {
+                    let value: Value = serde_json::from_str(&content).unwrap();
+                    assert_eq!(
+                        value["tasks"]["task-id"]["ImageEdits"]["task_status"],
+                        "Failed"
+                    );
+                    assert_eq!(value["nodeMemory"]["node-id"]["available"], 2048);
+                }
+                "network.txt" => assert!(content.contains("192.0.2.1")),
+                "PRIVACY.txt" => {}
+                name => panic!("Unexpected archive entry: {name}"),
+            }
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "PRIVACY.txt",
+                "cluster-state.json",
+                "metadata.json",
+                "network.txt"
+            ]
+        );
+        assert_eq!(std::fs::read_dir(logs).unwrap().count(), 21);
         assert!(root
             .canonicalize()
             .unwrap()
