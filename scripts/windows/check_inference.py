@@ -6,6 +6,7 @@ the user's namespace or writes into their model directory.
 
 import argparse
 import base64
+import contextlib
 import ctypes
 import io
 import json
@@ -13,6 +14,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -34,7 +36,24 @@ def main() -> None:
     parser.add_argument("--model", default="mlx-community/Qwen3-0.6B-4bit")
     parser.add_argument("--vision", action="store_true")
     parser.add_argument("--exercise-cancel", action="store_true")
+    parser.add_argument("--ram-offload", action="store_true")
+    parser.add_argument("--max-tokens", type=int, default=24)
+    parser.add_argument("--request-timeout", type=float, default=90)
+    parser.add_argument("--runner-ready-timeout", type=float, default=120)
+    parser.add_argument("--cancel-timeout", type=float, default=20)
     arguments = parser.parse_args()
+    if (
+        min(
+            arguments.max_tokens,
+            arguments.request_timeout,
+            arguments.runner_ready_timeout,
+            arguments.cancel_timeout,
+        )
+        <= 0
+    ):
+        parser.error("Token and timeout limits must be positive")
+    if arguments.ram_offload and arguments.vision:
+        parser.error("Experimental RAM offload does not support vision")
     output = arguments.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     api_port = available_port()
@@ -45,24 +64,8 @@ def main() -> None:
         "EXO_OFFLINE": "true",
         "PYTHONUTF8": "1",
     }
-    event = None
-    kernel = None
-    if sys.platform == "win32":
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.CreateEventW.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_wchar_p,
-        ]
-        kernel.CreateEventW.restype = ctypes.c_void_p
-        kernel.SetEvent.argtypes = [ctypes.c_void_p]
-        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-        event_name = f"Local\\exo-shutdown-{uuid.uuid4().hex}"
-        event = kernel.CreateEventW(None, 1, 0, event_name)
-        if not event:
-            raise ctypes.WinError()
-        environment["EXO_WINDOWS_SHUTDOWN_EVENT"] = event_name
+    if arguments.ram_offload:
+        environment["EXO_WINDOWS_TEXT_OFFLOAD"] = "true"
     executable = (
         [str(arguments.runtime)] if arguments.runtime else [sys.executable, "-m", "exo"]
     )
@@ -81,6 +84,56 @@ def main() -> None:
     ]
     model = arguments.model
     report = {"model": model, "runtime": executable[0], "chats": [], "passed": False}
+    if arguments.ram_offload:
+        from exo.utils.windows_gpu import read_gpu_memory
+
+        try:
+            snapshot = arguments.model_dir.resolve() / model.replace("/", "--")
+            index = json.loads((snapshot / "model.safetensors.index.json").read_text())
+            tensor_bytes = int(index["metadata"]["total_size"])
+            if any(
+                not (snapshot / shard).is_file()
+                for shard in set(index["weight_map"].values())
+            ):
+                raise RuntimeError("RAM offload acceptance requires every model shard")
+            gpu = read_gpu_memory()
+            if gpu is None or tensor_bytes <= gpu.total.in_bytes:
+                raise RuntimeError(
+                    "RAM offload acceptance requires weights larger than real dedicated VRAM"
+                )
+            report["ram_offload"] = {
+                "model_tensor_bytes": tensor_bytes,
+                "gpu_total_bytes": gpu.total.in_bytes,
+            }
+        except Exception as exc:
+            report["error"] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "phase": "preflight",
+            }
+            (output / "inference.json").write_text(
+                json.dumps(report, indent=2), encoding="utf-8"
+            )
+            raise
+    # Preflight must finish before creating resources requiring cleanup.
+    event = None
+    kernel = None
+    if sys.platform == "win32":
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateEventW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_wchar_p,
+        ]
+        kernel.CreateEventW.restype = ctypes.c_void_p
+        kernel.SetEvent.argtypes = [ctypes.c_void_p]
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        event_name = f"Local\\exo-shutdown-{uuid.uuid4().hex}"
+        event = kernel.CreateEventW(None, 1, 0, event_name)
+        if not event:
+            raise ctypes.WinError()
+        environment["EXO_WINDOWS_SHUTDOWN_EVENT"] = event_name
     with (output / "node.log").open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             executable,
@@ -89,9 +142,54 @@ def main() -> None:
             stderr=log,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
+        sampling_stop = threading.Event()
+        sampling_thread = None
+        if arguments.ram_offload:
+            import psutil
+
+            profile = {
+                "samples": 0,
+                "peak_process_tree_rss_bytes": 0,
+                "peak_system_gpu_used_bytes": 0,
+                "min_system_host_available_bytes": int(
+                    psutil.virtual_memory().available
+                ),
+            }
+            report["ram_offload"]["memory_profile"] = profile
+
+            def sample_memory() -> None:
+                while not sampling_stop.is_set():
+                    try:
+                        parent = psutil.Process(process.pid)
+                        processes = [parent, *parent.children(recursive=True)]
+                        rss = 0
+                        for owned in processes:
+                            with contextlib.suppress(psutil.Error):
+                                rss += owned.memory_info().rss
+                        profile["peak_process_tree_rss_bytes"] = max(
+                            profile["peak_process_tree_rss_bytes"], rss
+                        )
+                        profile["min_system_host_available_bytes"] = min(
+                            profile["min_system_host_available_bytes"],
+                            int(psutil.virtual_memory().available),
+                        )
+                        memory = read_gpu_memory()
+                        if memory is not None:
+                            used = memory.total.in_bytes - memory.free.in_bytes
+                            profile["peak_system_gpu_used_bytes"] = max(
+                                profile["peak_system_gpu_used_bytes"], used
+                            )
+                        profile["samples"] += 1
+                    except psutil.Error:
+                        break
+                    sampling_stop.wait(0.25)
+
+            sampling_thread = threading.Thread(target=sample_memory, daemon=True)
+            sampling_thread.start()
         try:
             with httpx.Client(
-                base_url=f"http://127.0.0.1:{api_port}", timeout=90
+                base_url=f"http://127.0.0.1:{api_port}",
+                timeout=arguments.request_timeout,
             ) as client:
                 deadline = time.monotonic() + 60
                 while True:
@@ -116,9 +214,18 @@ def main() -> None:
                             "CUDA node did not become ready within 60 seconds"
                         )
                     time.sleep(0.25)
+                if arguments.ram_offload:
+                    capacity = client.get("/windows/model-capacity")
+                    capacity.raise_for_status()
+                    qualification = capacity.json().get("models", {}).get(model)
+                    report["ram_offload"]["qualification"] = qualification
+                    if not qualification or qualification["mode"] != "ram_offload":
+                        raise RuntimeError(
+                            "Node did not qualify the oversized model for RAM offload"
+                        )
                 response = client.post("/place_instance", json={"model_id": model})
                 response.raise_for_status()
-                deadline = time.monotonic() + 120
+                deadline = time.monotonic() + arguments.runner_ready_timeout
                 while True:
                     state = client.get("/state").json()
                     statuses = list(state.get("runners", {}).values())
@@ -128,7 +235,7 @@ def main() -> None:
                         break
                     if time.monotonic() >= deadline:
                         raise TimeoutError(
-                            "Spawned runner did not load/warm up within 120 seconds"
+                            f"Spawned runner did not load/warm up within {arguments.runner_ready_timeout} seconds"
                         )
                     time.sleep(0.25)
                 prompts = (
@@ -169,7 +276,7 @@ def main() -> None:
                             "messages": [
                                 {"role": "user", "content": vision_content or prompt}
                             ],
-                            "max_tokens": 24,
+                            "max_tokens": arguments.max_tokens,
                             "temperature": 0,
                             "enable_thinking": False,
                             "use_prefix_cache": True,
@@ -221,7 +328,7 @@ def main() -> None:
                             raise RuntimeError(
                                 "No streaming token was returned before cancellation"
                             )
-                    deadline = time.monotonic() + 20
+                    deadline = time.monotonic() + arguments.cancel_timeout
                     while True:
                         statuses = list(
                             client.get("/state").json().get("runners", {}).values()
@@ -242,7 +349,7 @@ def main() -> None:
                             "messages": [
                                 {"role": "user", "content": "Reply with hello."}
                             ],
-                            "max_tokens": 16,
+                            "max_tokens": min(16, arguments.max_tokens),
                             "enable_thinking": False,
                         },
                     )
@@ -251,7 +358,17 @@ def main() -> None:
                         raise RuntimeError("No completion after cancellation")
                     report["cancel_recovery"] = recovered.json()
                 report["passed"] = True
+        except Exception as exc:
+            report["error"] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "phase": "inference",
+            }
+            raise
         finally:
+            sampling_stop.set()
+            if sampling_thread is not None:
+                sampling_thread.join(timeout=2)
             if process.poll() is None:
                 if kernel is not None:
                     kernel.SetEvent(event)
