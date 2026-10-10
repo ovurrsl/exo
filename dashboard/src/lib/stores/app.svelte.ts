@@ -8,6 +8,10 @@
  */
 
 import { browser } from "$app/environment";
+import {
+  fetchWindowsModelCapacity,
+  type WindowsModelCapacities,
+} from "$lib/utils/windows-model-capacity";
 
 // UUID generation fallback for browsers without crypto.randomUUID
 function generateUUID(): string {
@@ -550,6 +554,10 @@ class AppStore {
 
   // Topology state
   topologyData = $state<TopologyData | null>(null);
+  windowsModelCapacities = $state<WindowsModelCapacities>({});
+  private lastCapacityFetch = 0;
+  private capacityFetchPending = false;
+  private capacityNodeId: string | null = null;
   instances = $state<Record<string, unknown>>({});
   runners = $state<Record<string, unknown>>({});
   instanceLinks = $state<Record<string, RawInstanceLink>>({});
@@ -1328,6 +1336,7 @@ class AppStore {
         // Handle topology changes for preview filter
         this.handleTopologyChange();
       }
+      void this.refreshWindowsModelCapacities();
       if (data.instances) {
         this.instances = data.instances;
         this.refreshConversationModelFromInstances();
@@ -1371,6 +1380,43 @@ class AppStore {
         this.isConnected = false;
       }
       console.error("Error fetching state:", error);
+    }
+  }
+
+  private async refreshWindowsModelCapacities(): Promise<void> {
+    const nodes = Object.entries(this.topologyData?.nodes ?? {});
+    const node = nodes[0]?.[1];
+    if (
+      nodes.length !== 1 ||
+      !/^Windows(?:\s|$)/i.test(node?.os_version ?? "") ||
+      !node?.backends?.includes("MlxCuda")
+    ) {
+      this.windowsModelCapacities = {};
+      this.capacityNodeId = null;
+      return;
+    }
+    if (this.capacityNodeId !== nodes[0][0]) {
+      this.capacityNodeId = nodes[0][0];
+      this.windowsModelCapacities = {};
+      this.lastCapacityFetch = 0;
+    }
+    if (this.capacityFetchPending || Date.now() - this.lastCapacityFetch < 5000)
+      return;
+    this.capacityFetchPending = true;
+    this.lastCapacityFetch = Date.now();
+    try {
+      const capacities = await fetchWindowsModelCapacity();
+      const currentNodes = Object.entries(this.topologyData?.nodes ?? {});
+      if (
+        currentNodes.length === 1 &&
+        currentNodes[0][0] === nodes[0][0] &&
+        /^Windows(?:\s|$)/i.test(currentNodes[0][1].os_version ?? "") &&
+        currentNodes[0][1].backends?.includes("MlxCuda")
+      ) {
+        this.windowsModelCapacities = capacities;
+      }
+    } finally {
+      this.capacityFetchPending = false;
     }
   }
 
@@ -3607,6 +3653,7 @@ export const setMobileRightSidebarOpen = (open: boolean) =>
   appStore.setMobileRightSidebarOpen(open);
 
 export const refreshState = () => appStore.fetchState();
+export const windowsModelCapacities = () => appStore.windowsModelCapacities;
 
 // Connection status
 export const isConnected = () => appStore.isConnected;
