@@ -1,140 +1,64 @@
-# EXO Windows ve NVIDIA çalışma durumu
+# EXO Windows ve NVIDIA ilerlemesi — 10 Ekim 2026
 
-10 Ekim 2026. Aşağıdaki ana tablo önceki `abe3fdbb` kaynak/runtime snapshot'ıdır;
-en yeni ayrı konu dalları, inceleme bulguları ve entegrasyon durumları
-[güncel dal entegrasyon raporunda](upstream-integration-20261010.md) izlenir.
-Windows çekirdeği, CUDA runtime ve masaüstü uygulaması geliştirildi. Önceki yeni
-runtime 32 native kontrolü geçti; sonraki kurucu derlemesi dosya kilidi nedeniyle
-başarısız oldu. Güncel imzasız kurucunun derlemesi aşağıdaki yeni kanıtla tamamlandı;
-kurulum ve native Settings kabulü henüz tamamlanmadı.
-**Tüm plan ve kararlı sürüm tamamlanmış değildir.** Varsayılan API portu **52415**.
+Güncel birleşik kaynak **`79de2150c1979663b63708c13dc6ddee5709f663`**, fork'ın
+`windows-native` dalına gönderildi. Mac düzenini izleyen panel ve tanılama ZIP'inden
+özel içeriği çıkaran düzeltme ayrı konu commitleriyle birleştirildi.
+**Kararlı sürüm kabulü tamamlanmadı; `release_ready=false`.** Mac Swift/Metal/JACCL
+kaynakları, Darwin dependency pin'leri, ortak strict şemalar ve varsayılan API
+portu **52415** bu iki konuda değişmedi.
 
-Yeni ilerleme: API hata/iptal düzeltmeleri, runner lifecycle, cache retention,
-Windows CI asset ve bağımsız Rust biçim kapısı ayrı dallardan `windows-native`e
-birleştirildi. Birleşik kaynak `a36502ba` üzerinde **728 test geçti**, iki platform
-strict tip kontrolü temiz. Küçük fiziksel Qwen RAM–CUDA katman aktarımı tekrar geçti;
-[ölçüm raporu](windows-host-ram-offload-20261010.md) deneyin sınırlarını açıklar.
-Üretim büyük-model offload'u henüz yok. Kullanıcı Thunderbolt olmadan mevcut LAN
-üzerinden devam etmeyi seçti; Thunderbolt fiziksel kabulü ertelendi.
-[Yeni runtime ve gerçek LAN kabul raporu](windows-lan-acceptance-20261010.md):
-32 frozen runtime kapısı ve 3,09 GB safetensors yükleme; PC + tek M1'de iki ring
-rank sırası, Windows/Mac master üretimi, node stop ve iki iptal/toparlanma geçti.
-Windows 728, gerçek Mac 687 test geçti; atlanan ve slow kapsamlar raporda ayrıdır.
-Test fixture, Windows Cargo ve tip stub biçimi ayrı commitlerde düzeltildi.
-`7d11c690` ve `07c7e2b5` için hosted Windows checks beş job'ın tamamında başarılı;
-`02b5604f` ve `f99234db` için Darwin Nix build ve flake check geçti.
-Linux NVSHMEM/cuFile native bağımlılık hataları açık.
-LAN'da 20 başarılı sohbet, iki aktif iptal/toparlanma ve 2.825-token tekrar/cache
-deneyi doğrulandı. Panel/Settings P1 düzeltmesi `de85b2cf` ayrı dalında tutulup
-`f99234db` ile birleştirildi; açık/koyu temada 22'şer UI testi ve gerçek frozen
-controller unchanged-save/graceful restart testleri geçti.
-`f99234db` için hosted Windows checks beş job'ın tamamında geçti.
-Güncel GUI/CUDA/WebView2 review kurucusu derlendi: 1,67 GiB, Authenticode
-`NotSigned`; taze dosya SHA-256 ve source/runtime kimlikleri kaydedildi.
-[Aynı runtime'ın vision/görüntü kabulü](windows-runtime-media-acceptance-20261010.md)
-iki Qwen3-VL yanıtı ile FLUX üretim/düzenleme/iptal/toparlanma ve normal worker
-kapanışını doğruladı; kapsam tek RTX 5070'dir.
-[Masaüstü kabul raporu](windows-desktop-acceptance-20261010.md) kurucu durumunu
-ve native Settings/DPI/temiz kurulum için kalan kapıları açıklar.
-[GPU Gen5 x16 ölçümü ve BIOS/ALT_PCIE_MODE rehberi](windows-bios-pcie-20261010.md).
-Thunderbolt kablo bağlantısı OS seviyesinde aktif eş/NIC oluşturmadı;
-[anakart ve Claude dal incelemesi](claude-fork-thunderbolt-20261010.md) mevcut kanıtı içerir.
+## Güncel durum
 
-## Tamamlanan kaynak çalışmaları
+| Alan                   | Tamamlanan ve doğrulanan kapsam                                                                                                                                                                                                                                      | Sınır / sonraki iş                                                                                                                         |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Mac görünümü           | `aec96839`: çekirdek GPU/sıcaklık/bellek/ilerleme bilgileri görünür; model durumunun önceliği, durum kapsülleri, Settings gezinmesi ve içerik yüksekliğine göre panel küçülmesi düzeltildi. Açık ve koyu temada 27'şer UI testi, 4 birim testi, 70 Rust testi geçti. | Fiziksel DPI, monitör, ekran çizimi ve production Settings açıcı kabulü açık.                                                              |
+| Birleşik masaüstü      | `79de2150`: 27 Playwright (atlama yok), 4 Vitest ve derleme hedeflerinde toplam 76 Rust testi geçti; Svelte 0 hata/0 uyarı, TypeScript, strict Clippy ve Cargo fmt geçti.                                                                                            | Güncel hosted workflow sonuçları ayrı izleniyor; önceki yeşil commitler bu kaynağın CI kabulü değildir.                                    |
+| Native Settings ölçümü | Tam `aec96839` kaynağında light/dark 10'ar örnek; fixed WebView2 `154.0.4258.62`, salt okunur DOM ve IPC.                                                                                                                                                            | Pencere gizli ve odaksızdı; opener, paint, fiziksel DPI veya kurulum kabulü sağlamaz. Sonraki ZIP değişikliği bu ölçümün kaynağı değildir. |
+| Güvenlik               | `931e0ff4..0c5294ac` diff taraması tamamlandı: 187 değişen yol incelendi, 45 açık dışlama, 0 ertelenen; bir düşük önem/P3 CWE-200 bulgusu. `79d8b986` tanılama ZIP'inden ham logları ve generation payload'larını çıkardı.                                           | Düzeltme regresyon testleri geçti; yeni bir sealed tarama değildir. Sonraki arayüz ve değişmemiş bütün upstream API kapsam dışında.        |
+| Gerçek LAN ve CUDA     | `7d11c690` runtime'ında RTX 5070 + tek M1: iki ring sırası, iki master düzeni, 20 tamamlanmış sohbet ve iki iptal/toparlanma; tek CUDA vision ve FLUX üretim/düzenleme geçti.                                                                                        | İkinci M1/üç fiziksel cihaz, karma vision/image ve yüksek VRAM/context matrisi açık.                                                       |
+| Upstream PR'lar        | Altı açık PR'ın sabit head'leri gözden geçirildi; model kartı, namespace/workspace belgeleri, NIC uyumluluğu ve iki API güvenlik düzeltmesi ayrı raporda.                                                                                                            | PR 2305 DNS pinleme ve PR 2306 model yolu düzeltmeleri güncel main/frozen runtime'a henüz taşınmadı; seçili entegrasyon ve native CI açık. |
+| Kurucu                 | Önceki `f99234db` GUI / `7d11c690` runtime kurucusu derlendi, kimliği kaydedildi; imzasız ve kurulmadı.                                                                                                                                                              | **`79de2150` kurucu derlemesi sürüyor.** Final artefakt kimliği ve kurulum sonucu henüz yok.                                               |
 
-| Alan              | Yapılan çalışma                                                                                                 | Doğrulama                                                                                                     |
-| ----------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| Windows MLX       | Sabit kaynak/patch/wheel kimliği, paket içi NVIDIA DLL ve JIT kaynakları, derleyicisiz CPU yolu                 | Yeni frozen runtime'da 32 native kapı; gerçek 3.093.767.283 bayt safetensors yükleme                          |
-| CUDA düğümü       | Ayrı süreçte kernel/ring/normal çıkış kontrolü, NVML kapasitesi, host RAM'e yanlış geçişin kaldırılması         | RTX 5070 kontrolleri ve birim testleri                                                                        |
-| Karma küme        | Ortak cache eviction kararı, model snapshot kontrolü, ilerleme timeout'u ve Windows runner kapanışı             | Önceki frozen adayda PC + tek M1, iki master düzeni, üçer sohbet ve süreç çıkışları 0                         |
-| Masaüstü          | Tauri/Svelte, tepsi, beş ayar sekmesi, Job Object, Credential Manager, tanılama, model korumalı kaldırma        | Kurulu önceki adayda çift açılış, gerçek GPU sohbeti, çökme temizliği, restart/stop, Unicode kurulum/kaldırma |
-| Mac görünümü      | 340 px panel, 640×560 gruplu ayarlar, AppKit açık/koyu renkleri, orijinal siyah/sarı simge, Mac topoloji düzeni | Güncel kaynakta 13 açık + 13 koyu UI testi, 3 birim testi, tip kontrolü 0 hata/uyarı, üretim build            |
-| Ayar penceresi    | Native boş pencere hatası için async WebView oluşturma ve sıralı reuse                                          | Rust 19 test geçti; yeni native tekrar bekliyor                                                               |
-| Bellek hatası     | Yuvarlanmış eşit GB yerine GiB, tam bayt ve eksik miktar                                                        | 1 bayt eksik/gerçek yakın sınır/tam kapasite regresyonları; toplam 668 Python testi geçti                     |
-| Vision ve görüntü | Qwen3-VL yolu; tek CUDA FLUX.1-schnell üretim/düzenleme/iptal/toparlanma                                        | Önceki frozen RTX 5070 adayında gerçek yerel kabul                                                            |
-| Dashboard         | CUDA görüntü kapasitesini cihaz başına değerlendirme; Mac yolu korunur                                          | 9 test ve üretim build geçti                                                                                  |
-| CI                | Hosted Windows CPU/type/Rust/UI işleri ve ayrı fiziksel GPU/küme workflow'u                                     | GitHub işleri başladı; sonuçlar henüz doğrulanmadı                                                            |
+Ayrıntılar: [masaüstü kabulü](windows-desktop-acceptance-20261010.md),
+[LAN kabulü](windows-lan-acceptance-20261010.md),
+[tek CUDA vision/görüntü](windows-runtime-media-acceptance-20261010.md) ve
+[altı PR incelemesi](upstream-pr-review-20261010.md).
 
-Python kontrolü: **668 geçti, 8 atlandı, 190 slow dışlandı**. Windows Python tip,
-Ruff lint/format ve masaüstü tip kontrolleri geçti. Dashboard tip kontrolündeki
-15 hata/6 uyarı, aynı bağımlılıkla eski `931e0ff4` tabanında da var; dashboard
-tip kontrolü geçti olarak gösterilmez. Nix bu bilgisayarda yok; ilgili biçim
-araçları doğrudan çalıştırıldı.
+## Verimlilikte açık işler
 
-Mac Swift kaynakları değiştirilmedi; Metal/JACCL yolu ve Darwin MLX pin'i korundu.
-Gerekli ortak Python düzeltmeleri ayrı Mac regresyonlarıyla kontrol edildi.
+Salt okunur bağımsız inceleme, Python üretim kodunu `7d11c690` ve masaüstünü
+`23a76e4a` üzerinden sabitledi. Yeni panel/ZIP konusu o incelemede yoktur.
+Batch bellek dönüşümü baytları **%7,3741824 fazla** raporluyor; tam cache
+eşleşmesindeki `prompt_tps` önceki isteğin tarihsel değerini taşıyor. Kısa istem
+tekrarları gereksiz KV cache kopyaları biriktirebilir. Görsel önizlemelerin
+CPU/GPU ağırlık taşıma maliyeti ve gizli pencerelerin durum sorguları henüz
+ölçülmedi. Bu bulgular açık iş olarak tutulur; genel hızlanma oranı çıkarılmadı.
+Yerel rapor:
+`exo/build/acceptance/windows-efficiency-independent-review-20261010.md`.
 
-## GitHub üzerinden takip
+[Küçük RAM–CUDA aktarım deneyi](windows-host-ram-offload-20261010.md) başarılıdır;
+model gerçek VRAM'e zaten sığar. **VRAM'den büyük LLM için üretim offload'u
+kabul edilmiş değildir.**
 
-| Commit                                                     | Değişiklik                                                  |
-| ---------------------------------------------------------- | ----------------------------------------------------------- |
-| [899324be](https://github.com/ovurrsl/exo/commit/899324be) | Patch baytlarını koruma ve yerel çıktıların hariç tutulması |
-| [28c93dec](https://github.com/ovurrsl/exo/commit/28c93dec) | Taşınabilir CUDA runtime ve frozen dosya doğrulaması        |
-| [15651dbb](https://github.com/ovurrsl/exo/commit/15651dbb) | CUDA yeterlilik kontrolü ve karma küme toparlanması         |
-| [0abe5346](https://github.com/ovurrsl/exo/commit/0abe5346) | Süreç sahipliği ve async ayar penceresi                     |
-| [11d15d60](https://github.com/ovurrsl/exo/commit/11d15d60) | Model belleği hatasında tam eksik miktar                    |
-| [e6c21f31](https://github.com/ovurrsl/exo/commit/e6c21f31) | Mac panel düzeni, renkleri ve simgesi                       |
-| [ca6c4da7](https://github.com/ovurrsl/exo/commit/ca6c4da7) | Windows görüntü modeli kapasite hesabı                      |
-| [abe3fdbb](https://github.com/ovurrsl/exo/commit/abe3fdbb) | Windows CI, fiziksel kabul ve inceleme belgeleri            |
+## Kalan kabul
 
-Hepsi [fork windows-native dalına](https://github.com/ovurrsl/exo/tree/windows-native)
-gönderildi. Upstream'e merge veya kararlı yayın yapılmadı.
+- Geliştirme araçları olmayan temiz Windows'ta kurulum, GPU üretimi ve modelleri koruyan kaldırma.
+- Production Settings açıcı, beş sekme/klavye, fiziksel DPI ve birden fazla monitör.
+- İmzalı yayın/updater; güncel kaynakta hosted CI'nin tamamlanması. Önceki Linux Nix NVSHMEM/cuFile paketleme hataları açık.
+- İkinci M1, üç düğüm, VRAM üstü LLM offload ve karma vision/image.
+- Upstream API güvenlik düzeltmelerinin seçili entegrasyonu ve ilgili regresyonlar.
 
-## Şu anda süren işler
+Thunderbolt fiziksel kabulü kullanıcının LAN ile devam etme kararıyla ertelendi;
+[donanım incelemesi](claude-fork-thunderbolt-20261010.md) ve
+[BIOS/PCIe raporu](windows-bios-pcie-20261010.md) tarihsel kanıtı içerir.
 
-1. Önceki runtime'ın native kapıları ve bütünlük doğrulaması geçti; masaüstü/NSIS
-   kurucusu dosya kilidiyle başarısız oldu. Bu snapshot engine SHA-256:
-   `0412c817a9628ef63a833c47c143fc871b0a62c5c2ba4308dc90b1c7ed2cb363`.
-   Yeni manifest SHA-256:
-   `52d6f804b53121d846d1b59a11f7d519febc9d7aabac17eece9d1272058d0f67`.
-   Bu dosya kilidi önceki girişime aittir. `f99234db` GUI ve `7d11c690` runtime
-   kullanan yeni imzasız review kurucusu başarıyla derlendi; yeni paket kurulumu
-   ve native Settings/DPI kabulü ayrıca bekliyor. Yeni artefakt SHA-256:
-   `975cc62d04053edf3d6724831039fca9f541821bae13d09b850926ef872f76c3`.
-2. EXO upstream'in mevcut **280 dalının incelemesi tamamlandı**. Her dalın amacı,
-   `main` farkı, commit/dosya kanıtı ve Windows katkısı
-   [ayrı raporda](upstream-branches-20261010.md). Dallardaki kodlar çalıştırılmadı;
-   otomatik cherry-pick/merge yapılmadı.
+## Kimlik ve tarihsel ayrıntılar
 
-## Sıradaki işler
+- Panel konusu: [`aec96839`](https://github.com/ovurrsl/exo/commit/aec96839e6072f28c3c858e1f0938661ac8b8657).
+- Tanılama gizliliği konusu: [`79d8b986`](https://github.com/ovurrsl/exo/commit/79d8b9863281335188cb3282cc89370b843ace79).
+- Birleşik kaynak: [`79de2150`](https://github.com/ovurrsl/exo/commit/79de2150c1979663b63708c13dc6ddee5709f663).
+- Önceki uygulama/entegrasyon ayrıntıları [entegrasyon raporunda](upstream-integration-20261010.md); eski ilerleme metninin tamamı [sabit tarihsel sürümde](https://github.com/ovurrsl/exo/blob/79de2150c1979663b63708c13dc6ddee5709f663/docs/windows-progress-20261010.md) korunur. Eski sayılar güncel kabul olarak taşınmadı.
 
-1. Yeni binary'de gerçek Windows ayar penceresinin dolu açılmasını, beş sekmeyi,
-   pencere reuse/klavye/modal akışını ve API'nin çalışmasını doğrulamak.
-2. Yeni kurucuyu ayrı Unicode dizinine kurup paket bütünlüğü, GPU sohbeti,
-   düzgün kapanış, orphan worker ve model korumalı kaldırmayı tekrar doğrulamak.
-3. Yeni engine/manifest/installer hash'lerini ve kabul kapsamını rapora kaydetmek.
-   Eski kabul sonuçları otomatik olarak yeni binary'ye aktarılmayacak.
-4. Güncel kaynakların gerekli fiziksel PC–Mac tekrarlarını ve uzun context/cache
-   testlerini tamamlamak; iki cihazdan sonra üç cihaz matrisine geçmek.
-
-## Bekleyen kabul ve yayın şartları
-
-| Bekleyen                                              | Sebep / gerekli kaynak                                                                                              |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| Temiz fiziksel Windows                                | Bu PC geliştirme araçları içeriyor; son kullanıcı kurulumunu tek başına kanıtlamaz                                  |
-| İkinci M1 ve üç cihaz                                 | Önceki fiziksel kabul RTX 5070 + tek M1 kapsamındadır                                                               |
-| Native DPI ve erişilebilirlik                         | Tarayıcı piksel yoğunluğu testleri gerçek Windows monitör/klavye kabulünün yerine geçmez                            |
-| Uzun context ve tüm bellek/failure matrisi            | Kısa sohbet başarısı bütün sınır koşullarını kapsamaz                                                               |
-| Karma tensor parallelism, prefill ve görüntü pipeline | Tek CUDA görüntü/vision ve iki cihaz text PP kabulü ileri karma özellikleri kanıtlamaz                              |
-| İmzalı kurulum/güncelleme                             | Üretim imza anahtarı ve sertifika henüz yapılandırılmadı; yerel aday imzasız                                        |
-| Repo güvenlik denetimi                                | Codex Security önceki çalışmasında kaynak kapsamı 0/911, helper/setup hataları; 0 bulgu güvenli repo demek değildir |
-| MLX P2 socket retry sızıntısı                         | Eski upstream kaynakta başarısız bağlantı denemeleri socket kapatmıyor; ayrı patch/wheel ve tekrar kabulü gerekli   |
-| NVIDIA kapsamını genişletme                           | Güncel `+win.3` yalnız `120a-real;120-virtual`, hedef RTX 5070; diğer nesiller/çoklu GPU kabul edilmedi             |
-
-## Model yükleme hatasının durumu
-
-`Required: 8.3GB, Available: 8.3GB` gerçek bayt değerlerinin yuvarlanmasından
-kaynaklanıyordu. Mesaj düzeltildi; VRAM sınırı kaldırılmadı. Denenen
-`mlx-community/gemma-4-e4b-it-8bit` yaklaşık 8,35 GiB ağırlık gerektiriyor;
-Windows'un 2,5 GiB rezervi ve diğer uygulamaların VRAM kullanımı hesaba katılıyor.
-Bu modelin başarıyla çalıştığı iddiası yok: önceki izole native testte offline
-mod açıktı ve dosyaları yerel cache'te yoktu. Uygun precision/gerçek boş bellek
-ve eşleşen fork sürümündeki Mac katılımı ayrıca doğrulanmalıdır.
-
-## Kullanılan incelemeler
-
-Superpowers doğrulama/plan yürütme ve bağımsız kod incelemeleri; GitHub API ve
-yerel immutable commit karşılaştırması kullanıldı. Claude'un 26 commit/37 dosyalık
-eski Windows çalışması [ayrı raporda](windows-claude-baseline-review.md).
-Context7 güncel bağımlılık belgeleri gereken işlerde yararlıdır; durum sayıları
-yerel test kanıtlarından gelir. Bu rapor yeni bir Codex Security taraması değildir.
+Yerel log ve büyük artefaktlar `build/acceptance/` altında tutulur; kaynak
+deposuna kişisel tam log, model veya kurucu binary'si eklenmez. Güncel test,
+tarama ve kurucu kayıtlarının tam adları [masaüstü kabul belgesindedir](windows-desktop-acceptance-20261010.md).
