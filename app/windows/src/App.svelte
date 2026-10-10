@@ -1125,8 +1125,9 @@
       ></textarea></label
     >
     <p>
-      Export a local diagnostics ZIP and inspect it before attaching it to your
-      issue. Nothing is uploaded automatically.
+      The local diagnostics ZIP omits raw logs, generation requests and error
+      text. Device and network details remain. Inspect it before attaching it to
+      your issue. Nothing is uploaded automatically.
     </p>
     <div class="button-row">
       <button disabled={busy} onclick={exportDiagnostics}
