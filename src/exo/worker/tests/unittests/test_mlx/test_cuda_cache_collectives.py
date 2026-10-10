@@ -129,3 +129,47 @@ def test_lru_divergence_is_detected_before_removing_different_entries():
     ):
         prefix._evict_if_needed()  # pyright: ignore[reportPrivateUsage]
     assert len(prefix.caches) == 1
+
+
+def test_entry_limit_uses_joint_lru_order_without_memory_pressure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(cache, "_MAX_CUDA_PREFIX_CACHE_ENTRIES", 2)
+    prefixes = [cache.KVPrefixCache(_group(), cuda_group=True) for _ in range(2)]
+    with (
+        mx.stream(mx.Device(mx.cpu)),
+        mock.patch.object(cache, "get_memory_used_percentage", lambda: 0.0),
+        mock.patch.object(
+            mx.distributed, "all_gather", _gather_peer(lambda _values: None)
+        ),
+    ):
+        for prefix in prefixes:
+            for token in (1, 2, 1, 3):
+                prefix.add_kv_cache(mx.array([token, 9]), [])
+    assert [tokens.tolist() for tokens in prefixes[0].prompts] == [[1, 9], [3, 9]]
+    assert prefixes[0]._identities == prefixes[1]._identities  # pyright: ignore[reportPrivateUsage]
+    assert prefixes[0]._last_used == prefixes[1]._last_used  # pyright: ignore[reportPrivateUsage]
+
+
+def test_identity_divergence_rejects_refresh_before_mutation():
+    prefix = cache.KVPrefixCache(_group(), cuda_group=True)
+    with (
+        mx.stream(mx.Device(mx.cpu)),
+        mock.patch.object(cache, "get_memory_used_percentage", lambda: 0.0),
+        mock.patch.object(
+            mx.distributed, "all_gather", _gather_peer(lambda _values: None)
+        ),
+    ):
+        prefix.add_kv_cache(mx.array([1, 2]), [], prefill_tps=10.0)
+
+    def peer_identity(values: list[int]) -> None:
+        values[-1] ^= 1
+
+    with (
+        mx.stream(mx.Device(mx.cpu)),
+        mock.patch.object(cache, "get_memory_used_percentage", lambda: 0.0),
+        mock.patch.object(mx.distributed, "all_gather", _gather_peer(peer_identity)),
+        pytest.raises(RuntimeError, match="diverged"),
+    ):
+        prefix.add_kv_cache(mx.array([1, 2]), [], prefill_tps=20.0)
+    assert prefix.prefill_tps == [10.0]

@@ -101,6 +101,29 @@ which the Build Tools install.
 
 ## Checking a wheel
 
+### Native socket ownership regression
+
+`check-tcp-ownership.ps1` compiles `check_tcp_ownership.cpp` with the actual
+`mlx/distributed/utils.cpp` from an explicitly selected patched source tree.
+It does not import MLX or allocate GPU memory. It checks failed retries,
+throwing callbacks, error preservation, move assignment and invalid retry
+counts by comparing Windows process handle counts. `-Loopback` additionally
+checks successful connect/accept and send/receive; this needs loopback access.
+
+```powershell
+.\scripts\windows\mlx\check-tcp-ownership.ps1 -MlxSrc C:\path\to\patched-mlx -VsInstallPath C:\path\to\BuildTools -Loopback
+```
+
+`mlx-windows-ring-v0.32.3-win4.patch` is a full candidate patch against the same
+v0.32.3 commit, with Windows socket ownership fixes. The native source gate
+passes for its socket implementation, including real loopback send/receive.
+No wheel has been built or repinned for this candidate; the active `win.3`
+canonical patch and wheel provenance remain unchanged. Rebuild the candidate
+wheel and run the runtime gates before publishing it.
+The candidate leaves the POSIX branches unchanged. Ring setup
+still detaches sockets into raw vectors; partial multi-address initialization
+and constructor failures need a separate ownership change and regression gate.
+
 [`check-mlx-wheel.ps1`](check-mlx-wheel.ps1) checks the MLX of a Python
 environment (exo's `.venv` by default, or `-Python <path>`):
 
