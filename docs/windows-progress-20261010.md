@@ -15,6 +15,13 @@ strict tip kontrolü temiz. Küçük fiziksel Qwen RAM–CUDA katman aktarımı 
 [ölçüm raporu](windows-host-ram-offload-20261010.md) deneyin sınırlarını açıklar.
 Üretim büyük-model offload'u henüz yok. Kullanıcı Thunderbolt olmadan mevcut LAN
 üzerinden devam etmeyi seçti; Thunderbolt fiziksel kabulü ertelendi.
+[Yeni runtime ve gerçek LAN kabul raporu](windows-lan-acceptance-20261010.md):
+32 frozen runtime kapısı ve 3,09 GB safetensors yükleme; PC + tek M1'de iki ring
+rank sırası, Windows/Mac master üretimi, node stop ve iki iptal/toparlanma geçti.
+Windows 728, gerçek Mac 687 test geçti; atlanan ve slow kapsamlar raporda ayrıdır.
+Test fixture ve Windows Cargo biçimi ayrı commitlerde düzeltildi. `7d11c690`
+için hosted Windows checks beş job'ın tamamında başarılı; sonraki kaynakların
+hosted Nix sonucu ayrıca beklenir. Native Settings ve yeni installer kapıları açık.
 [GPU Gen5 x16 ölçümü ve BIOS/ALT_PCIE_MODE rehberi](windows-bios-pcie-20261010.md).
 Thunderbolt kablo bağlantısı OS seviyesinde aktif eş/NIC oluşturmadı;
 [anakart ve Claude dal incelemesi](claude-fork-thunderbolt-20261010.md) mevcut kanıtı içerir.

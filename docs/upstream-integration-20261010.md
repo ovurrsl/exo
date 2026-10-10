@@ -29,6 +29,17 @@ Yukarıdaki topic dalları ve `work/branch-integration-reports`, ayrı `--no-ff`
 
 Önceki bağımsız incelemenin tek önemli bulgusu `5359b312` odaklı takip incelemesinde kapandı. CI formatter düzeltmesi de ayrı odaklı incelemeden geçti. Bu sonuç Windows geliştirme dalı entegrasyonudur; kararlı release veya güvenlik sertifikası değildir. Kanıt logları `build/acceptance/upstream-integrated-*` ve `integration-review-20261010.md` altında yereldir.
 
+Sonraki fiziksel doğrulama [LAN kabul raporunda](windows-lan-acceptance-20261010.md):
+`7d11c690` kaynaklarından yeniden üretilen runtime 32 native kapıyı ve gerçek
+3.093.767.283 byte yükleme kapısını geçti. Tek M1 ile iki rank/master düzeni,
+node stop ve aktif üretim iptal/toparlanma doğrulandı. Gerçek Mac testinde
+Windows platform fixture'ı eksikti; `work/mac-platform-test-fixture` / `c548f31b`
+ile Mac 687 test geçti. `work/windows-toml-format` / `07c7e2b5` sonraki ayrı
+Taplo TOML hatasını düzeltir; Cargo semantiği aynıdır. İki küçük commit bağımsız
+odaklı incelemeden geçti ve ayrı merge commitleriyle `windows-native`e alındı.
+Bu fiziksel kabul Thunderbolt, ikinci M1/üç cihaz veya production RAM offload
+kabulü olarak sayılmaz; native Settings ve installer hâlâ ayrı kapılardır.
+
 ## Kaynak karar matrisi
 
 | Sabit kaynak                                                                                 | Karar                                   | Gerekçe / bağımlılık                                                                                                                                                        |
