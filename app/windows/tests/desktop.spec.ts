@@ -397,6 +397,172 @@ test("tray shows real cluster data and opens the existing dashboard", async ({
   ).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Settings…" })).toBeVisible();
 });
+test("expanded lists show the Mac core metrics and model status without a second disclosure", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 340, height: 650 });
+  await page.addInitScript(() => {
+    const desktopWindow = window as unknown as {
+      __EXO_TEST_BRIDGE__: (
+        command: string,
+        args: Record<string, unknown>,
+      ) => Promise<unknown>;
+    };
+    const bridge = desktopWindow.__EXO_TEST_BRIDGE__;
+    desktopWindow.__EXO_TEST_BRIDGE__ = async (command, args) => {
+      const result = await bridge(command, args);
+      return command === "cluster_state"
+        ? {
+            ...(result as object),
+            nodeSystem: { windows: { gpuUsage: 0.42, temp: 57 } },
+          }
+        : result;
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Show nodes", exact: true }).click();
+  const node = page.locator(".node").first();
+  await expect(node.locator("summary")).toContainText("42% GPU");
+  await expect(node.locator("summary")).toContainText("57.0 °C");
+  await expect(node.getByRole("progressbar")).toBeVisible();
+  await expect(page.locator(".node").last().locator("summary")).toContainText(
+    "N/A GPU",
+  );
+  await page
+    .getByRole("button", { name: "Show instances", exact: true })
+    .click();
+  await expect(page.locator(".instance summary")).toContainText("Ready");
+  await page.screenshot({ path: test.info().outputPath("mac-core-rows.png") });
+});
+test("settings navigation announces the selected section and supports arrow keys", async ({
+  page,
+}) => {
+  await page.goto("/?view=settings");
+  const navigation = page.getByRole("navigation", {
+    name: "Settings sections",
+  });
+  const general = navigation.getByRole("button", {
+    name: "General",
+    exact: true,
+  });
+  await expect(general).toHaveAttribute("aria-current", "page");
+  await general.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(
+    navigation.getByRole("button", { name: "Model", exact: true }),
+  ).toBeFocused();
+  await expect(
+    navigation.getByRole("button", { name: "Model", exact: true }),
+  ).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("main")).toHaveAccessibleName("Model settings");
+  await page.keyboard.press("End");
+  await expect(
+    navigation.getByRole("button", { name: "About", exact: true }),
+  ).toBeFocused();
+  await page.keyboard.press("ArrowRight");
+  await expect(general).toBeFocused();
+  await page.keyboard.press("Home");
+  await expect(general).toHaveAttribute("aria-current", "page");
+});
+test("stopped panel requests compact height and grows within the work-area cap on start", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("checkbox", { name: "Run EXO" }).uncheck();
+  const height = () =>
+    page.evaluate(() => {
+      const calls = (
+        window as unknown as {
+          __EXO_CALLS__: { command: string; args: { height?: number } }[];
+        }
+      ).__EXO_CALLS__;
+      return (
+        calls.filter((call) => call.command === "resize_panel").at(-1)?.args
+          .height ?? 0
+      );
+    });
+  await expect.poll(height).toBeGreaterThan(200);
+  await expect.poll(height).toBeLessThan(350);
+  const stopped = await height();
+  await page.getByRole("checkbox", { name: "Run EXO" }).check();
+  await expect.poll(height).toBeGreaterThan(stopped);
+  expect(await height()).toBeLessThanOrEqual(650);
+});
+test("running panel shrinks after the node list collapses", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 340, height: 650 });
+  await page.goto("/");
+  const height = () =>
+    page.evaluate(
+      () =>
+        (
+          window as unknown as {
+            __EXO_CALLS__: { command: string; args: { height?: number } }[];
+          }
+        ).__EXO_CALLS__
+          .filter((call) => call.command === "resize_panel")
+          .at(-1)?.args.height ?? 0,
+    );
+  await expect.poll(height).toBeGreaterThan(220);
+  await page.getByRole("button", { name: "Show nodes", exact: true }).click();
+  await expect.poll(height).toBe(650);
+  await page.getByRole("button", { name: "Hide nodes", exact: true }).click();
+  await expect.poll(height).toBeLessThan(650);
+});
+test("distributed model uses one compact status chip instead of repeating every runner", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 340, height: 650 });
+  await page.addInitScript(() => {
+    const desktopWindow = window as unknown as {
+      __EXO_TEST_BRIDGE__: (
+        command: string,
+        args: Record<string, unknown>,
+      ) => Promise<unknown>;
+    };
+    const bridge = desktopWindow.__EXO_TEST_BRIDGE__;
+    desktopWindow.__EXO_TEST_BRIDGE__ = async (command, args) => {
+      const result = await bridge(command, args);
+      if (command !== "cluster_state") return result;
+      return {
+        ...(result as object),
+        topology: {
+          nodes: Array.from({ length: 8 }, (_, i) => `node-${i}`),
+          connections: {},
+        },
+        instances: {
+          first: {
+            MlxRingInstance: {
+              shardAssignments: {
+                modelId: "org/Qwen3",
+                nodeToRunner: Object.fromEntries(
+                  Array.from({ length: 8 }, (_, i) => [
+                    `node-${i}`,
+                    `runner-${i}`,
+                  ]),
+                ),
+              },
+            },
+          },
+        },
+        runners: Object.fromEntries(
+          Array.from({ length: 8 }, (_, i) => [
+            `runner-${i}`,
+            { RunnerReady: {} },
+          ]),
+        ),
+      };
+    };
+  });
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Show instances", exact: true })
+    .click();
+  const chip = page.locator(".status-chip");
+  await expect(chip).toHaveText("Ready");
+  expect((await chip.boundingBox())!.width).toBeLessThan(90);
+});
 test("five settings tabs persist namespace, secure token input and model directories", async ({
   page,
 }) => {

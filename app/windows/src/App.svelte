@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { call } from "./lib/bridge";
   import { modal } from "./lib/modal";
+  import { instanceStatus } from "./lib/presentation";
   import Icon from "./lib/Icon.svelte";
   import {
     formatBytes,
@@ -261,6 +262,22 @@
       y2: end.y - (dy / distance) * 32,
     };
   }
+  function navigateSettings(event: KeyboardEvent, index: number) {
+    const next =
+      event.key === "ArrowRight"
+        ? (index + 1) % tabs.length
+        : event.key === "ArrowLeft"
+          ? (index + tabs.length - 1) % tabs.length
+          : event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? tabs.length - 1
+              : null;
+    if (next === null) return;
+    event.preventDefault();
+    tab = tabs[next];
+    document.getElementById(`settings-section-${tab}`)?.focus();
+  }
   onMount(() => {
     void loadSettings()
       .then(refresh)
@@ -280,10 +297,80 @@
       }
     };
     window.addEventListener("keydown", keyboard);
+    // Measure intrinsic content rather than the viewport-sized flex spacer.
+    // The native command caps it to the current monitor's work area.
+    let panelFrame = 0;
+    let lastPanelHeight = 0;
+    const resizePanel = () => {
+      if (settingsWindow || panelFrame) return;
+      panelFrame = requestAnimationFrame(() => {
+        panelFrame = 0;
+        const panel = document.querySelector<HTMLElement>(".popover");
+        if (!panel) return;
+        const style = getComputedStyle(panel);
+        const children = Array.from(panel.children) as HTMLElement[];
+        const content = children.reduce(
+          (sum, child) =>
+            sum +
+            (child.classList.contains("cluster-scroll")
+              ? Array.from(child.children).reduce((height, section) => {
+                  const sectionStyle = getComputedStyle(section);
+                  return (
+                    height +
+                    section.getBoundingClientRect().height +
+                    parseFloat(sectionStyle.marginTop) +
+                    parseFloat(sectionStyle.marginBottom)
+                  );
+                }, 0)
+              : child.getBoundingClientRect().height +
+                (child.classList.contains("message") ? 16 : 0)),
+          0,
+        );
+        const messages = Array.from(
+          document.querySelectorAll<HTMLElement>(".desktop > .message"),
+        ).reduce(
+          (sum, item) => sum + item.getBoundingClientRect().height + 16,
+          0,
+        );
+        const height = Math.min(
+          650,
+          Math.max(
+            220,
+            Math.ceil(
+              content +
+                messages +
+                parseFloat(style.paddingTop) +
+                parseFloat(style.paddingBottom) +
+                parseFloat(style.rowGap) * Math.max(0, children.length - 1),
+            ),
+          ),
+        );
+        if (height === lastPanelHeight) return;
+        lastPanelHeight = height;
+        void call("resize_panel", { height }).catch(() => {
+          lastPanelHeight = 0;
+        });
+      });
+    };
+    const layoutObserver = new MutationObserver(resizePanel);
+    const sizeObserver = new ResizeObserver(resizePanel);
+    if (!settingsWindow) {
+      layoutObserver.observe(document.querySelector(".desktop")!, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+      });
+      sizeObserver.observe(document.querySelector(".desktop")!);
+      resizePanel();
+    }
     return () => {
       clearInterval(polling);
       clearInterval(welcomeTimer);
       window.removeEventListener("keydown", keyboard);
+      layoutObserver.disconnect();
+      sizeObserver.disconnect();
+      cancelAnimationFrame(panelFrame);
     };
   });
 </script>
@@ -425,25 +512,40 @@
                 >{/if}
             </div>
             {#each visibleNodes as node}<details class="card node">
-                <summary
-                  ><div>
-                    <strong>{node.name}</strong><small
-                      >{node.chip || node.os}</small
-                    >
+                <summary>
+                  <div class="node-heading">
+                    <div>
+                      <strong>{node.name}</strong><small
+                        >{formatBytes(Math.max(0, node.total - node.available))} /
+                        {formatBytes(node.total)}</small
+                      >
+                    </div>
+                    <div class="node-metrics">
+                      <span
+                        >{node.gpu === null
+                          ? "N/A GPU"
+                          : `${Math.round(node.gpu * 100)}% GPU`}</span
+                      ><small
+                        >{node.temperature === null || node.temperature === 0
+                          ? "N/A"
+                          : `${node.temperature.toFixed(1)} °C`}</small
+                      >
+                    </div>
                   </div>
-                  <span
-                    title={node.backends.includes("MlxCuda")
-                      ? "Used and reserved compute memory, including the Windows CUDA runtime safety reserve. This can differ from physical GPU usage."
-                      : "Used compute memory / total compute memory"}
-                    >{formatBytes(node.total - node.available)} / {formatBytes(
-                      node.total,
-                    )}</span
-                  ></summary
-                ><progress
-                  value={Math.max(0, node.total - node.available)}
-                  max={node.total || 1}
-                ></progress>
+                  <progress
+                    aria-label={`${node.name} compute memory usage`}
+                    value={Math.max(0, node.total - node.available)}
+                    max={node.total || 1}
+                  ></progress></summary
+                >
+                <p class="muted">
+                  {node.backends.includes("MlxCuda")
+                    ? "Compute memory includes the CUDA runtime safety reserve; it can differ from physical GPU usage."
+                    : "Memory available to this device for inference."}
+                </p>
                 <dl>
+                  <dt>Chip</dt>
+                  <dd>{node.chip || "Unknown"}</dd>
                   <dt>CPU</dt>
                   <dd>
                     {node.cpu === null
@@ -490,17 +592,37 @@
                   >{showAllInstances ? "Hide" : "Show"}</button
                 >{/if}
             </div>
-            {#each visibleInstances as instance}<details class="card">
+            {#each visibleInstances as instance}
+              {@const status = instanceStatus(
+                instance.status,
+                currentDownloads.some(
+                  (download) =>
+                    download.kind === "Ongoing" &&
+                    download.model === instance.model &&
+                    instance.nodes.includes(download.node),
+                ),
+              )}
+              <details class="card instance">
                 <summary
-                  ><div>
-                    <strong>{instance.model.split("/").at(-1)}</strong><small
-                      >{instance.nodes.length} node(s) · {instance.kind.replace(
-                        "Instance",
-                        "",
-                      )}</small
+                  ><div class="instance-heading">
+                    <div>
+                      <strong>{instance.model.split("/").at(-1)}</strong><small
+                        >{instance.nodes.length} node(s) · {instance.kind.replace(
+                          "Instance",
+                          "",
+                        )}</small
+                      >
+                    </div>
+                    <span class={`status-chip ${status.kind}`}
+                      >{status.label}</span
                     >
-                  </div></summary
-                >
+                  </div>
+                  {#each instance.tasks.filter((item) => item.error) as item}<p
+                      class="error-text task-error"
+                    >
+                      {item.error}
+                    </p>{/each}
+                </summary>
                 <p class="muted">{instance.status}</p>
                 {#each instance.tasks as item}<button
                     class="task"
@@ -629,8 +751,12 @@
     </main>
   {:else}
     <nav class="tabs" aria-label="Settings sections">
-      {#each tabs as name}<button
+      {#each tabs as name, index}<button
+          id={`settings-section-${name}`}
+          aria-current={tab === name ? "page" : undefined}
+          aria-controls="settings-section-content"
           class:active={tab === name}
+          onkeydown={(event) => navigateSettings(event, index)}
           onclick={() => (tab = name)}
           ><Icon
             name={name === "General" ? "settings" : name.toLowerCase()}
@@ -638,7 +764,11 @@
           /><span>{name}</span></button
         >{/each}
     </nav>
-    <main class="settings-content">
+    <main
+      id="settings-section-content"
+      class="settings-content"
+      aria-label={`${tab} settings`}
+    >
       {#if settings}
         {#if tab === "General"}
           <section class="form-section">
