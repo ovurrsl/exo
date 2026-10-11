@@ -25,8 +25,8 @@ def model(name: str, size: int, *, base: str = "Qwen3 32B") -> ModelCard:
     return ModelCard(
         model_id=ModelId(name),
         storage_size=Memory.from_bytes(size),
-        n_layers=40,
-        hidden_size=4096,
+        n_layers=64,
+        hidden_size=5120,
         supports_tensor=True,
         tasks=[ModelTask.TextGeneration],
         backends=[Backend.MlxCuda],
@@ -56,10 +56,10 @@ def local_api(available: int) -> API:
 async def test_capacity_prefers_exact_vram_then_qualified_ram_offload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    api = local_api(2 * 1024**3)
+    api = local_api(8 * 1024**3)
     cards = [
-        model("test/exact", 2 * 1024**3),
-        model("test/offload", 20 * 1024**3),
+        model("test/exact", 8 * 1024**3),
+        model("mlx-community/Qwen3-32B-4bit", 20 * 1024**3),
         model("test/unsupported", 20 * 1024**3, base="Qwen3.5 27B"),
         model("mlx-community/Qwen3-30B-A3B-4bit", 20 * 1024**3, base="Qwen3 30B"),
     ]
@@ -78,13 +78,14 @@ async def test_capacity_prefers_exact_vram_then_qualified_ram_offload(
     response = await api.get_windows_model_capacity()
     assert response["models"]["test/exact"] == {
         "mode": "vram",
-        "required_bytes": 2 * 1024**3,
-        "available_bytes": 2 * 1024**3,
+        "required_bytes": 8 * 1024**3,
+        "available_bytes": 8 * 1024**3,
     }
-    assert response["models"]["test/offload"] == {
+    assert response["models"]["mlx-community/Qwen3-32B-4bit"] == {
         "mode": "ram_offload",
-        "required_bytes": 3 * (20 * 1024**3 // 40),
-        "available_bytes": 2 * 1024**3,
+        # The head's three-copy initialization peak dominates staging here.
+        "required_bytes": 6_585_794_560,
+        "available_bytes": 8 * 1024**3,
     }
     assert response["models"]["test/unsupported"]["mode"] == "unavailable"
     assert (
@@ -115,6 +116,7 @@ async def test_non_windows_cuda_returns_empty_without_catalog_reads(
         (False, 64 * 1024**3, 2 * 1024**3),
         (True, 1, 2 * 1024**3),
         (True, 64 * 1024**3, 1),
+        (True, 64 * 1024**3, 2 * 1024**3),
     ],
 )
 async def test_capacity_rejects_disabled_offload_or_insufficient_host_and_gpu(
@@ -128,7 +130,7 @@ async def test_capacity_rejects_disabled_offload_or_insufficient_host_and_gpu(
     monkeypatch.setattr(
         card_cache,
         "list_all",
-        AsyncMock(return_value=[model("test/offload", 20 * 1024**3)]),
+        AsyncMock(return_value=[model("mlx-community/Qwen3-32B-4bit", 20 * 1024**3)]),
     )
     monkeypatch.setattr(
         api_module,
@@ -141,7 +143,7 @@ async def test_capacity_rejects_disabled_offload_or_insufficient_host_and_gpu(
         api_module.psutil, "virtual_memory", lambda: HostMemory(host_available)
     )
     response = await api.get_windows_model_capacity()
-    assert response["models"]["test/offload"]["mode"] == "unavailable"
+    assert response["models"]["mlx-community/Qwen3-32B-4bit"]["mode"] == "unavailable"
 
 
 def test_private_capacity_route_serializes_without_state_changes(

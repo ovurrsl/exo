@@ -27,8 +27,6 @@ def local_windows_text_offload_policy() -> WindowsTextOffloadPolicy | None:
 
 
 def is_windows_text_offload_card(card: ModelCard) -> bool:
-    # Catalog MoE cards use generic names such as "Qwen3 30B"; a numeric
-    # family-name regex alone would advertise unsupported expert staging.
     dense_bases = {
         "Qwen3 0.6B",
         "Qwen3 1.7B",
@@ -44,6 +42,21 @@ def is_windows_text_offload_card(card: ModelCard) -> bool:
         and card.quantization == "4bit"
         and card.base_model in dense_bases
     )
+
+
+def _has_audited_catalogue_geometry(card: ModelCard) -> bool:
+    # Only audited stock cards provide the uniform decoder / quantized head
+    # assumptions needed by the catalogue estimate. A family label alone cannot
+    # certify a custom model's vocabulary, head dtype or largest decoder.
+    profiles = {
+        "mlx-community/Qwen3-0.6B-4bit": ("Qwen3 0.6B", 28, 1024),
+        "mlx-community/Qwen3-32B-4bit": ("Qwen3 32B", 64, 5120),
+    }
+    return profiles.get(str(card.model_id)) == (
+        card.base_model,
+        card.n_layers,
+        card.hidden_size,
+    ) and card.num_key_value_heads in (None, 8)
 
 
 def cuda_text_memory_requirement(
@@ -64,13 +77,17 @@ def cuda_text_memory_requirement(
         or local_node_id not in windows_node_ids
         or Backend.MlxCuda not in node_backends.get(local_node_id, [])
         or not is_windows_text_offload_card(card)
+        or not _has_audited_catalogue_geometry(card)
     ):
         return None
     offload_policy.validate()
     storage = card.storage_size.in_bytes
-    bits = 4
     decoder = (storage + card.n_layers - 1) // card.n_layers
-    largest = max(decoder, (151936 * card.hidden_size * bits * 5 + 31) // 32)
+    # Affine 4-bit head with group32 and FP32 scales/biases is an upper bound
+    # for the audited group32/group64 stock head, including BF16 storage.
+    head = (151936 * card.hidden_size * 3 + 3) // 4
+    norm = card.hidden_size * 4
+    largest = max(decoder, head)
     if host_available_bytes is None:
         host_available_bytes = int(psutil.virtual_memory().available)
     required_host = storage + 6 * largest + offload_policy.host_reserve_bytes
@@ -83,10 +100,19 @@ def cuda_text_memory_requirement(
         or required_host > host_available_bytes
     ):
         raise ValueError("Windows text offload host memory budget is insufficient")
-    required = 3 * decoder
+    # Use FP32 KV as the conservative supported storage width. The runtime uses
+    # the actual tensors. Its padded cache and two-layer growth scratch are
+    # separate from the runtime reserve already deducted from reported VRAM.
+    layer_kv = 2 * 8 * 128 * (offload_policy.max_context_tokens + 255) * 4
+    required = (
+        max(3 * head, head + norm + 3 * decoder)
+        + layer_kv * (card.n_layers + 2)
+        + 256 * 1024**2
+    )
     if offload_policy.stage_limit_bytes and decoder > offload_policy.stage_limit_bytes:
         raise ValueError("Windows text offload stage memory budget is insufficient")
-    # The reported CUDA capacity already excludes the runtime/KV reserve.
+    # Reported CUDA capacity already excludes the 2.5 GiB runtime reserve;
+    # the explicit padded KV budget above must still be included.
     return Memory.from_bytes(required)
 
 
