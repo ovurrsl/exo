@@ -14,6 +14,7 @@ from mlx_lm.models.qwen3 import ModelArgs
 
 from exo.shared.types.memory import Memory
 from exo.utils.windows_gpu import GpuMemory
+from exo.utils.windows_text_offload_config import WINDOWS_TEXT_PHYSICAL_HEADROOM_BYTES
 from exo.worker.engines.mlx import windows_text_offload as offload
 
 _mock_gpu_budget: list[int] | None = None
@@ -51,7 +52,7 @@ def _overflow_capacity(
         + 3 * max(offload.parameter_bytes(layer) for layer in original.model.layers)
     )
     return (
-        256 * 1024**2  # Physical headroom is planning-only, separate from reserves.
+        WINDOWS_TEXT_PHYSICAL_HEADROOM_BYTES
         + policy.gpu_reserve_bytes
         + layer_kv * (len(original.model.layers) + 2)
         + max(required, 3 * offload.parameter_bytes(head))
@@ -184,6 +185,89 @@ def test_mandatory_gpu_head_fails_instead_of_cpu_fallback(
         _prepare(_model(), _policy())
 
 
+def test_fresh_cache_has_bounded_capacity_before_decoder_staging(
+    cpu_staging: None,
+) -> None:
+    wrapped = _prepare(_model(), replace(_policy(), max_context_tokens=513))
+    cache = [KVCache(), KVCache()]
+    wrapped.staging.register_cache_pool(cache)
+    for entry in cache:
+        assert entry.keys is not None and entry.values is not None
+        assert entry.keys is not entry.values
+        assert entry.keys.shape == entry.values.shape == (1, 2, 768, 16)
+        assert entry.offset == 0
+    cache_capacities = wrapped.staging.cache_credits.copy()
+    owners = [(id(entry.keys), id(entry.values)) for entry in cache]
+    wrapped.staging.register_cache_pool(cache)
+    assert owners == [(id(entry.keys), id(entry.values)) for entry in cache]
+    _forward(wrapped, [1, 2], cache)
+    assert wrapped.staging.cache_credits == cache_capacities
+
+
+def test_cache_allocation_failure_releases_partial_pool(
+    cpu_staging: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapped = _prepare(_model(), _policy())
+    cache = [KVCache(), KVCache()]
+    original = mx.zeros
+    calls = 0
+
+    def fail_third(*args: object, **kwargs: object) -> mx.array:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise MemoryError("injected-cache-allocation")
+        return original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(mx, "zeros", fail_third)
+    with pytest.raises(MemoryError, match="injected-cache-allocation"):
+        wrapped.staging.register_cache_pool(cache)
+    assert all(entry.keys is None and entry.values is None for entry in cache)
+    assert wrapped.staging.cache_pool_ids is None
+    assert wrapped.staging.cache_credits == [0, 0]
+    monkeypatch.setattr(mx, "zeros", original)
+    wrapped.staging.register_cache_pool(cache)
+    assert all(entry.keys is not None and entry.values is not None for entry in cache)
+
+
+def test_cache_evaluation_failure_releases_pool(
+    cpu_staging: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapped = _prepare(_model(), _policy())
+    cache = [KVCache(), KVCache()]
+    original = mx.eval
+
+    def fail_evaluation(*args: object) -> None:
+        raise RuntimeError("injected-cache-evaluation")
+
+    monkeypatch.setattr(mx, "eval", fail_evaluation)
+    with pytest.raises(RuntimeError, match="injected-cache-evaluation"):
+        wrapped.staging.register_cache_pool(cache)
+    assert all(entry.keys is None and entry.values is None for entry in cache)
+    assert wrapped.staging.cache_pool_ids is None
+    assert wrapped.staging.cache_credits == [0, 0]
+    monkeypatch.setattr(mx, "eval", original)
+    wrapped.staging.register_cache_pool(cache)
+    assert all(entry.keys is not None and entry.values is not None for entry in cache)
+
+
+def test_fresh_cache_still_requires_actual_free_gpu_capacity(
+    cpu_staging: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapped = _prepare(_model(), _policy())
+    cache = [KVCache(), KVCache()]
+    monkeypatch.setattr(
+        offload,
+        "read_gpu_memory",
+        lambda: GpuMemory(Memory.from_gb(12), Memory.from_bytes(1)),
+    )
+    with pytest.raises(MemoryError, match="remaining dedicated"):
+        wrapped.staging.register_cache_pool(cache)
+    assert all(entry.keys is None and entry.values is None for entry in cache)
+    assert wrapped.staging.cache_pool_ids is None
+    assert wrapped.staging.cache_credits == [0, 0]
+
+
 def test_owned_cache_credit_uses_capacity_and_resets_on_settle(
     cpu_staging: None,
 ) -> None:
@@ -266,6 +350,8 @@ def test_invalid_canonical_cache_never_receives_credit(
     wrapped = _prepare(_model(), _policy())
     cache = [KVCache(), KVCache()]
     wrapped.staging.register_cache_pool(cache)
+    other_credit = wrapped.staging.cache_credits[1]
+    wrapped.staging.cache_credits[0] = 0
     keys = mx.zeros((1, 2, 256, 16), dtype=mx.float32)
     values = mx.zeros_like(keys)
     if invalid == "dtype":
@@ -284,7 +370,7 @@ def test_invalid_canonical_cache_never_receives_credit(
     mx.eval(keys, values)
     with pytest.raises(ValueError, match="dtype|capacity"):
         wrapped.staging.record_cache_credit(0, cache[0])
-    assert wrapped.staging.cache_credits == [0, 0]
+    assert wrapped.staging.cache_credits == [0, other_credit]
 
 
 def test_resident_weights_do_not_copy_per_token(
@@ -876,13 +962,16 @@ def test_physical_headroom_keeps_logical_fit_from_filling_resident_prefix(
     inner = cast(offload._QwenModel, cast(object, model)).model  # pyright: ignore[reportPrivateUsage]
     layer_bytes = offload.parameter_bytes(inner.layers[0])
     logical_free = (
-        _overflow_capacity(model, _policy()) - 256 * 1024**2 + 2 * layer_bytes
+        _overflow_capacity(model, _policy())
+        - WINDOWS_TEXT_PHYSICAL_HEADROOM_BYTES
+        + 2 * layer_bytes
     )
     monkeypatch.setattr(
         offload,
         "read_gpu_memory",
         lambda: GpuMemory(
-            Memory.from_gb(12), Memory.from_bytes(256 * 1024**2 + logical_free)
+            Memory.from_gb(12),
+            Memory.from_bytes(WINDOWS_TEXT_PHYSICAL_HEADROOM_BYTES + logical_free),
         ),
     )
     wrapped = _prepare(model, _policy())

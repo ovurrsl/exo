@@ -12,6 +12,7 @@ from exo.shared.types.memory import Memory
 from exo.shared.types.worker.instances import Instance, MlxRingInstance
 from exo.shared.types.worker.shards import PipelineShardMetadata
 from exo.utils.windows_text_offload_config import (
+    WINDOWS_TEXT_PHYSICAL_HEADROOM_BYTES,
     WindowsTextOffloadPolicy,
     read_windows_text_offload_policy,
 )
@@ -107,7 +108,7 @@ def cuda_text_memory_requirement(
     required = (
         max(3 * head, head + norm + 3 * decoder)
         + layer_kv * (card.n_layers + 2)
-        + 256 * 1024**2
+        + WINDOWS_TEXT_PHYSICAL_HEADROOM_BYTES
     )
     if offload_policy.stage_limit_bytes and decoder > offload_policy.stage_limit_bytes:
         raise ValueError("Windows text offload stage memory budget is insufficient")
