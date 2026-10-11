@@ -28,15 +28,54 @@ class OffloadOptions(TypedDict):
 
 def card(base: str = "Qwen3 32B") -> ModelCard:
     return ModelCard(
-        model_id=ModelId("test/Qwen3-32B-4bit"),
+        model_id=ModelId("mlx-community/Qwen3-32B-4bit"),
         storage_size=Memory.from_gb(20),
-        n_layers=40,
-        hidden_size=4096,
+        n_layers=64,
+        hidden_size=5120,
         supports_tensor=True,
         tasks=[ModelTask.TextGeneration],
         backends=[Backend.MlxCuda],
         base_model=base,
         quantization="4bit",
+    )
+
+
+def test_offload_admission_includes_mandatory_head_kv_and_allocation_margin() -> None:
+    local = NodeId()
+    model = card().model_copy(update={"n_layers": 64, "hidden_size": 5120})
+    policy = WindowsTextOffloadPolicy(
+        enabled=True, host_limit_bytes=64 * 1024**3, stage_limit_bytes=1024**3
+    )
+    required = cuda_text_memory_requirement(
+        model,
+        [local],
+        {local: [Backend.MlxCuda]},
+        {local},
+        offload_policy=policy,
+        local_node_id=local,
+        host_available_bytes=64 * 1024**3,
+    )
+    # Even BF16 KV alone exceeds the old three-layer-only estimate.
+    bf16_kv = 2 * 8 * 128 * (8192 + 255) * 2 * 64
+    assert required is not None
+    assert required.in_bytes > bf16_kv + 256 * 1024**2
+
+
+def test_modified_stock_geometry_is_not_advertised_as_qualified_offload() -> None:
+    local = NodeId()
+    assert (
+        cuda_text_memory_requirement(
+            card().model_copy(update={"hidden_size": 4096}),
+            [local],
+            {local: [Backend.MlxCuda]},
+            {local},
+            offload_policy=WindowsTextOffloadPolicy(
+                enabled=True, host_limit_bytes=64 * 1024**3, stage_limit_bytes=1024**3
+            ),
+            local_node_id=local,
+            host_available_bytes=64 * 1024**3,
+        )
+        is None
     )
 
 
@@ -49,9 +88,11 @@ def test_only_local_enabled_dense_windows_cuda_qualifies() -> None:
     options = OffloadOptions(
         offload_policy=policy, local_node_id=local, host_available_bytes=64 * 1024**3
     )
-    assert cuda_text_memory_requirement(
+    requirement = cuda_text_memory_requirement(
         model, [local], {local: [Backend.MlxCuda]}, {local}, **options
-    ) == Memory.from_gb(1.5)
+    )
+    assert requirement is not None
+    assert requirement > Memory.from_gb(4)
     cases: tuple[tuple[list[NodeId], set[NodeId], str], ...] = (
         ([remote], {remote}, "Qwen3 32B"),
         ([local, remote], {local}, "Qwen3 32B"),
@@ -136,7 +177,7 @@ def test_full_singleton_placement_exceeds_vram_without_mutating_storage() -> Non
         ),
         topology,
         instances,
-        {local: create_node_memory(2 * 1024**3)},
+        {local: create_node_memory(8 * 1024**3)},
         {local: create_node_network()},
         {local: [Backend.MlxCuda]},
     )
@@ -154,7 +195,7 @@ def test_full_singleton_placement_exceeds_vram_without_mutating_storage() -> Non
     shard = next(
         iter(next(iter(placements.values())).shard_assignments.runner_to_shard.values())
     )
-    assert (shard.start_layer, shard.end_layer, shard.world_size) == (0, 40, 1)
+    assert (shard.start_layer, shard.end_layer, shard.world_size) == (0, 64, 1)
     assert shard.model_card.storage_size == Memory.from_gb(20)
     with pytest.raises(ValueError, match="sufficient memory"):
         place_instance(
