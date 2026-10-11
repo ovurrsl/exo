@@ -84,7 +84,7 @@ async def test_capacity_prefers_exact_vram_then_qualified_ram_offload(
     assert response["models"]["mlx-community/Qwen3-32B-4bit"] == {
         "mode": "ram_offload",
         # The head's three-copy initialization peak dominates staging here.
-        "required_bytes": 6_585_794_560,
+        "required_bytes": 6_854_230_016,
         "available_bytes": 8 * 1024**3,
     }
     assert response["models"]["test/unsupported"]["mode"] == "unavailable"

@@ -6,6 +6,11 @@ from dataclasses import dataclass
 
 import psutil
 
+# Planning-only physical allocation slack, shared by admission and the loader.
+# RTX 5070 long-prefill probes measured up to 471 MiB of stranded CUDA pool
+# reservation. Actual free VRAM is still checked before each decoder stage.
+WINDOWS_TEXT_PHYSICAL_HEADROOM_BYTES = 512 * 1024**2
+
 
 @dataclass(frozen=True)
 class WindowsTextOffloadPolicy:

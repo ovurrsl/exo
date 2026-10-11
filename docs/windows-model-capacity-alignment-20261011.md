@@ -3,7 +3,7 @@
 Model listesi ve yerleştirme aynı `cuda_text_memory_requirement` fonksiyonunu
 kullanıyor. Önceki RAM offload hesabı yalnız üç ortalama decoder katmanını
 sayıyordu. Gerçek yükleyicinin zorunlu GPU head/norm'u, head başlangıç tahsis
-tepesi, padded KV cache'i, iki katmanlık KV büyüme geçicileri ve 256 MiB tahsis
+tepesi, padded KV cache'i, iki katmanlık KV büyüme geçicileri ve fiziksel tahsis
 payı eksikti. Bu nedenle yeterli RAM bulunan bir PC, GPU kapasitesi yetersizken
 modeli sarı gösterebiliyordu.
 
@@ -12,6 +12,12 @@ Yeni katalog tahmini bu kalemleri içeriyor. Bildirilen GPU kapasitesinden
 affine 4-bit/group32/FP32 scale-bias head üst sınırı kullanılıyor; gerçek
 yükleyici kendi tensor boyutları ve güncel NVML değeriyle son kontrolü yapıyor.
 Context limiti arttıkça katalogda gereken GPU kapasitesi de artıyor.
+
+Uzun bağlam incelemesinde fiziksel tahsis payı 512 MiB olarak ortak sabite
+alındı. Katalog bunu ekler, yükleyici yerleşim hesabında bir kez çıkarır;
+runtime rezervine tekrar eklenmez. KV alanı isteğin başında GPU üzerinde
+context sınırına kadar ayrılır. Bu, katman aktarımıyla iç içe büyüyen KV
+tahsislerinin CUDA havuzunda kullanılmayan alan bırakmasını azaltır.
 
 Tahmin denetlenmiş `mlx-community/Qwen3-0.6B-4bit` ve
 `mlx-community/Qwen3-32B-4bit` stok ID/geometrileriyle sınırlı. Key/value head

@@ -25,6 +25,9 @@ from exo.utils.windows_residency import (
     validate_stage_capacity,
 )
 from exo.utils.windows_text_offload_config import (
+    WINDOWS_TEXT_PHYSICAL_HEADROOM_BYTES,
+)
+from exo.utils.windows_text_offload_config import (
     WindowsTextOffloadPolicy as WindowsTextOffloadPolicy,
 )
 from exo.utils.windows_weights import parameter_bytes
@@ -33,12 +36,8 @@ from exo.worker.engines.mlx.types import KVCacheType
 type ParameterTree = mx.array | list[ParameterTree] | dict[str, ParameterTree]
 type AttentionMask = mx.array | str | None
 
-# Planning-only slack for physical CUDA allocation overhead. The RTX 5070
-# acceptance probe measured ~39 MB beyond parameter bytes and a ~28 MB stage
-# deficit at an otherwise logical fit. This bounded allowance is not a universal
-# driver guarantee; every stage still checks actual free VRAM. Do not also add it
-# to the remaining reserve, which would consume the slack a second time.
-_PHYSICAL_GPU_HEADROOM_BYTES = 256 * 1024**2
+# Do not add planning slack to remaining_reserve: that would spend it twice.
+_PHYSICAL_GPU_HEADROOM_BYTES = WINDOWS_TEXT_PHYSICAL_HEADROOM_BYTES
 
 
 class _CudaCacheLease:
@@ -265,7 +264,7 @@ class _LayerStaging:
 
     def register_cache_pool(self, cache: KVCacheType) -> None:
         identifiers = tuple(id(entry) for entry in cache)
-        if len(set(identifiers)) != len(identifiers):
+        if len(cache) != len(self.layers) or len(set(identifiers)) != len(identifiers):
             raise ValueError("Residency requires unique cache owners per layer")
         if identifiers != self.cache_pool_ids:
             if any(
@@ -280,6 +279,47 @@ class _LayerStaging:
                 )
             self.cache_pool_ids = identifiers
             self.cache_credits = [0] * len(self.layers)
+            try:
+                largest_overflow = max(
+                    (layer.bytes for layer in self.layers if layer.host_parameters),
+                    default=0,
+                )
+                _check_gpu_capacity(
+                    largest_overflow, self.policy, self.remaining_reserve()
+                )
+                # Growing/interleaving KV and staged weights strands CUDA pool
+                # segments. Reserve the bounded canonical KV owners once instead.
+                # Their physical bytes are already included in the unchanged plan.
+                capacity = ((self.policy.max_context_tokens + 255) // 256) * 256
+                shape = (1, self.kv_heads, capacity, self.head_dim)
+                with mx.stream(self.stream):
+                    for entry in cache:
+                        entry.keys = mx.zeros(
+                            shape, dtype=self.cache_dtype, stream=self.stream
+                        )
+                        entry.values = mx.zeros(
+                            shape, dtype=self.cache_dtype, stream=self.stream
+                        )
+                    mx.eval(
+                        *[
+                            value
+                            for entry in cache
+                            for value in (entry.keys, entry.values)
+                        ]
+                    )
+                    mx.synchronize(self.stream)
+                for index, entry in enumerate(cache):
+                    self.record_cache_credit(index, cast(KVCache, entry))
+            except BaseException:
+                try:
+                    mx.synchronize(self.stream)
+                finally:
+                    for entry in cache:
+                        entry.keys = None
+                        entry.values = None
+                    self.clear_cache_credit()
+                    mx.clear_cache()
+                raise
 
     def clear_cache_credit(self) -> None:
         self.cache_pool_ids = None
