@@ -41,3 +41,28 @@ politikasına dokunulmaması; worker tokenizer güvenlik yolunun korunması.
 Kaynak doğrulaması: **902 test geçti, 8 atlandı, 195 slow test dışlandı**.
 Windows/Darwin strict type check sıfır hata ve uyarı; Ruff ve 338 dosyanın
 biçim kontrolü geçti. Atlanan kontroller donanım kabulü olarak sayılmadı.
+
+## Paket ve çalışan uygulama
+
+`bbe0490b` kaynağından üretilen frozen runtime **32 zorunlu kapıyı geçti**:
+CUDA, derleyicisiz CPU/GPU, gerçek 5,36 GB safetensors dosyası, ring ve süreç
+çıkışı. Runtime SHA-256:
+`80328e943fb293ad34f542378b2000a85194c0bcb6cb9d303c4a0c343da2bbe7`.
+11.441 dosyanın manifest kontrolü kaynak paket ve iki masaüstü kopyasında geçti.
+Yeni runtime hash'ine bağlı yardımcı ve masaüstü yeniden derlendi.
+
+Normal kullanıcı uygulaması 52415 üzerinde açıldı; dinleyici backend'in kendi
+GUI'sinin alt süreci ve doğru runtime yolu/hash'i olduğu doğrulandı. Düğüm
+keşfi tamamlandıktan sonra gerçek kapasite API'si 32B için `ram_offload`,
+**6.585.794.560 bayt gerekli**, **8.910.364.672 bayt kullanılabilir** bildirdi.
+Kullanılabilir değer canlı ölçümdür; sabit kapasite garantisi değildir.
+İlk HTTP yanıtı bellek ölçümlerinden önce gelebilir; kabul kontrolü yalnız
+HTTP 200 ile yetinmeyip beklenen düğüm/capability bilgisini de bekledi.
+Kayıt: `build/windows-runtime/normal-gui-capacity-bbe0490b.json`.
+
+Aktif model bulunmadığı kontrol edilerek yalnız sahip olunan GUI/backend
+kapatıldı. Eski runtime ve GUI workspace içinde yedeklendi. Sohbetler, modeller,
+ayarlar ve tasarım kaynakları değiştirilmedi. Bu paket için 32B sohbet QA'sı
+tekrar çalıştırılmadı; önceki cevap doğruluğu/fiziksel yerleşim kabulü ayrı
+rapordadır ve ilgili inference kaynakları bu değişiklikte değişmedi.
+İmzalı installer, temiz tüketici sistemi ve Mac kümesi yayın kabulü değildir.
