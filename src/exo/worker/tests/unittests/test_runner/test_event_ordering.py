@@ -126,6 +126,7 @@ class MockLoadOutput:
 def patch_out_mlx(monkeypatch: pytest.MonkeyPatch):
     # initialize_mlx returns a mock group
     monkeypatch.setattr(mlx_builder, "initialize_mlx", make_nothin(MockGroup()))
+    monkeypatch.setattr(mlx_builder, "discover_cuda_cache_group", make_nothin(False))
 
     def lmi_gen():
         yield MockLoadOutput(1, 1)

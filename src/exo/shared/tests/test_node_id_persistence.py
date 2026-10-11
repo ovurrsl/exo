@@ -1,6 +1,7 @@
 import contextlib
 import multiprocessing
 import os
+import sys
 from multiprocessing import Event, Queue, Semaphore
 from multiprocessing.process import BaseProcess
 from multiprocessing.queues import Queue as QueueT
@@ -28,6 +29,8 @@ def _get_keypair_concurrent_subprocess_task(
 
 def _get_keypair_concurrent(num_procs: int) -> bytes:
     assert num_procs > 0
+    if sys.platform == "win32":
+        raise RuntimeError("The node-ID concurrency test requires POSIX fork")
 
     sem = Semaphore(0)
     ev = Event()

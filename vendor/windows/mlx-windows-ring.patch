@@ -1,0 +1,754 @@
+diff --git a/mlx/backend/cpu/jit_compiler.cpp b/mlx/backend/cpu/jit_compiler.cpp
+index 530637e551d437838f3c40d1f0e39f089807aecb..8b21f509ee0d8fc409c2e69d34f1001c54bd417a 100644
+--- a/mlx/backend/cpu/jit_compiler.cpp
++++ b/mlx/backend/cpu/jit_compiler.cpp
+@@ -44,6 +44,8 @@ struct VisualStudioInfo {
+     // Get path of Visual Studio.
+     // Use -latest to get only the most recent installation when multiple
+     // versions are installed, avoiding path concatenation issues.
++    // -products * also matches the standalone Build Tools, which vswhere
++    // skips by default; -requires makes sure the C++ toolchain is installed.
+     auto pf86 = std::getenv("ProgramFiles(x86)");
+     if (!pf86) {
+       throw std::runtime_error(
+@@ -52,8 +54,11 @@ struct VisualStudioInfo {
+     std::string vs_path = JitCompiler::exec(
+         fmt::format(
+             "\"{0}\\Microsoft Visual Studio\\Installer\\vswhere.exe\""
+-            " -latest -property installationPath 2>&1",
+-            pf86));
++            " -latest -products *"
++            " -requires Microsoft.VisualStudio.Component.VC.Tools.{1}"
++            " -property installationPath 2>&1",
++            pf86,
++            arch == "arm64" ? "ARM64" : "x86.x64"));
+     if (vs_path.empty()) {
+       throw std::runtime_error("Can not find Visual Studio.");
+     }
+diff --git a/mlx/backend/cuda/CMakeLists.txt b/mlx/backend/cuda/CMakeLists.txt
+index 50be6f404fc98d67615db5e758306e154f7be2af..8b140aa6709c681a98d30bb3e3e62b938a6e85c5 100644
+--- a/mlx/backend/cuda/CMakeLists.txt
++++ b/mlx/backend/cuda/CMakeLists.txt
+@@ -205,6 +205,11 @@ if(WIN32)
+     if("${MLX_CUDNN_BIN_DIR}" STREQUAL "")
+       set(MLX_CUDNN_BIN_DIR "${CUDNN_BIN_DIR}")
+     endif()
++  elseif(CUDAToolkit_VERSION_MAJOR GREATER_EQUAL 13)
++    # The CUDA 13 wheels put all DLLs except cuDNN in one dir.
++    if("${MLX_CUDA_BIN_DIR}" STREQUAL "")
++      set(MLX_CUDA_BIN_DIR "../nvidia/cu13/bin/x86_64")
++    endif()
+   endif()
+ 
+   function(mlx_add_dir_definition name)
+diff --git a/mlx/backend/cuda/delayload.cpp b/mlx/backend/cuda/delayload.cpp
+index 44f6d163c6e9b65e6acf84dc2012fdef4b6b9cc5..28637e04d10d0a328eb7eddef76c100904dae26b 100644
+--- a/mlx/backend/cuda/delayload.cpp
++++ b/mlx/backend/cuda/delayload.cpp
+@@ -2,6 +2,9 @@
+ 
+ #include "mlx/backend/common/utils.h"
+ 
++#include <cstdio>
++#include <mutex>
++
+ // clang-format off
+ #include <windows.h> // must be included first
+ #include <delayimp.h>
+@@ -26,6 +29,45 @@ inline fs::path cublas_dir() {
+   return relative_to_current_binary("../nvidia/cublas/bin");
+ }
+ 
++// CUDA libs load other DLLs by name with the standard search order, which
++// ignores AddDllDirectory, so put the dirs of CUDA libs in PATH.
++void add_dirs_to_path() {
++  static std::once_flag flag;
++  std::call_once(flag, []() {
++    std::vector<fs::path> dirs;
++    if (const char* dir = cudnn_bin_dir()) {
++      dirs.emplace_back(dir);
++    } else {
++      dirs.push_back(relative_to_current_binary("../nvidia/cudnn/bin"));
++    }
++    if (const char* dir = cuda_bin_dir()) {
++      dirs.emplace_back(dir);
++    } else {
++      for (const char* name :
++           {"cublas",
++            "cuda_nvrtc",
++            "cufft",
++            "cusolver",
++            "cusparse",
++            "nvjitlink"}) {
++        dirs.push_back(relative_to_current_binary("../nvidia") / name / "bin");
++      }
++    }
++    std::wstring path;
++    std::error_code error;
++    for (const auto& dir : dirs) {
++      if (fs::exists(dir, error)) {
++        path += dir.wstring() + L";";
++      }
++    }
++    DWORD size = ::GetEnvironmentVariableW(L"PATH", nullptr, 0);
++    std::wstring old_path(size, L'\0');
++    DWORD length = ::GetEnvironmentVariableW(L"PATH", old_path.data(), size);
++    old_path.resize(length < size ? length : 0);
++    ::SetEnvironmentVariableW(L"PATH", (path + old_path).c_str());
++  });
++}
++
+ fs::path load_nvrtc() {
+   fs::path nvrtc_dir;
+   if (const char* dir = cuda_bin_dir()) {
+@@ -81,6 +123,7 @@ fs::path load_cusolver() {
+ FARPROC WINAPI delayload_helper(unsigned dliNotify, PDelayLoadInfo pdli) {
+   HMODULE mod = NULL;
+   if (dliNotify == dliNotePreLoadLibrary) {
++    add_dirs_to_path();
+     std::string dll = pdli->szDll;
+     if (dll.starts_with("cudnn")) {
+       static auto cudnn_dir = load_cudnn();
+@@ -100,7 +143,24 @@ FARPROC WINAPI delayload_helper(unsigned dliNotify, PDelayLoadInfo pdli) {
+   return reinterpret_cast<FARPROC>(mod);
+ }
+ 
++// Called by system when a lazy-loaded DLL or function is not found, print the
++// name as otherwise the process exits with only an exception code.
++FARPROC WINAPI delayload_failure(unsigned dliNotify, PDelayLoadInfo pdli) {
++  if (dliNotify == dliFailLoadLib) {
++    fprintf(stderr, "[mlx] Failed to load %s.\n", pdli->szDll);
++  } else if (dliNotify == dliFailGetProc && pdli->dlp.fImportByName) {
++    fprintf(
++        stderr,
++        "[mlx] Failed to find %s in %s.\n",
++        pdli->dlp.szProcName,
++        pdli->szDll);
++  }
++  return NULL;
++}
++
+ } // namespace mlx::core::cu
+ 
+ extern "C" const PfnDliHook __pfnDliNotifyHook2 =
+     mlx::core::cu::delayload_helper;
++extern "C" const PfnDliHook __pfnDliFailureHook2 =
++    mlx::core::cu::delayload_failure;
+diff --git a/mlx/backend/cuda/event.cu b/mlx/backend/cuda/event.cu
+index bcea005443f0831a0211efbcf83b2403ec327037..0ed1812fa1a91b851bf07eea1ed6c99d4773c901 100644
+--- a/mlx/backend/cuda/event.cu
++++ b/mlx/backend/cuda/event.cu
+@@ -275,6 +275,11 @@ void AtomicEvent::signal(uint32_t value) {
+ 
+ void AtomicEvent::signal(cudaStream_t stream, uint32_t value) {
+   event_signal_kernel<<<1, 1, 0, stream>>>(ptr(), value);
++#if defined(_WIN32)
++  // WDDM can keep the launch in a batch, query the stream to submit it. The
++  // driver API does not change the last error of the runtime API.
++  cuStreamQuery(stream);
++#endif
+ }
+ 
+ void AtomicEvent::signal(Stream s, uint32_t value) {
+diff --git a/mlx/distributed/CMakeLists.txt b/mlx/distributed/CMakeLists.txt
+index 807fd0fbdb791211d6517ded4f57857c2841eb92..7e783f7b95ede989106001e45e4fc86f35427fab 100644
+--- a/mlx/distributed/CMakeLists.txt
++++ b/mlx/distributed/CMakeLists.txt
+@@ -4,8 +4,11 @@ target_sources(
+           ${CMAKE_CURRENT_SOURCE_DIR}/ops.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cpp)
+ 
+-if(MLX_BUILD_CPU AND NOT WIN32)
++if(MLX_BUILD_CPU)
+   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp)
++  if(WIN32)
++    target_link_libraries(mlx PRIVATE ws2_32)
++  endif()
+ endif()
+ 
+ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mpi)
+diff --git a/mlx/distributed/ring/CMakeLists.txt b/mlx/distributed/ring/CMakeLists.txt
+index 346f7cdb7e6bcf9671a4717be5efe24ae53647b6..e94ca11426776981dc29ec98d8da162010fbcaa9 100644
+--- a/mlx/distributed/ring/CMakeLists.txt
++++ b/mlx/distributed/ring/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-if(MLX_BUILD_CPU AND NOT WIN32)
++if(MLX_BUILD_CPU)
+   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ring.cpp)
+ else()
+   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/no_ring.cpp)
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+index 9a81010e34370ebc5c342fe808c5d9ad20d32401..9f26fdaa95fb4181bd787c26516093a35cb85ebe 100644
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -1,9 +1,11 @@
+ // Copyright © 2024 Apple Inc.
+ 
++#ifndef _WIN32
+ #include <fcntl.h>
+ #include <netinet/tcp.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
++#endif
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -43,6 +45,7 @@ constexpr const char* RING_TAG = "[ring]";
+ constexpr const size_t MAX_IO_BYTES = 1024 * 1024 * 1024;
+ 
+ using GroupImpl = mlx::core::distributed::detail::GroupImpl;
++using socket_t = mlx::core::distributed::detail::socket_t;
+ using json = nlohmann::json;
+ using namespace std::chrono_literals;
+ 
+@@ -74,17 +77,15 @@ decltype(T() * U()) ceildiv(T a, U b) {
+ 
+ class SocketThread {
+  public:
+-  SocketThread(int fd) : fd_(fd), stop_(false) {
++  SocketThread(socket_t fd) : fd_(fd), stop_(false) {
+     worker_ = std::thread(&SocketThread::worker, this);
+-    int flags = fcntl(fd, F_GETFL, 0);
+-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++    detail::set_socket_nonblocking(fd, true);
+   }
+   ~SocketThread() {
+     stop_ = true;
+     condition_.notify_all();
+     worker_.join();
+-    int flags = fcntl(fd_, F_GETFL, 0);
+-    fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK);
++    detail::set_socket_nonblocking(fd_, false);
+   }
+ 
+   template <typename T>
+@@ -179,8 +180,8 @@ class SocketThread {
+ 
+       if (!recvs_.empty()) {
+         auto& task = recvs_.front();
+-        ssize_t r =
+-            ::recv(fd_, task.buffer, std::min(task.size, MAX_IO_BYTES), 0);
++        auto r = detail::socket_recv(
++            fd_, task.buffer, std::min(task.size, MAX_IO_BYTES));
+         if (r > 0) {
+           task.buffer = static_cast<char*>(task.buffer) + r;
+           task.size -= r;
+@@ -189,16 +190,17 @@ class SocketThread {
+         } else if (r == 0) {
+           error_count++;
+           log_info(true, "Socket", fd_, "was closed by the peer");
+-        } else if (errno != EAGAIN) {
++        } else if (int error = detail::last_socket_error();
++                   !detail::socket_would_block(error)) {
+           error_count++;
+           log_info(
+-              true, "Receiving from socket", fd_, "failed with errno", errno);
++              true, "Receiving from socket", fd_, "failed with errno", error);
+         }
+       }
+       if (!sends_.empty()) {
+         auto& task = sends_.front();
+-        ssize_t r =
+-            ::send(fd_, task.buffer, std::min(task.size, MAX_IO_BYTES), 0);
++        auto r = detail::socket_send(
++            fd_, task.buffer, std::min(task.size, MAX_IO_BYTES));
+         if (r > 0) {
+           task.buffer = static_cast<char*>(task.buffer) + r;
+           task.size -= r;
+@@ -207,9 +209,10 @@ class SocketThread {
+         } else if (r == 0) {
+           error_count++;
+           log_info(true, "Sending to socket", fd_, "made no progress");
+-        } else if (errno != EAGAIN) {
++        } else if (int error = detail::last_socket_error();
++                   !detail::socket_would_block(error)) {
+           error_count++;
+-          log_info(true, "Sending to socket", fd_, "failed with errno", errno);
++          log_info(true, "Sending to socket", fd_, "failed with errno", error);
+         }
+       }
+ 
+@@ -231,7 +234,7 @@ class SocketThread {
+     }
+   }
+ 
+-  int fd_;
++  socket_t fd_;
+   bool stop_;
+   std::thread worker_;
+   std::mutex queue_mutex_;
+@@ -242,24 +245,24 @@ class SocketThread {
+ 
+ class CommunicationThreads {
+  public:
+-  void add(const std::vector<int>& sockets) {
+-    for (int sock : sockets) {
++  void add(const std::vector<socket_t>& sockets) {
++    for (socket_t sock : sockets) {
+       threads_.emplace(sock, sock);
+     }
+   }
+ 
+   template <typename T>
+-  std::future<void> send(int socket, T* buffer, size_t size) {
++  std::future<void> send(socket_t socket, T* buffer, size_t size) {
+     return threads_.at(socket).send<T>(buffer, size);
+   }
+ 
+   template <typename T>
+-  std::future<void> recv(int socket, T* buffer, size_t size) {
++  std::future<void> recv(socket_t socket, T* buffer, size_t size) {
+     return threads_.at(socket).recv<T>(buffer, size);
+   }
+ 
+  private:
+-  std::unordered_map<int, SocketThread> threads_;
++  std::unordered_map<socket_t, SocketThread> threads_;
+ };
+ 
+ /**
+@@ -294,9 +297,9 @@ std::vector<std::vector<detail::address_t>> load_nodes(const char* hostfile) {
+  * Create a socket and accept one connection for each of the provided
+  * addresses.
+  */
+-std::vector<int> accept_connections(
++std::vector<socket_t> accept_connections(
+     const std::vector<detail::address_t>& addresses) {
+-  std::vector<int> sockets;
++  std::vector<socket_t> sockets;
+   int success;
+ 
+   for (auto& address : addresses) {
+@@ -312,10 +315,10 @@ std::vector<int> accept_connections(
+  * The counterpoint of `accept_connections`. Basically connect to each of the
+  * provided addresses.
+  */
+-std::vector<int> make_connections(
++std::vector<socket_t> make_connections(
+     const std::vector<detail::address_t>& addresses,
+     bool verbose) {
+-  std::vector<int> sockets;
++  std::vector<socket_t> sockets;
+   int success;
+ 
+   for (auto& address : addresses) {
+@@ -333,7 +336,7 @@ std::vector<int> make_connections(
+                   "waiting",
+                   wait,
+                   "ms (error:",
+-                  errno,
++                  detail::last_socket_error(),
+                   ")");
+             })
+             .detach());
+@@ -398,9 +401,10 @@ class RingGroup : public GroupImpl {
+ 
+     // Configure all sockets to use TCP no delay.
+     int one = 1;
++    auto one_ptr = reinterpret_cast<const char*>(&one);
+     for (int i = 0; i < sockets_right_.size(); i++) {
+-      setsockopt(sockets_right_[i], SOL_TCP, TCP_NODELAY, &one, sizeof(one));
+-      setsockopt(sockets_left_[i], SOL_TCP, TCP_NODELAY, &one, sizeof(one));
++      setsockopt(sockets_right_[i], SOL_TCP, TCP_NODELAY, one_ptr, sizeof(one));
++      setsockopt(sockets_left_[i], SOL_TCP, TCP_NODELAY, one_ptr, sizeof(one));
+     }
+ 
+     // Start the all reduce threads. One all reduce per direction per ring.
+@@ -420,11 +424,11 @@ class RingGroup : public GroupImpl {
+   ~RingGroup() {
+     for (auto s : sockets_right_) {
+       shutdown(s, 2);
+-      close(s);
++      detail::close_socket(s);
+     }
+     for (auto s : sockets_left_) {
+       shutdown(s, 2);
+-      close(s);
++      detail::close_socket(s);
+     }
+   }
+ 
+@@ -632,13 +636,13 @@ class RingGroup : public GroupImpl {
+       T* buffer,
+       T* data,
+       size_t data_size,
+-      int socket_right,
+-      int socket_left,
++      socket_t socket_right,
++      socket_t socket_left,
+       int direction,
+       ReduceOp reduce_op) {
+     // Choose which socket we send to and recv from
+-    int socket_send = (direction < 0) ? socket_right : socket_left;
+-    int socket_recv = (direction < 0) ? socket_left : socket_right;
++    socket_t socket_send = (direction < 0) ? socket_right : socket_left;
++    socket_t socket_recv = (direction < 0) ? socket_left : socket_right;
+ 
+     // We split the data into `size_` segments of size `segment_size` and each
+     // of these in smaller segments of ALL_SUM_SIZE which we 'll call packets.
+@@ -735,12 +739,12 @@ class RingGroup : public GroupImpl {
+       char* output,
+       size_t input_size,
+       size_t data_size,
+-      int socket_right,
+-      int socket_left,
++      socket_t socket_right,
++      socket_t socket_left,
+       int direction) {
+     // Choose which socket we send to and recv from
+-    int socket_send = (direction < 0) ? socket_right : socket_left;
+-    int socket_recv = (direction < 0) ? socket_left : socket_right;
++    socket_t socket_send = (direction < 0) ? socket_right : socket_left;
++    socket_t socket_recv = (direction < 0) ? socket_left : socket_right;
+ 
+     // Initial segments
+     int send_segment = rank_;
+@@ -766,8 +770,10 @@ class RingGroup : public GroupImpl {
+     }
+   }
+ 
+-  void
+-  send(const std::vector<int>& sockets, const char* data, size_t data_size) {
++  void send(
++      const std::vector<socket_t>& sockets,
++      const char* data,
++      size_t data_size) {
+     size_t segment_size =
+         std::max(size_t(1024), ceildiv(data_size, sockets.size()));
+     std::vector<std::future<void>> sends;
+@@ -785,7 +791,8 @@ class RingGroup : public GroupImpl {
+     }
+   }
+ 
+-  void recv(const std::vector<int>& sockets, char* data, size_t data_size) {
++  void
++  recv(const std::vector<socket_t>& sockets, char* data, size_t data_size) {
+     size_t segment_size =
+         std::max(size_t(1024), ceildiv(data_size, sockets.size()));
+     std::vector<std::future<void>> recvs;
+@@ -811,8 +818,8 @@ class RingGroup : public GroupImpl {
+   ThreadPool pool_;
+   CommunicationThreads comm_;
+ 
+-  std::vector<int> sockets_right_;
+-  std::vector<int> sockets_left_;
++  std::vector<socket_t> sockets_right_;
++  std::vector<socket_t> sockets_left_;
+ 
+   std::vector<char> buffers_;
+ };
+diff --git a/mlx/distributed/utils.cpp b/mlx/distributed/utils.cpp
+index 11f8df85c4ae29fafd90a7e95fb23dc3c5712001..97c8ad7701adbe9ddded5f4e654a1c8b2c85df7a 100644
+--- a/mlx/distributed/utils.cpp
++++ b/mlx/distributed/utils.cpp
+@@ -1,7 +1,14 @@
+ // Copyright © 2025 Apple Inc.
+ 
++#ifdef _WIN32
++#include <algorithm>
++#include <climits>
++#else
++#include <fcntl.h>
+ #include <netdb.h>
+ #include <unistd.h>
++#include <cerrno>
++#endif
+ #include <cstring>
+ #include <sstream>
+ #include <thread>
+@@ -12,18 +19,105 @@ namespace mlx::core::distributed::detail {
+ 
+ namespace {
+ 
++#ifdef _WIN32
++constexpr socket_t invalid_socket = INVALID_SOCKET;
++
++// WSAStartup is reference counted, so other Winsock users are not affected.
++void ensure_socket_library() {
++  static const int status = [] {
++    WSADATA data;
++    return WSAStartup(MAKEWORD(2, 2), &data);
++  }();
++  if (status != 0) {
++    std::ostringstream msg;
++    msg << "WSAStartup failed (error: " << status << ")";
++    throw std::runtime_error(msg.str());
++  }
++}
++
++// Winsock send and recv take an int length.
++int clamp_length(size_t len) {
++  return static_cast<int>(std::min(len, static_cast<size_t>(INT_MAX)));
++}
++#else
++constexpr socket_t invalid_socket = -1;
++
++void ensure_socket_library() {}
++#endif
++
+ [[noreturn]] void throw_socket_error(const char* tag, const char* action) {
+   std::ostringstream msg;
+-  msg << tag << " " << action << " (error: " << errno << ")";
++  msg << tag << " " << action << " (error: " << last_socket_error() << ")";
+   throw std::runtime_error(msg.str());
+ }
+ 
+ } // namespace
+ 
++int last_socket_error() {
++#ifdef _WIN32
++  return WSAGetLastError();
++#else
++  return errno;
++#endif
++}
++
++bool socket_would_block(int error) {
++#ifdef _WIN32
++  return error == WSAEWOULDBLOCK;
++#else
++  return error == EAGAIN;
++#endif
++}
++
++bool socket_is_valid(socket_t sock) {
++#ifdef _WIN32
++  return sock != INVALID_SOCKET;
++#else
++  return sock >= 0;
++#endif
++}
++
++void close_socket(socket_t sock) {
++#ifdef _WIN32
++  closesocket(sock);
++#else
++  close(sock);
++#endif
++}
++
++void set_socket_nonblocking(socket_t sock, bool nonblocking) {
++#ifdef _WIN32
++  u_long mode = nonblocking ? 1 : 0;
++  ioctlsocket(sock, FIONBIO, &mode);
++#else
++  int flags = fcntl(sock, F_GETFL, 0);
++  flags = nonblocking ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
++  fcntl(sock, F_SETFL, flags);
++#endif
++}
++
++std::ptrdiff_t socket_send(socket_t sock, const void* data, size_t len) {
++#ifdef _WIN32
++  return ::send(sock, static_cast<const char*>(data), clamp_length(len), 0);
++#else
++  return ::send(sock, data, len, 0);
++#endif
++}
++
++std::ptrdiff_t socket_recv(socket_t sock, void* data, size_t len) {
++#ifdef _WIN32
++  return ::recv(sock, static_cast<char*>(data), clamp_length(len), 0);
++#else
++  return ::recv(sock, data, len, 0);
++#endif
++}
++
+ /**
+  * Parse a sockaddr from an ip and port provided as strings.
+  */
+ address_t parse_address(const std::string& ip, const std::string& port) {
++  ensure_socket_library();
++
+   struct addrinfo hints, *res;
+   std::memset(&hints, 0, sizeof(hints));
+   hints.ai_family = AF_UNSPEC;
+@@ -61,37 +155,39 @@ address_t parse_address(const std::string& ip_port) {
+ }
+ 
+ TCPSocket::TCPSocket(const char* tag) {
++  ensure_socket_library();
+   sock_ = socket(AF_INET, SOCK_STREAM, 0);
+-  if (sock_ < 0) {
++  if (!socket_is_valid(sock_)) {
+     throw_socket_error(tag, "Couldn't create socket");
+   }
+ }
+ 
+ TCPSocket::TCPSocket(TCPSocket&& s) {
+   sock_ = s.sock_;
+-  s.sock_ = -1;
++  s.sock_ = invalid_socket;
+ }
+ 
+ TCPSocket& TCPSocket::operator=(TCPSocket&& s) {
+   if (this != &s) {
+     sock_ = s.sock_;
+-    s.sock_ = -1;
++    s.sock_ = invalid_socket;
+   }
+   return *this;
+ }
+ 
+-TCPSocket::TCPSocket(int s) : sock_(s) {}
++TCPSocket::TCPSocket(socket_t s) : sock_(s) {}
+ 
+ TCPSocket::~TCPSocket() {
+-  if (sock_ > 0) {
++  // Same as `sock_ > 0` on POSIX.
++  if (socket_is_valid(sock_) && sock_ != 0) {
+     shutdown(sock_, 2);
+-    close(sock_);
++    close_socket(sock_);
+   }
+ }
+ 
+-int TCPSocket::detach() {
+-  int s = sock_;
+-  sock_ = -1;
++socket_t TCPSocket::detach() {
++  socket_t s = sock_;
++  sock_ = invalid_socket;
+   return s;
+ }
+ 
+@@ -101,14 +197,19 @@ void TCPSocket::listen(const char* tag, const address_t& addr) {
+   // Make sure we can launch immediately after shutdown by setting the
+   // reuseaddr option so that we don't get address already in use errors
+   int enable = 1;
+-  success = setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
++  auto enable_ptr = reinterpret_cast<const char*>(&enable);
++  success =
++      setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR, enable_ptr, sizeof(int));
+   if (success < 0) {
+     throw_socket_error(tag, "Couldn't enable reuseaddr");
+   }
+-  success = setsockopt(sock_, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(int));
++#ifdef SO_REUSEPORT
++  success =
++      setsockopt(sock_, SOL_SOCKET, SO_REUSEPORT, enable_ptr, sizeof(int));
+   if (success < 0) {
+     throw_socket_error(tag, "Couldn't enable reuseport");
+   }
++#endif
+ 
+   // Bind the socket to the address and port
+   success = bind(sock_, addr.get(), addr.len);
+@@ -124,8 +225,8 @@ void TCPSocket::listen(const char* tag, const address_t& addr) {
+ }
+ 
+ TCPSocket TCPSocket::accept(const char* tag) {
+-  int peer = ::accept(sock_, nullptr, nullptr);
+-  if (peer < 0) {
++  socket_t peer = ::accept(sock_, nullptr, nullptr);
++  if (!socket_is_valid(peer)) {
+     throw_socket_error(tag, "Accept failed");
+   }
+ 
+@@ -134,10 +235,10 @@ TCPSocket TCPSocket::accept(const char* tag) {
+ 
+ void TCPSocket::send(const char* tag, const void* data, size_t len) {
+   while (len > 0) {
+-    auto n = ::send(sock_, data, len, 0);
++    auto n = socket_send(sock_, data, len);
+     if (n <= 0) {
+       std::ostringstream msg;
+-      msg << tag << " Send failed with errno=" << errno;
++      msg << tag << " Send failed with errno=" << last_socket_error();
+       throw std::runtime_error(msg.str());
+     }
+     len -= n;
+@@ -147,10 +248,10 @@ void TCPSocket::send(const char* tag, const void* data, size_t len) {
+ 
+ void TCPSocket::recv(const char* tag, void* data, size_t len) {
+   while (len > 0) {
+-    auto n = ::recv(sock_, data, len, 0);
++    auto n = socket_recv(sock_, data, len);
+     if (n <= 0) {
+       std::ostringstream msg;
+-      msg << tag << " Recv failed with errno=" << errno;
++      msg << tag << " Recv failed with errno=" << last_socket_error();
+       throw std::runtime_error(msg.str());
+     }
+     len -= n;
+@@ -164,13 +265,16 @@ TCPSocket TCPSocket::connect(
+     int num_retries,
+     int wait,
+     std::function<void(int, int)> cb) {
+-  int sock, success;
++  ensure_socket_library();
++
++  socket_t sock;
++  int success;
+ 
+   // Attempt to connect `num_retries` times with exponential backoff.
+   for (int attempt = 0; attempt < num_retries; attempt++) {
+     // Create the socket
+     sock = socket(AF_INET, SOCK_STREAM, 0);
+-    if (sock < 0) {
++    if (!socket_is_valid(sock)) {
+       throw_socket_error(tag, "Couldn't create socket to connect");
+     }
+ 
+diff --git a/mlx/distributed/utils.h b/mlx/distributed/utils.h
+index 213dd59a21a90b70d1542e82a594b76caf870de6..4ac29dd5080f13e88d585ce0ade2e0c3aa833c02 100644
+--- a/mlx/distributed/utils.h
++++ b/mlx/distributed/utils.h
+@@ -2,12 +2,33 @@
+ 
+ #pragma once
+ 
++#ifdef _WIN32
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#else
+ #include <sys/socket.h>
++#endif
++#include <cstddef>
+ #include <functional>
+ #include <string>
+ 
+ namespace mlx::core::distributed::detail {
+ 
++#ifdef _WIN32
++using socket_t = SOCKET;
++#else
++using socket_t = int;
++#endif
++
++// Small wrappers so that the same code works with BSD sockets and Winsock2.
++int last_socket_error();
++bool socket_would_block(int error);
++bool socket_is_valid(socket_t sock);
++void close_socket(socket_t sock);
++void set_socket_nonblocking(socket_t sock, bool nonblocking);
++std::ptrdiff_t socket_send(socket_t sock, const void* data, size_t len);
++std::ptrdiff_t socket_recv(socket_t sock, void* data, size_t len);
++
+ struct address_t {
+   sockaddr_storage addr;
+   socklen_t len;
+@@ -45,9 +66,9 @@ class TCPSocket {
+   void send(const char* tag, const void* data, size_t len);
+   void recv(const char* tag, void* data, size_t len);
+ 
+-  int detach();
++  socket_t detach();
+ 
+-  operator int() const {
++  operator socket_t() const {
+     return sock_;
+   }
+ 
+@@ -59,9 +80,9 @@ class TCPSocket {
+       std::function<void(int, int)> cb = nullptr);
+ 
+  private:
+-  TCPSocket(int sock);
++  TCPSocket(socket_t sock);
+ 
+-  int sock_;
++  socket_t sock_;
+ };
+ 
+ } // namespace mlx::core::distributed::detail

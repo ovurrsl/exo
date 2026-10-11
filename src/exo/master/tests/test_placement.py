@@ -84,6 +84,40 @@ def _metal_only(
     return {node_id: [Backend.MlxMetal] for node_id in node_memory}
 
 
+def test_cuda_tensor_is_gated_while_mac_tensor_placement_remains_available(
+    model_card: ModelCard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("exo.master.placement.EXO_ENABLE_CUDA_TENSOR_PARALLEL", False)
+    nodes = [NodeId(), NodeId()]
+    topology = Topology()
+    for node in nodes:
+        topology.add_node(node)
+    for source, sink in (nodes, nodes[::-1]):
+        topology.add_connection(
+            Connection(source=source, sink=sink, edge=create_socket_connection(1))
+        )
+    memory = {node: create_node_memory(1000 * 1024) for node in nodes}
+    network = {node: create_node_network() for node in nodes}
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxRing,
+        min_nodes=2,
+        model_card=model_card.model_copy(
+            update={"backends": [Backend.MlxMetal, Backend.MlxCuda]}
+        ),
+    )
+    with pytest.raises(ValueError, match="CUDA tensor parallelism requires"):
+        place_instance(
+            command,
+            topology,
+            {},
+            memory,
+            network,
+            {nodes[0]: [Backend.MlxCuda], nodes[1]: [Backend.MlxMetal]},
+        )
+    assert place_instance(command, topology, {}, memory, network, _metal_only(memory))
+
+
 def place_instance_command(model_card: ModelCard) -> PlaceInstance:
     return PlaceInstance(
         command_id=CommandId(),

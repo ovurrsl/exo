@@ -385,20 +385,28 @@ def parse_thinking_models(
 
         accumulated += response.text
 
-        if response.finish_reason is not None:
-            yield from drain_pending(is_thinking)
-            yield response.model_copy(update={"is_thinking": False})
-            continue
-
         if accumulated == think_start and not is_thinking:
             is_thinking = True
             accumulated = ""
             pending_buffer.clear()
+            if response.finish_reason is not None:
+                yield response.model_copy(update={"text": "", "is_thinking": True})
             continue
         if accumulated == think_end and is_thinking:
             is_thinking = False
             accumulated = ""
             pending_buffer.clear()
+            if response.finish_reason is not None:
+                yield response.model_copy(update={"text": "", "is_thinking": False})
+            continue
+
+        if response.finish_reason is not None:
+            # A length/stop event does not close an unfinished thinking block.
+            # Flush incomplete markers in their existing channel and preserve
+            # the terminal event even when its decoded text is empty.
+            yield from drain_pending(is_thinking)
+            accumulated = ""
+            yield response.model_copy(update={"is_thinking": is_thinking})
             continue
 
         if (think_start and accumulated == think_start[: len(accumulated)]) or (

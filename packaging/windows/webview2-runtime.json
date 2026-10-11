@@ -1,0 +1,8 @@
+{
+  "version": "154.0.4258.62",
+  "architecture": "x64",
+  "url": "https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/b92cd7d9-6976-4f34-9708-47e80937c287/Microsoft.WebView2.FixedVersionRuntime.154.0.4258.62.x64.cab",
+  "archive_sha256": "e8f55a4bde27c7f82512402b56a58539b5ec8928be4e500e077b6f66c9ef4668",
+  "executable_sha256": "7e941ccb324fd87c849dca6356079e65a31ff264b8b5b37cc43d055b2764b9b3",
+  "folder": "Microsoft.WebView2.FixedVersionRuntime.154.0.4258.62.x64"
+}

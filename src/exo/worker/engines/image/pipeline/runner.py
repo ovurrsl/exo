@@ -1,4 +1,4 @@
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from math import ceil
 from typing import Any, Optional, final
@@ -6,6 +6,7 @@ from typing import Any, Optional, final
 import mlx.core as mx
 from mflux.models.common.config.config import Config
 from mflux.utils.exceptions import StopImageGenerationException
+from PIL import Image
 from tqdm import tqdm
 
 from exo.shared.constants import EXO_TRACING_ENABLED
@@ -25,6 +26,7 @@ from exo.worker.engines.image.pipeline.block_wrapper import (
     JointBlockWrapper,
     SingleBlockWrapper,
 )
+from exo.worker.engines.image.windows_memory import WindowsImageMemoryManager
 
 
 @final
@@ -84,10 +86,12 @@ class DiffusionRunner:
         group: Optional[mx.distributed.Group],
         shard_metadata: PipelineShardMetadata | CfgShardMetadata,
         num_patches: Optional[int] = None,
+        windows_memory: WindowsImageMemoryManager | None = None,
     ):
         self.config = config
         self.adapter = adapter
         self.group = group
+        self._windows_memory = windows_memory
 
         self._init_cfg_topology(shard_metadata)
 
@@ -401,6 +405,17 @@ class DiffusionRunner:
             for wrapper in self.single_block_wrappers:
                 wrapper.reset_cache()
 
+    def _release_windows_step_state(self) -> None:
+        if self._windows_memory is None or self.pipeline_world_size != 1:
+            return
+        # Single-node passes reset PipeFusion caches before every forward.
+        # Retaining wrappers after evaluation also retains FLUX norm states and
+        # unused lazy KV branches while the transformer is offloaded for decode.
+        self.joint_block_wrappers = None
+        self.single_block_wrappers = None
+        self._wrappers_initialized = False
+        self._current_text_seq_len = None
+
     def _set_text_seq_len(self, text_seq_len: int) -> None:
         if self.joint_block_wrappers:
             for wrapper in self.joint_block_wrappers:
@@ -490,8 +505,25 @@ class DiffusionRunner:
         self._guidance_override = guidance_override
         self._cancel_checker = cancel_checker
         self._cancelling = False
-        latents = self.adapter.create_latents(seed, runtime_config)
-        prompt_data = self.adapter.encode_prompt(prompt, negative_prompt)
+        if self._windows_memory is None:
+            latents = self.adapter.create_latents(seed, runtime_config)
+            prompt_data = self.adapter.encode_prompt(prompt, negative_prompt)
+        else:
+            with self._windows_memory.stage(("vae",)):
+                latents = self.adapter.create_latents(seed, runtime_config)
+                mx.eval(latents)
+            names = self._windows_memory.prompt_components
+            if runtime_config.image_path is not None:
+                names = (*names, "vae")
+            with self._windows_memory.stage(names):
+                prompt_data = self.adapter.encode_prompt(prompt, negative_prompt)
+                for positive in (True, False):
+                    arrays = [
+                        value
+                        for value in prompt_data.get_cfg_branch_data(positive)
+                        if value is not None
+                    ]
+                    mx.eval(*arrays)
 
         capture_steps = self._calculate_capture_steps(
             partial_images=partial_images,
@@ -508,31 +540,57 @@ class DiffusionRunner:
             capture_steps=capture_steps,
             num_sync_steps=num_sync_steps,
         )
+        if self._windows_memory is not None:
+            diffusion_gen = self._windows_diffusion_loop(diffusion_gen)
 
         partial_index = 0
         total_partials = len(capture_steps)
 
-        if capture_steps:
-            try:
-                while True:
-                    partial_latents, _step = next(diffusion_gen)
-                    if self.is_last_stage:
-                        partial_image = self.adapter.decode_latents(
-                            partial_latents, runtime_config, seed, prompt
-                        )
-                        yield (partial_image, partial_index, total_partials)
-                        partial_index += 1
-            except StopIteration as e:
-                latents = e.value  # pyright: ignore[reportAny]
-        else:
-            try:
-                while True:
-                    next(diffusion_gen)
-            except StopIteration as e:
-                latents = e.value  # pyright: ignore[reportAny]
+        try:
+            if capture_steps:
+                try:
+                    while True:
+                        partial_latents, _step = next(diffusion_gen)
+                        if self.is_last_stage:
+                            partial_image = self._decode_image(
+                                partial_latents, runtime_config, seed, prompt
+                            )
+                            yield (partial_image, partial_index, total_partials)
+                            partial_index += 1
+                except StopIteration as e:
+                    latents = e.value  # pyright: ignore[reportAny]
+            else:
+                try:
+                    while True:
+                        next(diffusion_gen)
+                except StopIteration as e:
+                    latents = e.value  # pyright: ignore[reportAny]
+        finally:
+            if self._windows_memory is not None:
+                diffusion_gen.close()
 
         if self.is_last_stage and not self._cancelling:
-            yield self.adapter.decode_latents(latents, runtime_config, seed, prompt)  # pyright: ignore[reportAny]
+            yield self._decode_image(latents, runtime_config, seed, prompt)  # pyright: ignore[reportAny]
+
+    def _windows_diffusion_loop(
+        self,
+        generator: Generator[tuple[mx.array, int], None, mx.array],
+    ) -> Generator[tuple[mx.array, int], None, mx.array]:
+        assert self._windows_memory is not None
+        with self._windows_memory.stage(("transformer",), require_cuda=True):
+            try:
+                return (yield from generator)
+            finally:
+                generator.close()
+                self._release_windows_step_state()
+
+    def _decode_image(
+        self, latents: mx.array, runtime_config: Config, seed: int, prompt: str
+    ) -> Image.Image:
+        if self._windows_memory is None:
+            return self.adapter.decode_latents(latents, runtime_config, seed, prompt)
+        with self._windows_memory.stage(("vae",)):
+            return self.adapter.decode_latents(latents, runtime_config, seed, prompt)
 
     def _run_diffusion_loop(
         self,
@@ -543,7 +601,7 @@ class DiffusionRunner:
         prompt: str,
         num_sync_steps: int,
         capture_steps: set[int] | None = None,
-    ):
+    ) -> Generator[tuple[mx.array, int], None, mx.array]:
         if capture_steps is None:
             capture_steps = set()
 
@@ -582,6 +640,9 @@ class DiffusionRunner:
                 )
 
                 mx.eval(latents)
+
+                if self._windows_memory is not None:
+                    self._release_windows_step_state()
 
                 if t in capture_steps and self.is_last_stage and not self._cancelling:
                     yield (latents, t)

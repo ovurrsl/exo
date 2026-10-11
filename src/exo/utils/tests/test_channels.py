@@ -88,6 +88,45 @@ def test_channel_error_override_replaces_sync_errors_with_subclasses():
     assert type(closed_resource_info.value.__cause__) is ClosedResourceError
 
 
+def close_sender_after_messages(sender: MpSender[int], graceful: bool) -> None:
+    sender.send(1)
+    sender.send(2)
+    if graceful:
+        sender.close(graceful=True)
+    else:
+        sender.close()
+    sender.join()
+
+
+@pytest.mark.parametrize("graceful", [False, True])
+def test_sender_close_preserves_queued_messages_when_graceful(graceful: bool) -> None:
+    sender, receiver = mp_channel[int]()
+    process = mp.get_context("spawn").Process(
+        target=close_sender_after_messages, args=(sender, graceful)
+    )
+    process.start()
+    try:
+        # Consume only after the producer has exited. This makes the final
+        # message/close race deterministic instead of relying on timing.
+        process.join(timeout=10)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+        if graceful:
+            assert receiver.receive() == 1
+            assert receiver.receive() == 2
+            with pytest.raises(EndOfStream):
+                receiver.receive()
+        else:
+            with pytest.raises(ClosedResourceError):
+                receiver.receive()
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        sender.close()
+        receiver.close()
+
+
 @pytest.mark.anyio
 async def test_channel_error_override_replaces_async_errors_with_subclasses():
     send, recv = channel[int](0, error_override_config=ERROR_OVERRIDE)

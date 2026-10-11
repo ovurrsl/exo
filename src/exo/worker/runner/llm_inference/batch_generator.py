@@ -3,7 +3,7 @@ import time
 from collections import deque
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -34,6 +34,7 @@ from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import (
     PrefillCancelled,
     mlx_generate,
+    settle_generation_streams,
     warmup_inference,
 )
 from exo.worker.engines.mlx.types import Model
@@ -43,6 +44,7 @@ from exo.worker.engines.mlx.utils_mlx import (
     mx_any,
 )
 from exo.worker.engines.mlx.vision import VisionProcessor
+from exo.worker.engines.mlx.windows_text_offload import WindowsQwen3OffloadModel
 from exo.worker.runner.bootstrap import logger
 
 from .model_output_parsers import apply_all_parsers, map_responses_to_chunks
@@ -105,6 +107,7 @@ class SequentialGenerator(Engine):
     _maybe_cancel: list[TextGeneration] = field(default_factory=list, init=False)
     _all_tasks: dict[TaskId, TextGeneration] = field(default_factory=dict, init=False)
     _queue: deque[TextGeneration] = field(default_factory=deque, init=False)
+    _offload_closed: bool = field(default=False, init=False)
     _active: (
         tuple[
             TextGeneration,
@@ -118,6 +121,10 @@ class SequentialGenerator(Engine):
         | None
     ) = field(default=None, init=False)
 
+    @property
+    def supports_disaggregated_prefill(self) -> bool:
+        return not isinstance(cast(object, self.model), WindowsQwen3OffloadModel)
+
     def warmup(self):
         self.check_for_cancel_every = warmup_inference(
             model=self.model,
@@ -125,6 +132,10 @@ class SequentialGenerator(Engine):
             group=self.group,
             model_id=self.model_id,
         )
+        if isinstance(cast(object, self.model), WindowsQwen3OffloadModel):
+            # Each token streams the decoder weights again; check cancellation
+            # before starting another expensive transfer instead of batching polls.
+            self.check_for_cancel_every = 1
 
     def submit(
         self,
@@ -298,6 +309,23 @@ class SequentialGenerator(Engine):
         )
 
     def close(self) -> None:
+        if self._offload_closed:
+            return
+        if isinstance(cast(object, self.model), WindowsQwen3OffloadModel):
+            try:
+                if self._active is not None:
+                    try:
+                        self._active[1].close()
+                    finally:
+                        self._active = None
+            finally:
+                # Idle generation streams can still own lazy work. Settle them
+                # before the wrapper releases its model-lifetime allocator lease.
+                settle_generation_streams()
+                cast(WindowsQwen3OffloadModel, cast(object, self.model)).close()
+                self._offload_closed = True
+                del self.model, self.tokenizer, self.group
+            return
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
@@ -436,11 +464,19 @@ class BatchGenerator(Engine):
         if not self._gen.has_work:
             return self._apply_cancellations()
 
-        results = self._gen.step()
+        output = self._parse_responses(self._gen.step())
 
-        output: list[
-            tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
-        ] = []
+        return filter(
+            lambda chunk: (
+                not isinstance(chunk[1], GenerationChunk) or self.device_rank == 0
+            ),
+            itertools.chain(output, self._apply_cancellations()),
+        )
+
+    def _parse_responses(
+        self, results: list[tuple[int, GenerationResponse]]
+    ) -> list[tuple[TaskId, GenerationChunk | FinishedResponse]]:
+        output: list[tuple[TaskId, GenerationChunk | FinishedResponse]] = []
         for uid, response in results:
             if uid not in self._active_tasks:
                 # should we error here?
@@ -458,23 +494,22 @@ class BatchGenerator(Engine):
                 output.append((task.task_id, FinishedResponse()))
                 del self._active_tasks[uid]
 
-        return filter(
-            lambda chunk: (
-                not isinstance(chunk[1], GenerationChunk) or self.device_rank == 0
-            ),
-            itertools.chain(output, self._apply_cancellations()),
-        )
+        return output
 
     def _apply_cancellations(
         self,
-    ) -> Iterator[tuple[TaskId, CancelledResponse]]:
+    ) -> Iterator[
+        tuple[TaskId, GenerationChunk | FinishedResponse | CancelledResponse]
+    ]:
         if not self._cancelled_tasks:
             return iter([])
 
         cancel_all = CANCEL_ALL_TASKS in self._cancelled_tasks
 
         uids_to_cancel: list[int] = []
-        results: list[tuple[TaskId, CancelledResponse]] = []
+        results: list[
+            tuple[TaskId, GenerationChunk | FinishedResponse | CancelledResponse]
+        ] = []
 
         for uid, (task, _, _) in list(self._active_tasks.items()):
             if task.task_id in self._cancelled_tasks or cancel_all:
@@ -490,7 +525,27 @@ class BatchGenerator(Engine):
             if tid != CANCEL_ALL_TASKS and tid not in already_cancelled:
                 results.append((tid, CancelledResponse()))
 
+        # A cancelled task that hasn't started must never start: the runner has already
+        # forgotten it. The cancellation is agreed, so every rank drops the same tasks.
+        self._queue = deque(
+            task
+            for task in self._queue
+            if not cancel_all and task.task_id not in self._cancelled_tasks
+        )
+        self._maybe_queue = [
+            task
+            for task in self._maybe_queue
+            if not cancel_all and task.task_id not in self._cancelled_tasks
+        ]
         self._cancelled_tasks.clear()
+
+        if uids_to_cancel:
+            # Runner removes its last active task when it receives CancelledResponse.
+            # Finish the agreed decode first so its KV/lazy work cannot survive idle
+            # or overlap a following request's synchronous prefill. Normal MLX steps
+            # retain pipeline collective ordering; preserve surviving requests' output.
+            while self._gen.has_pending_cancellations:
+                results.extend(self._parse_responses(self._gen.step()))
         return iter(results)
 
     def _send_error(self, task: TextGeneration, e: Exception) -> None:

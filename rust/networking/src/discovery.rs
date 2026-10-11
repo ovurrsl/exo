@@ -18,6 +18,45 @@ use zenoh::config::ZenohId;
 const GROUP: Ipv6Addr = Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0xe0a1, 0xde89);
 const MAGIC: [u8; 3] = *b"EXO";
 
+#[cfg(not(windows))]
+type InterfaceWatch = WatchHandle;
+#[cfg(windows)]
+type InterfaceWatch = WindowsWatchHandle;
+
+/// On Windows `netwatcher::WatchHandle` holds a raw `HANDLE` from
+/// `NotifyIpInterfaceChange`, so it is not `Send` and `Discovery` could not be
+/// moved into a tokio task.
+#[cfg(windows)]
+struct WindowsWatchHandle(#[allow(dead_code)] WatchHandle);
+
+// SAFETY: the handle is only kept alive so interface-change callbacks keep
+// firing; it is never accessed after construction. Its only use is `Drop`,
+// which calls `CancelMibChangeNotify2` - documented as callable from any thread.
+#[cfg(windows)]
+unsafe impl Send for WindowsWatchHandle {}
+
+#[cfg(not(windows))]
+fn into_interface_watch(handle: WatchHandle) -> InterfaceWatch {
+    handle
+}
+
+#[cfg(windows)]
+fn into_interface_watch(handle: WatchHandle) -> InterfaceWatch {
+    WindowsWatchHandle(handle)
+}
+
+/// Joining a multicast group the socket has already joined fails with
+/// EADDRINUSE on unix, but with WSAEINVAL (10022) on Windows.
+fn is_already_joined(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    const WSAEINVAL: i32 = 10022;
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(WSAEINVAL) {
+        return true;
+    }
+    error.kind() == io::ErrorKind::AddrInUse
+}
+
 pub struct Discovery {
     sock: Arc<UdpSocket>,
     ifaces: Arc<Mutex<Vec<SocketAddrV6>>>,
@@ -27,7 +66,7 @@ pub struct Discovery {
     listen_port: u16,
     zid: ZenohId,
     tick: Interval,
-    _sync: Mutex<WatchHandle>,
+    _sync: Mutex<InterfaceWatch>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,7 +95,7 @@ impl Discovery {
         sock.set_multicast_loop_v6(true)?;
         let sock = Arc::new(UdpSocket::from_std(sock.into())?);
         let ifaces: Arc<Mutex<Vec<SocketAddrV6>>> = Default::default();
-        let _sync = Mutex::new(
+        let _sync = Mutex::new(into_interface_watch(
             netwatcher::watch_interfaces_with_callback({
                 let sock = sock.clone();
                 let ifaces = ifaces.clone();
@@ -76,7 +115,7 @@ impl Discovery {
                                 0,
                                 *iface_idx,
                             )),
-                            Err(e) if e.kind() != io::ErrorKind::AddrInUse => {
+                            Err(e) if !is_already_joined(&e) => {
                                 // skip AddrInUse - just means we've already joined the mv6
                                 if let Some(iface) = update.interfaces.get(&iface_idx) {
                                     warn!(
@@ -104,7 +143,7 @@ impl Discovery {
             })
             // todo: better error handling here
             .expect("failed to bind discovery watcher"),
-        );
+        ));
         Ok(Self {
             sock,
             namespace,

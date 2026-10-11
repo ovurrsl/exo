@@ -1,8 +1,10 @@
+import sys
 from collections.abc import Callable, Generator
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, cast
 
 import mlx.core as mx
+import mlx.nn as nn
 from mflux.models.common.config.config import Config
 from PIL import Image
 
@@ -14,6 +16,7 @@ from exo.shared.types.worker.shards import (
     PipelineShardMetadata,
     ShardMetadata,
 )
+from exo.utils.windows_image import validate_windows_image_model
 from exo.worker.engines.image.config import ImageModelConfig
 from exo.worker.engines.image.models import (
     create_adapter_for_model,
@@ -21,8 +24,14 @@ from exo.worker.engines.image.models import (
 )
 from exo.worker.engines.image.models.base import ModelAdapter
 from exo.worker.engines.image.pipeline import DiffusionRunner
+from exo.worker.engines.image.windows_memory import WindowsImageMemoryManager
 from exo.worker.engines.mlx.utils_mlx import mx_barrier
 from exo.worker.runner.bootstrap import logger
+
+
+class _AdapterModel(Protocol):
+    @property
+    def model(self) -> nn.Module: ...
 
 
 class DistributedImageModel:
@@ -39,8 +48,23 @@ class DistributedImageModel:
         group: mx.distributed.Group | None,
         quantize: int | None = None,
     ):
+        if sys.platform == "win32":
+            if quantize is not None or (group is not None and group.size() != 1):
+                raise ValueError(
+                    "Windows CUDA image generation requires the qualified stored "
+                    "precision and a single local device"
+                )
+            validate_windows_image_model(model_id, local_path, shard_metadata)
         config = get_config_for_model(model_id)
-        adapter = create_adapter_for_model(config, model_id, local_path, quantize)
+        if sys.platform == "win32":
+            with mx.stream(mx.Device(mx.cpu)):
+                adapter = create_adapter_for_model(
+                    config, model_id, local_path, quantize
+                )
+                host_model = cast(_AdapterModel, cast(object, adapter)).model
+                mx.eval(host_model.parameters())
+        else:
+            adapter = create_adapter_for_model(config, model_id, local_path, quantize)
 
         has_layer_sharding = (
             shard_metadata.start_layer != 0
@@ -53,11 +77,17 @@ class DistributedImageModel:
                 end_layer=shard_metadata.end_layer,
             )
 
+        windows_memory = (
+            WindowsImageMemoryManager(cast(_AdapterModel, cast(object, adapter)).model)
+            if sys.platform == "win32"
+            else None
+        )
         runner = DiffusionRunner(
             config=config,
             adapter=adapter,
             group=group,
             shard_metadata=shard_metadata,
+            windows_memory=windows_memory,
         )
 
         if group is not None:
@@ -112,6 +142,7 @@ class DistributedImageModel:
         partial_images: int = 0,
         advanced_params: AdvancedImageParams | None = None,
         cancel_checker: Callable[[], bool] | None = None,
+        image_strength: float | None = None,
     ) -> Generator[Image.Image | tuple[Image.Image, int, int], None, None]:
         if (
             advanced_params is not None
@@ -142,6 +173,7 @@ class DistributedImageModel:
             height=height,
             width=width,
             image_path=image_path,
+            image_strength=image_strength if sys.platform == "win32" else None,
             model_config=self._adapter.model.model_config,  # pyright: ignore[reportAny]
             guidance=guidance_override if guidance_override is not None else 4.0,
         )

@@ -81,31 +81,37 @@ nix run .#exo
 ```
 
 **Note:** To accept the Cachix binary cache (and avoid the Xcode Metal ToolChain), add to `/etc/nix/nix.conf`:
+
 ```
 trusted-users = root    (or your username)
 experimental-features = nix-command flakes
 ```
+
 Then restart the Nix daemon: `sudo launchctl kickstart -k system/org.nixos.nix-daemon`
 
 **Prerequisites:**
+
 - [Xcode](https://developer.apple.com/xcode/) (provides the Metal ToolChain required for MLX compilation)
 - [brew](https://github.com/Homebrew/brew) (for simple package management on macOS)
 
   ```bash
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
   ```
+
 - [uv](https://github.com/astral-sh/uv) (for Python dependency management)
 - [node](https://github.com/nodejs/node) (for building the dashboard)
 
   ```bash
   brew install uv node
   ```
+
 - [rust](https://github.com/rust-lang/rustup) (to build Rust bindings, nightly for now)
 
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   rustup toolchain install nightly
   ```
+
 - [macmon](https://github.com/vladkens/macmon) (for hardware monitoring on Apple Silicon)
 
   Install the pinned fork revision used by this repo instead of Homebrew `macmon`.
@@ -136,9 +142,7 @@ uv run exo
 
 This starts the exo dashboard and API at http://localhost:52415/
 
-
-*Please view the section on RDMA to enable this feature on MacOS >=26.2!*
-
+_Please view the section on RDMA to enable this feature on MacOS >=26.2!_
 
 ### Run from Source (Linux)
 
@@ -151,6 +155,7 @@ This starts the exo dashboard and API at http://localhost:52415/
 **Installation methods:**
 
 **Option 1: Using system package manager (Ubuntu/Debian example):**
+
 ```bash
 # Install Node.js and npm
 sudo apt update
@@ -165,6 +170,7 @@ rustup toolchain install nightly
 ```
 
 **Option 2: Using Homebrew on Linux (if preferred):**
+
 ```bash
 # Install Homebrew on Linux
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -226,6 +232,10 @@ exo follows the [XDG Base Directory Specification](https://specifications.freede
 
 You can override these locations by setting the corresponding XDG environment variables.
 
+### Run from Source (Windows, experimental)
+
+Windows PCs with an NVIDIA GPU can run exo natively and join a cluster with macOS nodes. See [docs/windows.md](docs/windows.md).
+
 ### macOS App
 
 exo ships a macOS app that runs in the background on your Mac.
@@ -246,16 +256,16 @@ The app will ask for permission to modify system settings and install a new Netw
 
 **Custom Namespace for Cluster Isolation:**
 
-The macOS app includes a custom namespace feature that allows you to isolate your exo cluster from others on the same network. This is configured through the `EXO_LIBP2P_NAMESPACE` setting:
+The macOS and Windows apps include a custom namespace feature that allows you to isolate your exo cluster from others on the same network. This is configured through the `EXO_ZENOH_NAMESPACE` setting:
 
 - **Use cases**:
   - Running multiple separate exo clusters on the same network
   - Isolating development/testing clusters from production clusters
   - Preventing accidental cluster joining
 
-- **Configuration**: Access this setting in the app's Advanced settings (or set the `EXO_LIBP2P_NAMESPACE` environment variable when running from source)
+- **Configuration**: Access this setting in the app's Advanced settings (or set the `EXO_ZENOH_NAMESPACE` environment variable when running from source)
 
-The namespace is logged on startup for debugging purposes.
+The namespace is logged on startup for debugging purposes. An explicit `--namespace` argument takes priority, followed by a nonempty `EXO_ZENOH_NAMESPACE`, then the package version. Nodes must use the same namespace to discover each other. `EXO_LIBP2P_NAMESPACE` is obsolete and rejected at startup.
 
 #### Uninstalling the macOS App
 
@@ -268,6 +278,7 @@ sudo ./app/EXO/uninstall-exo.sh
 ```
 
 This removes:
+
 - Network setup LaunchDaemon
 - Network configuration script
 - Log files
@@ -312,16 +323,16 @@ After that, RDMA will be enabled in macOS and exo will take care of the rest.
 
 exo supports several environment variables for configuration:
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `EXO_DEFAULT_MODELS_DIR` | Default directory for model downloads and caches. Always first in the writable dirs list. | `~/.local/share/exo/models` (Linux) or `~/.exo/models` (macOS) |
-| `EXO_MODELS_DIRS` | Colon-separated additional writable directories for model downloads. Checked in order after the default; first with enough free space is used. | None |
-| `EXO_MODELS_READ_ONLY_DIRS` | Colon-separated read-only directories to search for pre-downloaded models (e.g., NFS mounts, shared storage). Models here cannot be deleted. | None |
-| `EXO_OFFLINE` | Run without internet connection (uses only local models) | `false` |
-| `EXO_ENABLE_IMAGE_MODELS` | Enable image model support | `false` |
-| `EXO_LIBP2P_NAMESPACE` | Custom namespace for cluster isolation | None |
-| `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
-| `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
+| Variable                    | Description                                                                                                                                    | Default                                                        |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `EXO_DEFAULT_MODELS_DIR`    | Default directory for model downloads and caches. Always first in the writable dirs list.                                                      | `~/.local/share/exo/models` (Linux) or `~/.exo/models` (macOS) |
+| `EXO_MODELS_DIRS`           | Colon-separated additional writable directories for model downloads. Checked in order after the default; first with enough free space is used. | None                                                           |
+| `EXO_MODELS_READ_ONLY_DIRS` | Colon-separated read-only directories to search for pre-downloaded models (e.g., NFS mounts, shared storage). Models here cannot be deleted.   | None                                                           |
+| `EXO_OFFLINE`               | Run without internet connection (uses only local models)                                                                                       | `false`                                                        |
+| `EXO_ENABLE_IMAGE_MODELS`   | Enable image model support                                                                                                                     | `false`                                                        |
+| `EXO_ZENOH_NAMESPACE`       | Custom namespace for cluster isolation                                                                                                         | Package version                                                |
+| `EXO_FAST_SYNCH`            | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend)                                                                                      | Auto                                                           |
+| `EXO_TRACING_ENABLED`       | Enable distributed tracing for performance analysis                                                                                            | `false`                                                        |
 
 **Example usage:**
 
@@ -339,7 +350,7 @@ EXO_OFFLINE=true uv run exo
 EXO_ENABLE_IMAGE_MODELS=true uv run exo
 
 # Use custom namespace for cluster isolation
-EXO_LIBP2P_NAMESPACE=my-dev-cluster uv run exo
+EXO_ZENOH_NAMESPACE=my-dev-cluster uv run exo
 ```
 
 ---
@@ -403,7 +414,6 @@ curl -X POST http://localhost:52415/instance \
     "instance": {...}
   }'
 ```
-
 
 Sample response:
 
@@ -523,7 +533,7 @@ curl -X POST http://localhost:52415/models/add \
 
 Custom models requiring `trust_remote_code` in their configuration must be explicitly enabled (default is false) for security. Only enable this if you trust the model's remote code execution. Models are fetched from HuggingFace and stored locally as custom model cards.
 
-**Other useful API endpoints*:**
+**Other useful API endpoints\*:**
 
 - List all models: `curl http://localhost:52415/models`
 - List downloaded models only: `curl http://localhost:52415/models?status=downloaded`
@@ -542,6 +552,7 @@ For further details, see:
 The `exo-bench` tool measures model prefill and token generation speed across different placement configurations. This helps you optimize model performance and validate improvements.
 
 **Prerequisites:**
+
 - Nodes should be running with `uv run exo` before benchmarking
 - The tool uses the `/bench/chat/completions` endpoint
 

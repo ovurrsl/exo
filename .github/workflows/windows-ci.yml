@@ -1,0 +1,152 @@
+name: Windows checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  windows-cpu:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.22"
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: Build dashboard assets required by core tests
+        working-directory: dashboard
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Dashboard dependency installation failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Dashboard assets build failed' }
+      - name: Install Python and CPU-test dependencies
+        run: uv sync --frozen --extra mlx-none
+      - name: Lint Windows package and validation code
+        run: uv run --no-sync ruff check packaging/windows scripts/windows
+      - name: Validate PowerShell syntax
+        shell: pwsh
+        run: |
+          $scripts = Get-ChildItem scripts/windows -Recurse -Filter *.ps1
+          foreach ($script in $scripts) {
+            $errors = $null
+            $tokens = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { throw ($errors | Out-String) }
+          }
+      - name: Run shared and platform unit tests
+        run: uv run --no-sync pytest --import-mode=importlib src/exo/shared/tests src/exo/utils/tests scripts/windows/tests
+      - name: Check Windows Rust transports
+        run: cargo test --workspace
+
+  python-platform-types:
+    runs-on: windows-2025
+    strategy:
+      matrix:
+        platform: [Windows, Darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.22"
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install inference sources for CPU-hosted type analysis
+        shell: pwsh
+        run: |
+          uv sync --frozen --extra mlx-cuda13 --no-install-package mlx --no-install-package nvidia-cublas --no-install-package nvidia-cuda-nvrtc --no-install-package nvidia-cuda-runtime --no-install-package nvidia-cudnn-cu13 --no-install-package nvidia-cufft --no-install-package nvidia-cusolver --no-install-package nvidia-cusparse --no-install-package nvidia-nvjitlink
+          if ($LASTEXITCODE -ne 0) { throw 'CPU inference source installation failed' }
+          # Source resolution only: use the public MLX module with repository
+          # stubs, without the unpublished candidate or CUDA runtime libraries.
+          uv pip install --no-deps mlx==0.32.3 python-daemon==3.1.2
+          if ($LASTEXITCODE -ne 0) { throw 'Public MLX analysis module installation failed' }
+      - name: Check the complete Python source, tools and bench scope
+        run: uv run --no-sync basedpyright --pythonplatform ${{ matrix.platform }}
+
+  windows-dashboard:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: Test Windows image placement and build dashboard
+        working-directory: dashboard
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Dashboard dependency installation failed' }
+          npm run test:windows-image-fit
+          if ($LASTEXITCODE -ne 0) { throw 'Windows image fit tests failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Dashboard production build failed' }
+
+  windows-desktop:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/windows/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check Windows shell formatting with its Cargo edition
+        working-directory: app/windows/src-tauri
+        run: cargo fmt --check
+      - name: Install desktop build dependencies
+        working-directory: app/windows
+        run: npm ci
+      - name: Type-check desktop UI
+        working-directory: app/windows
+        run: npm run check
+      - name: Test and build desktop UI
+        working-directory: app/windows
+        shell: pwsh
+        run: |
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop UI unit tests failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop UI production build failed' }
+      - name: Install headless Chrome and test desktop flows
+        working-directory: app/windows
+        shell: pwsh
+        run: |
+          npx playwright install chrome
+          if ($LASTEXITCODE -ne 0) { throw 'Playwright Chrome installation failed' }
+          npm run test:ui
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop headless UI tests failed' }
+      - name: Test Windows shell
+        working-directory: app/windows/src-tauri
+        shell: pwsh
+        run: |
+          # Headless unit tests create no browser or inference runtime. Keep
+          # packaging paths present without downloading GPU/browser binaries.
+          foreach ($folder in @('runtime', 'firewall', 'webview2')) {
+            New-Item -ItemType Directory -Path "resources/$folder" -Force | Out-Null
+            New-Item -ItemType File -Path "resources/$folder/.gitkeep" -Force | Out-Null
+          }
+          # Compile the native Settings helper and run its verifier units;
+          # cargo test does not run the helper's WebView/event-loop main.
+          cargo test --features process-test-helper,firewall-helper,native-settings-probe
+          if ($LASTEXITCODE -ne 0) { throw 'Windows shell tests failed' }
+      - name: Check Windows shell lint
+        working-directory: app/windows/src-tauri
+        run: cargo clippy --all-targets --features process-test-helper,firewall-helper,native-settings-probe -- -D warnings
+
+# A hosted CPU runner cannot establish CUDA or heterogeneous cluster parity.
+# The installer workflow runs separate physical GPU and Mac-cluster gates.

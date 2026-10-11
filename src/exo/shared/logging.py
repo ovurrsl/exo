@@ -10,6 +10,12 @@ from loguru import logger
 
 _MAX_LOG_ARCHIVES = 5
 
+# loguru's diagnose mode calls repr() on every local in a traceback, and the
+# repr of an MLX CUDA object can crash the process mid-log, replacing the real
+# error with an opaque crash (exo-explore/exo#2290). Windows nodes always run
+# MLX on CUDA; other platforms keep the detailed tracebacks.
+_DIAGNOSE_TRACEBACKS = sys.platform != "win32"
+
 
 def _zstd_compress(filepath: str) -> None:
     source = Path(filepath)
@@ -63,6 +69,7 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
             level="INFO",
             colorize=True,
             enqueue=True,
+            diagnose=_DIAGNOSE_TRACEBACKS,
         )
     else:
         logger.add(
@@ -71,6 +78,7 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
             level="DEBUG",
             colorize=True,
             enqueue=True,
+            diagnose=_DIAGNOSE_TRACEBACKS,
         )
     if log_file:
         rotate_once = _once_then_never()
@@ -80,6 +88,7 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
             level="DEBUG" if verbosity > 0 else "INFO",
             colorize=False,
             enqueue=True,
+            diagnose=_DIAGNOSE_TRACEBACKS,
             rotation=lambda _, __: next(rotate_once),
             retention=_MAX_LOG_ARCHIVES,
             compression=_zstd_compress,

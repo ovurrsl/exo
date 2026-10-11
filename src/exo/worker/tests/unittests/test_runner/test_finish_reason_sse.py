@@ -1,8 +1,19 @@
 import json
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from typing import Any
 
-from exo.api.types import CompletionTokensDetails, PromptTokensDetails, Usage
+import pytest
+
+from exo.api.adapters.chat_completions import collect_chat_response
+from exo.api.types import (
+    ChatCompletionChoice,
+    ChatCompletionResponse,
+    CompletionTokensDetails,
+    PromptTokensDetails,
+    Usage,
+)
+from exo.shared.types.chunks import TokenChunk
+from exo.shared.types.common import CommandId, ModelId
 from exo.shared.types.worker.runner_response import (
     FinishReason,
     GenerationResponse,
@@ -17,6 +28,7 @@ from exo.worker.engines.mlx.vendor.dsml_encoding import (
 )
 from exo.worker.runner.llm_inference.model_output_parsers import (
     count_reasoning_tokens,
+    map_responses_to_chunks,
     parse_deepseek_v32,
     parse_thinking_models,
     parse_tool_calls,
@@ -211,7 +223,127 @@ class TestThinkingModelsFinishReason:
             if isinstance(r, GenerationResponse) and r.finish_reason is not None
         ]
         assert len(last_gen) == 1
-        assert last_gen[0].is_thinking is False
+        assert last_gen[0].is_thinking is True
+
+    @pytest.mark.parametrize("starts_in_thinking", [False, True])
+    @pytest.mark.parametrize("terminal_text", [" basic", "", "</thi"])
+    def test_truncated_reasoning_terminal_never_becomes_answer(
+        self, starts_in_thinking: bool, terminal_text: str
+    ) -> None:
+        tokens = [] if starts_in_thinking else [_make_response("<think>", 0)]
+        tokens += [
+            _make_response("reasoning", 1),
+            _make_response(terminal_text, 2, finish_reason="length"),
+        ]
+        results = _step_until_finish(
+            parse_thinking_models(
+                _queue_source(tokens), "<think>", "</think>", starts_in_thinking
+            )
+        )
+        generations = [r for r in results if isinstance(r, GenerationResponse)]
+        assert all(r.is_thinking for r in generations)
+        assert "".join(r.text for r in generations) == "reasoning" + terminal_text
+        assert generations[-1].finish_reason == "length"
+        assert sum(r.finish_reason is not None for r in generations) == 1
+
+    @pytest.mark.parametrize("starts_in_thinking", [False, True])
+    @pytest.mark.parametrize("closing_parts", [["</think>"], ["</", "think", ">"]])
+    def test_terminal_closing_tag_is_swallowed_without_losing_finish(
+        self, starts_in_thinking: bool, closing_parts: list[str]
+    ) -> None:
+        tokens = [] if starts_in_thinking else [_make_response("<think>", 0)]
+        tokens.append(_make_response("reasoning", 1))
+        tokens.extend(
+            _make_response(text, i + 2) for i, text in enumerate(closing_parts[:-1])
+        )
+        tokens.append(_make_response(closing_parts[-1], 9, finish_reason="stop"))
+        results = _step_until_finish(
+            parse_thinking_models(
+                _queue_source(tokens), "<think>", "</think>", starts_in_thinking
+            )
+        )
+        generations = [r for r in results if isinstance(r, GenerationResponse)]
+        assert [(r.text, r.is_thinking) for r in generations] == [
+            ("reasoning", True),
+            ("", False),
+        ]
+        assert generations[-1].finish_reason == "stop"
+
+    def test_truncated_terminal_reasoning_counts_in_usage(self) -> None:
+        usage = Usage(
+            prompt_tokens=10,
+            completion_tokens=2,
+            total_tokens=12,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
+            completion_tokens_details=CompletionTokensDetails(reasoning_tokens=0),
+        )
+        tokens = [
+            _make_response("reasoning", 1),
+            GenerationResponse(
+                text=" basic", token=2, finish_reason="length", usage=usage
+            ),
+        ]
+        results = _step_until_finish(
+            count_reasoning_tokens(
+                parse_thinking_models(
+                    _queue_source(tokens), "<think>", "</think>", True
+                )
+            )
+        )
+        final = results[-1]
+        assert isinstance(final, GenerationResponse)
+        assert final.usage is not None
+        assert final.usage.completion_tokens_details.reasoning_tokens == 2
+
+    @pytest.mark.parametrize("terminal_text", ["thi", ""])
+    def test_terminal_partial_closing_tag_keeps_buffered_reasoning(
+        self, terminal_text: str
+    ) -> None:
+        tokens = [
+            _make_response("reasoning", 0),
+            _make_response("</", 1),
+            _make_response(terminal_text, 2, finish_reason="length"),
+        ]
+        results = _step_until_finish(
+            parse_thinking_models(_queue_source(tokens), "<think>", "</think>", True)
+        )
+        generations = [r for r in results if isinstance(r, GenerationResponse)]
+        assert all(r.is_thinking for r in generations)
+        assert "".join(r.text for r in generations) == "reasoning</" + terminal_text
+        assert generations[-1].finish_reason == "length"
+
+    async def test_collected_api_truncation_has_no_final_answer_leak(self) -> None:
+        responses = _step_until_finish(
+            parse_thinking_models(
+                _queue_source(
+                    [
+                        _make_response("reasoning", 0),
+                        _make_response(" basic", 1, finish_reason="length"),
+                    ]
+                ),
+                "<think>",
+                "</think>",
+                True,
+            )
+        )
+
+        async def chunks() -> AsyncGenerator[TokenChunk]:
+            for response in responses:
+                chunk = map_responses_to_chunks(response, ModelId("qwen3"))
+                assert isinstance(chunk, TokenChunk)
+                yield chunk
+
+        collected = [
+            part
+            async for part in collect_chat_response(CommandId("truncated"), chunks())
+        ]
+        assert len(collected) == 1
+        completion = ChatCompletionResponse.model_validate_json(collected[0])
+        choice = completion.choices[0]
+        assert isinstance(choice, ChatCompletionChoice)
+        assert choice.message.content == ""
+        assert choice.message.reasoning_content == "reasoning basic"
+        assert choice.finish_reason == "length"
 
     def test_finish_reason_after_thinking(self):
         tokens = [

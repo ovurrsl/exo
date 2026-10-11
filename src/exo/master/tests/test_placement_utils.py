@@ -498,6 +498,28 @@ def test_get_shard_assignments_insufficient_memory_raises():
 
 
 class TestCfgParallelPlacement:
+    def test_second_cfg_group_must_fit_mirrored_weights(self):
+        nodes = [NodeId() for _ in range(4)]
+        cycle = next(
+            c for c in self._create_ring_topology(nodes).get_cycles() if len(c) == 4
+        )
+        node_memory = {
+            node: create_node_memory((1000 if index < 2 else 1) * 1024)
+            for index, node in enumerate(cycle.node_ids)
+        }
+        model_card = ModelCard(
+            model_id=ModelId("qwen-image-test"),
+            n_layers=60,
+            storage_size=Memory.from_kb(1000),
+            hidden_size=1,
+            supports_tensor=False,
+            uses_cfg=True,
+            tasks=[ModelTask.TextToImage],
+            backends=[Backend.MlxMetal],
+        )
+        with pytest.raises(ValueError, match="CFG group 1"):
+            get_shard_assignments_for_pipeline_parallel(model_card, cycle, node_memory)
+
     def _create_ring_topology(self, node_ids: list[NodeId]) -> Topology:
         topology = Topology()
         for node_id in node_ids:

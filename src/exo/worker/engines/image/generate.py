@@ -1,11 +1,12 @@
 import base64
 import io
 import random
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Generator, Literal
+from typing import Generator, Literal, TypedDict
 
 import mlx.core as mx
 from PIL import Image
@@ -22,6 +23,10 @@ from exo.shared.types.chunks import ImageChunk
 from exo.shared.types.common import ModelId
 from exo.shared.types.memory import Memory
 from exo.worker.engines.image.distributed_model import DistributedImageModel
+
+
+class _WindowsEditOptions(TypedDict, total=False):
+    image_strength: float | None
 
 
 def parse_size(size_str: ImageSize) -> tuple[int, int]:
@@ -97,6 +102,9 @@ def generate_image(
     )
 
     image_path: Path | None = None
+    edit_options: _WindowsEditOptions = {}
+    if isinstance(task, ImageEditsTaskParams) and sys.platform == "win32":
+        edit_options["image_strength"] = task.image_strength
 
     with tempfile.TemporaryDirectory() as tmpdir:
         if isinstance(task, ImageEditsTaskParams):
@@ -121,6 +129,7 @@ def generate_image(
                 partial_images=partial_images,
                 advanced_params=advanced_params,
                 cancel_checker=cancel_checker,
+                **edit_options,
             ):
                 if isinstance(result, tuple):
                     # Partial image: (Image, partial_index, total_partials)

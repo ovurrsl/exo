@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "upstream_commit": "64ea011cb65f14d9ce2737e60db9a4ae91ed7441",
+  "patch_sha256": "37762249a1112031eae074b50f80403c38730b2bd962e1cb6039775aa3f1805c",
+  "wheel_filename": "mlx-0.32.3.dev20261009-cp313-cp313-win_amd64.whl",
+  "wheel_sha256": "364daa278b094f771e55dad7739369c1b77e8f349726e25ff93e261af212a5c5",
+  "backend": "cuda13",
+  "architectures": "75-real;80-real;89-real;120a-real;120-virtual",
+  "built_at_utc": "2026-10-09T17:25:53.1230578Z",
+  "release_gates": "native CUDA gates passed; frozen and physical Mac/Windows gates pending",
+  "native_gates": {
+    "passed": true,
+    "report_sha256": "80d11120782adc850d0c072c4c406ca6006631466c648f3be7e255447c6f0aaa",
+    "gpu": "NVIDIA GeForce RTX 5070",
+    "driver": "617.42",
+    "checks": 31,
+    "idle_cpu_percent_of_one_core": 0.78,
+    "includes_interpreter_descendants": true
+  }
+}

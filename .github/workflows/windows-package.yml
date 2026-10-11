@@ -1,0 +1,134 @@
+name: Windows physical release gates
+
+on:
+  workflow_dispatch:
+    inputs:
+      wheel_path:
+        description: "Local reviewed MLX wheel with adjacent .provenance.json"
+        type: string
+        required: true
+      large_model_shard:
+        description: "Real >2 GiB model shard for the native and frozen release gates"
+        type: string
+        required: true
+      model_cache:
+        description: "Read-only model root containing mlx-community/Qwen3-0.6B-4bit"
+        type: string
+        required: true
+      vision_model_cache:
+        description: "Optional read-only root containing the specified vision model"
+        type: string
+        required: false
+      vision_model:
+        description: "Optional vision model ID; required with vision_model_cache"
+        type: string
+        required: false
+      image_model_cache:
+        description: "Optional verified FLUX.1-schnell root; full local image qualification must pass first"
+        type: string
+        required: false
+      mac_cluster_hostfile:
+        description: "Hostfile for the physical Mac + Windows mixed ring"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  package:
+    runs-on: [self-hosted, Windows, X64, exo-cuda13]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.22"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Stage the reviewed candidate and install GPU dependencies
+        shell: pwsh
+        env:
+          MLX_WHEEL: ${{ inputs.wheel_path }}
+        run: |
+          ./scripts/windows/prepare-runtime-wheel.ps1 -WheelPath $env:MLX_WHEEL
+          uv sync --frozen --extra mlx-cuda13
+      - name: Check all Python code with the installed GPU dependencies
+        shell: pwsh
+        run: |
+          uv run --no-sync basedpyright --pythonplatform Windows
+          if ($LASTEXITCODE -ne 0) { throw 'Full Windows type check failed' }
+          uv run --no-sync basedpyright --pythonplatform Darwin
+          if ($LASTEXITCODE -ne 0) { throw 'Full Darwin type check failed' }
+      - name: Run compilerless native wheel gates
+        shell: pwsh
+        env:
+          MLX_WHEEL: ${{ inputs.wheel_path }}
+          LARGE_MODEL_SHARD: ${{ inputs.large_model_shard }}
+        run: |
+          ./scripts/windows/mlx/check-mlx-wheel.ps1 -LargeFile $env:LARGE_MODEL_SHARD -Output dist/windows/native-wheel-gates.json
+      - name: Build and validate offline Windows installer
+        shell: pwsh
+        env:
+          MLX_WHEEL: ${{ inputs.wheel_path }}
+          LARGE_MODEL_SHARD: ${{ inputs.large_model_shard }}
+        run: |
+          ./scripts/windows/build-installer.ps1 -MlxWheel $env:MLX_WHEEL -LargeFile $env:LARGE_MODEL_SHARD
+      - name: Run physical Mac/Windows ring rank
+        shell: pwsh
+        env:
+          MAC_CLUSTER_HOSTFILE: ${{ inputs.mac_cluster_hostfile }}
+          MLX_RANK: "1"
+        run: |
+          $env:MLX_HOSTFILE = $env:MAC_CLUSTER_HOSTFILE
+          ./dist/windows/exo/exo.exe --runtime-check --worker ring --device gpu --exo-hook
+          if ($LASTEXITCODE -ne 7) { throw 'Physical mixed ring gate failed' }
+      - name: Validate real CUDA HTTP inference in the frozen runtime
+        shell: pwsh
+        env:
+          MODEL_CACHE: ${{ inputs.model_cache }}
+        run: |
+          ./.venv/Scripts/python.exe scripts/windows/check_inference.py --model-dir $env:MODEL_CACHE --runtime ./dist/windows/exo/exo.exe --output dist/windows/frozen-inference --exercise-cancel
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen chat/cancellation/worker-shutdown gate failed' }
+      - name: Validate frozen vision inference when weights are supplied
+        if: ${{ inputs.vision_model_cache != '' }}
+        shell: pwsh
+        env:
+          VISION_MODEL_CACHE: ${{ inputs.vision_model_cache }}
+          VISION_MODEL: ${{ inputs.vision_model }}
+        run: |
+          if (-not $env:VISION_MODEL) { throw 'vision_model is required when vision_model_cache is set' }
+          ./.venv/Scripts/python.exe scripts/windows/check_inference.py --model-dir $env:VISION_MODEL_CACHE --model $env:VISION_MODEL --vision --runtime ./dist/windows/exo/exo.exe --output dist/windows/frozen-vision
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen vision/worker-shutdown gate failed' }
+      - name: Validate real frozen image inference when qualified weights are supplied
+        if: ${{ inputs.image_model_cache != '' }}
+        shell: pwsh
+        env:
+          IMAGE_MODEL_CACHE: ${{ inputs.image_model_cache }}
+        run: |
+          ./.venv/Scripts/python.exe scripts/windows/check_image_inference.py --model-dir $env:IMAGE_MODEL_CACHE --runtime ./dist/windows/exo/exo.exe --output dist/windows/frozen-image --exercise-edit
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen image/edit/conditioning/cancellation/recovery/worker-shutdown gate failed' }
+      - name: Prepare consumer runtime acceptance kit
+        shell: pwsh
+        run: ./scripts/windows/build-acceptance-kit.ps1 -OutputDirectory dist/windows/consumer-acceptance-kit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-candidate-installer
+          path: |
+            app/windows/src-tauri/target/release/bundle/nsis/*.exe
+            dist/windows/*gates.json
+            dist/windows/exo/runtime-manifest.json
+            dist/windows/frozen-inference/**
+            dist/windows/frozen-vision/**
+            dist/windows/frozen-image/**
+            dist/windows/consumer-acceptance-kit/**
+          if-no-files-found: error
+
+# The Mac must run the same check_mlx.py --worker ring --device gpu --exo-hook
+# at rank 0 against its unchanged MLX install. A real same-model PP/TP inference,
+# vision/image request, recovery and clean-machine installer check are also needed
+# before a candidate is published. This workflow never publishes releases.

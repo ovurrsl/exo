@@ -115,6 +115,8 @@
               rustfmt = {
                 enable = true;
                 package = config.rust.toolchain;
+                # The Windows desktop uses its own Cargo edition and CI fmt gate.
+                excludes = [ "app/windows/**" ];
               };
               prettier = {
                 enable = true;

@@ -38,6 +38,11 @@ bench/**/*.json
 # tmp
 tmp/models
 /build/exo
+/build/
+# Archived Windows wheels stay local; publish validated binaries as release assets.
+/vendor/windows/**/*.whl
+/tmp-*.txt
+/tmp-types*.json
 /.agents
 /.claude/skills
 /.claude

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import anyio
 from loguru import logger
 
+from exo.master.cuda_placement import failed_cuda_instance_events
 from exo.master.placement import (
     add_instance_to_placements,
     cancel_unnecessary_downloads,
@@ -11,6 +12,14 @@ from exo.master.placement import (
     place_instance,
 )
 from exo.master.placement_utils import find_ip_prioritised
+from exo.master.windows_image_placement import (
+    cuda_image_instance_memory,
+    windows_nodes,
+)
+from exo.master.windows_text_placement import (
+    cuda_text_instance_memory,
+    local_windows_text_offload_policy,
+)
 from exo.routing.event_router import (
     EventRouterBrokenResourceError,
     EventRouterClosedResourceError,
@@ -378,12 +387,73 @@ class Master:
                                 self.state.node_backends,
                                 download_status=self.state.downloads,
                                 node_rdma_ctl=self.state.node_rdma_ctl,
+                                windows_node_ids=windows_nodes(
+                                    self.state.node_identities
+                                ),
+                                offload_policy=local_windows_text_offload_policy(),
+                                local_node_id=self.node_id,
                             )
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks
                             )
                             generated_events.extend(transition_events)
                         case CreateInstance():
+                            image_memory = (
+                                cuda_image_instance_memory(
+                                    command.instance,
+                                    next(
+                                        iter(
+                                            command.instance.shard_assignments.runner_to_shard.values()
+                                        )
+                                    ).model_card,
+                                    self.state.node_backends,
+                                    windows_nodes(self.state.node_identities),
+                                )
+                                if command.instance.shard_assignments.runner_to_shard
+                                else None
+                            )
+                            if command.instance.shard_assignments.runner_to_shard:
+                                local_capacity = self.state.node_memory.get(
+                                    self.node_id
+                                )
+                                model_card = next(
+                                    iter(
+                                        command.instance.shard_assignments.runner_to_shard.values()
+                                    )
+                                ).model_card
+                                text_memory = (
+                                    cuda_text_instance_memory(
+                                        command.instance,
+                                        next(
+                                            iter(
+                                                command.instance.shard_assignments.runner_to_shard.values()
+                                            )
+                                        ).model_card,
+                                        self.state.node_backends,
+                                        windows_nodes(self.state.node_identities),
+                                        offload_policy=local_windows_text_offload_policy(),
+                                        local_node_id=self.node_id,
+                                    )
+                                    if local_capacity is None
+                                    or model_card.storage_size
+                                    > local_capacity.ram_available
+                                    else None
+                                )
+                                image_memory = image_memory or text_memory
+                            if image_memory is not None:
+                                node_id = next(
+                                    iter(
+                                        command.instance.shard_assignments.node_to_runner
+                                    )
+                                )
+                                capacity = self.state.node_memory.get(node_id)
+                                if (
+                                    capacity is None
+                                    or image_memory > capacity.ram_available
+                                ):
+                                    raise ValueError(
+                                        "Windows CUDA image GPU capacity is insufficient"
+                                    )
                             placement = add_instance_to_placements(
                                 command,
                                 self.state.topology,
@@ -470,6 +540,8 @@ class Master:
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
     async def _plan(self) -> None:
         while True:
+            for event in failed_cuda_instance_events(self.state):
+                await self.event_sender.send(event)
             # kill broken instances
             connected_node_ids = set(self.state.topology.list_nodes())
             for instance_id, instance in self.state.instances.items():

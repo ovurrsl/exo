@@ -1,7 +1,10 @@
 import gc
+import hashlib
+import json
 import os
+import sys
 from copy import deepcopy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
 import numpy as np
@@ -20,8 +23,10 @@ from mlx_lm.models.deepseek_v4 import (
     _CompressorBranch as CompressorBranch,  # type: ignore
 )
 from mlx_lm.tokenizer_utils import TokenizerWrapper
+from numpy.typing import NDArray
 
 from exo.shared.types.memory import Memory
+from exo.utils.windows_gpu import read_gpu_memory
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.runner.bootstrap import logger
@@ -46,6 +51,41 @@ def _default_memory_threshold() -> float:
 _MEMORY_THRESHOLD = float(
     os.environ.get("EXO_MEMORY_THRESHOLD", _default_memory_threshold())
 )
+
+# On a Windows CUDA node the KV cache lives in GPU memory: evict once less than
+# this much of it is free (see get_memory_used_percentage). Keep it below the
+# 2.5 GiB the node leaves out of the memory it reports, or a model placed to
+# fill the GPU would evict on every request.
+_WINDOWS_GPU_MIN_FREE = Memory.from_mb(
+    int(os.environ.get("EXO_WINDOWS_GPU_MIN_FREE_MB", "1024"))
+    if sys.platform == "win32"
+    else 1024
+)
+
+# Bound token lookup and metadata work even while CUDA has ample free memory.
+# All members of a CUDA-containing group apply the same limit and LRU order.
+_MAX_CUDA_PREFIX_CACHE_ENTRIES = 32
+
+
+def is_cuda_device() -> bool:
+    return (
+        sys.platform != "darwin"
+        and mx.cuda.is_available()
+        and mx.default_device() == mx.gpu
+    )
+
+
+def discover_cuda_cache_group(group: mx.distributed.Group | None) -> bool:
+    """All ranks discover actual devices before any cache-dependent branching."""
+    local_cuda = is_cuda_device()
+    if group is None:
+        return local_cuda
+    cpu = mx.Device(mx.cpu)
+    with mx.stream(cpu):
+        flags = mx.distributed.all_gather(
+            mx.array([int(local_cuda)], dtype=mx.int32), group=group, stream=cpu
+        )
+        return bool(mx.max(flags).item())
 
 
 class CacheSnapshot:
@@ -229,8 +269,21 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
     return any(is_non_trimmable_cache_entry(c) for c in cache)
 
 
+_MAX_RETAINED_SNAPSHOTS = 16
+
+
+def _bounded_snapshots(snapshots: list[CacheSnapshot]) -> list[CacheSnapshot]:
+    # A position identifies a prefix only within this entry. Keep the newest
+    # snapshot at each position, then the latest restore points. Older hybrid
+    # prefixes fall back to cold prefill when no retained snapshot applies.
+    by_position = {snapshot.token_count: snapshot for snapshot in snapshots}
+    return [by_position[position] for position in sorted(by_position)][
+        -_MAX_RETAINED_SNAPSHOTS:
+    ]
+
+
 class KVPrefixCache:
-    def __init__(self, group: mx.distributed.Group | None):
+    def __init__(self, group: mx.distributed.Group | None, *, cuda_group: bool = False):
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
         self.caches: list[KVCacheType] = []
         self._snapshots: list[list[CacheSnapshot] | None] = []
@@ -239,6 +292,8 @@ class KVPrefixCache:
         self.prefill_tps: list[float] = []
         self._access_counter: int = 0
         self._group = group
+        self._cuda_group = cuda_group
+        self._identities: list[str] = []
 
     def clear(self):
         """Clear all cached prompts and caches."""
@@ -248,6 +303,7 @@ class KVPrefixCache:
         self._media_regions.clear()
         self._last_used.clear()
         self.prefill_tps.clear()
+        self._identities.clear()
 
     def add_kv_cache(
         self,
@@ -258,14 +314,39 @@ class KVPrefixCache:
         prefill_tps: float = 0.0,
     ):
         """Add a new cache entry. Evicts LRU entries if memory is high."""
-        self._evict_if_needed()
+        if self._cuda_group:
+            # Validate shared identities before branching into refresh or append.
+            self._evict_if_needed()
+            identity = self._entry_identity(prompt_tokens, media_regions)
+            if identity in self._identities:
+                index = self._identities.index(identity)
+                # Identical tokens and media make retained restore points valid,
+                # but only up to the new cache's actual prefilled position.
+                self.update_kv_cache(
+                    index,
+                    prompt_tokens,
+                    cache,
+                    ssm_snapshots,
+                    restore_pos=cache_length(cache),
+                    media_regions=media_regions,
+                    prefill_tps=prefill_tps,
+                )
+                return
+            self._evict_cuda_group(reserve_entry=True)
+        else:
+            self._evict_if_needed()
         self.prompts.append(prompt_tokens)
         self.caches.append(deepcopy(cache))
-        self._snapshots.append(ssm_snapshots)
+        self._snapshots.append(
+            _bounded_snapshots(ssm_snapshots) if ssm_snapshots else None
+        )
         self._media_regions.append(media_regions or [])
         self.prefill_tps.append(prefill_tps)
         self._access_counter += 1
         self._last_used.append(self._access_counter)
+        if self._cuda_group:
+            self._identities.append(self._entry_identity(prompt_tokens, media_regions))
+            _ = self._cuda_eviction_state()
         logger.info(f"KV cache added: {len(prompt_tokens)} tokens")
 
     def update_kv_cache(
@@ -288,11 +369,14 @@ class KVPrefixCache:
 
         self.prompts[index] = prompt_tokens
         self.caches[index] = deepcopy(cache)
-        self._snapshots[index] = merged or None
+        self._snapshots[index] = _bounded_snapshots(merged) or None
         self._media_regions[index] = media_regions or []
         self.prefill_tps[index] = prefill_tps
         self._access_counter += 1
         self._last_used[index] = self._access_counter
+        if self._cuda_group:
+            self._identities[index] = self._entry_identity(prompt_tokens, media_regions)
+            _ = self._cuda_eviction_state()
         logger.info(f"KV cache updated (index {index}): {len(prompt_tokens)} tokens")
 
     def _get_snapshot(
@@ -335,6 +419,8 @@ class KVPrefixCache:
         match is truncated to the start of that region.
         """
         max_length = len(prompt_tokens)
+        if self._cuda_group:
+            _ = self._cuda_eviction_state()
         query_regions = media_regions or []
 
         best_index: int | None = None
@@ -428,6 +514,9 @@ class KVPrefixCache:
 
     def _evict_if_needed(self):
         """Evict least recently used entries while memory usage is high."""
+        if self._cuda_group:
+            self._evict_cuda_group()
+            return
         if len(self.caches) == 0:
             return
 
@@ -451,6 +540,89 @@ class KVPrefixCache:
                 f"KV cache evicted LRU entry ({evicted_tokens} tokens) due to memory usage"
             )
 
+        if evicted_any:
+            gc.collect()
+            mx.clear_cache()
+
+    @staticmethod
+    def _entry_identity(
+        tokens: mx.array, media_regions: list["MediaRegion"] | None
+    ) -> str:
+        digest = hashlib.sha256(np.asarray(tokens, dtype="<i8").tobytes())
+        regions = [
+            (region.start_pos, region.end_pos, region.content_hash)
+            for region in media_regions or []
+        ]
+        digest.update(json.dumps(regions, separators=(",", ":")).encode("utf-8"))
+        return digest.hexdigest()
+
+    def _cuda_eviction_state(self) -> tuple[int, bool]:
+        # Even an empty rank participates. A fixed-size header avoids hanging
+        # peers when cache lengths have already diverged.
+        count = len(self.caches)
+        aligned = all(
+            len(values) == count
+            for values in (
+                self.prompts,
+                self._snapshots,
+                self._media_regions,
+                self._last_used,
+                self.prefill_tps,
+                self._identities,
+            )
+        )
+        identity = hashlib.sha256(
+            json.dumps(
+                (self._identities, self._last_used, self._access_counter),
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).digest()
+        local_evict = get_memory_used_percentage() > _MEMORY_THRESHOLD
+        # Bytes have exact integer representation across every backend.
+        header = [count, int(aligned), int(local_evict), *identity]
+        if self._group is None:
+            if not aligned:
+                raise RuntimeError("CUDA prefix cache metadata is inconsistent")
+            return count, local_evict
+        cpu = mx.Device(mx.cpu)
+        with mx.stream(cpu):
+            gathered = mx.distributed.all_gather(
+                mx.array(header, dtype=mx.int32), group=self._group, stream=cpu
+            )
+            flat = cast(list[int], gathered.tolist())
+        width = len(header)
+        records = [flat[start : start + width] for start in range(0, len(flat), width)]
+        if (
+            len(records) != self._group.size()
+            or any(record[1] != 1 for record in records)
+            or any(record[0] != records[0][0] for record in records)
+            or any(record[3:] != records[0][3:] for record in records)
+        ):
+            raise RuntimeError("Prefix caches diverged across CUDA cluster ranks")
+        return count, any(record[2] != 0 for record in records)
+
+    def _evict_cuda_group(self, *, reserve_entry: bool = False) -> None:
+        evicted_any = False
+        max_entries = _MAX_CUDA_PREFIX_CACHE_ENTRIES - int(reserve_entry)
+        while True:
+            count, evict = self._cuda_eviction_state()
+            if count == 0 or (not evict and count <= max_entries):
+                break
+            index = self._last_used.index(min(self._last_used))
+            for values in (
+                self.prompts,
+                self.caches,
+                self._snapshots,
+                self._media_regions,
+                self._last_used,
+                self.prefill_tps,
+                self._identities,
+            ):
+                _ = values.pop(index)
+            evicted_any = True
+            logger.info(
+                "KV cache evicted by joint CUDA cluster pressure or entry limit"
+            )
         if evicted_any:
             gc.collect()
             mx.clear_cache()
@@ -541,9 +713,11 @@ def get_prefix_length(prompt: mx.array, cached_prompt: mx.array) -> int:
     if n == 0:
         return 0
 
-    equal = mx.equal(prompt[:n], cached_prompt[:n]).astype(mx.int32)
-    prefix_mask = mx.cumprod(equal)  # stays 1 until first mismatch, then 0 forever
-    return int(mx.sum(prefix_mask).item())
+    left = cast(NDArray[np.int32], np.asarray(prompt[:n]))
+    right = cast(NDArray[np.int32], np.asarray(cached_prompt[:n]))
+    unequal = cast(NDArray[np.bool_], left != right)
+    mismatches = np.flatnonzero(unequal)
+    return int(cast(np.intp, mismatches[0])) if mismatches.size else n
 
 
 def get_available_memory() -> Memory:
@@ -552,6 +726,20 @@ def get_available_memory() -> Memory:
 
 
 def get_memory_used_percentage() -> float:
+    if sys.platform == "win32" and is_cuda_device():
+        gpu = read_gpu_memory()
+        # CUDA's MLX cache counter also includes pinned CPU buffers. Release
+        # cached allocations under pressure, then use fresh driver residency;
+        # host buffers cannot be credited toward available GPU memory.
+        if gpu is not None and gpu.free < _WINDOWS_GPU_MIN_FREE:
+            mx.clear_cache()
+            gpu = read_gpu_memory()
+        if gpu is None or gpu.free < _WINDOWS_GPU_MIN_FREE:
+            # System RAM says nothing about the GPU memory the KV cache is in.
+            # Report it full: the pressure the cache acts on is the maximum over
+            # ranks, so every rank then evicts together.
+            return 1.0
+        return 0.0
     mem = psutil.virtual_memory()
     # percent is 0-100
     return float(mem.percent / 100)

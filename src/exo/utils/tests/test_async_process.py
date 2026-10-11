@@ -10,8 +10,13 @@ from anyio import EndOfStream, create_task_group, fail_after
 
 from exo.utils.async_process import (
     AsyncProcess,
+    _read_pipe_win32,  # pyright: ignore[reportPrivateUsage]
 )
 from exo.utils.channels import MpSender, Receiver, mp_channel
+
+# os.abort() kills the child with SIGABRT on POSIX; on Windows the C runtime's
+# abort() exits with status 3 instead.
+_ABORT_EXITCODE = 3 if sys.platform == "win32" else -signal.SIGABRT
 
 
 def _write_to_stdio(prefix: str, *, stderr_suffix: str) -> None:
@@ -318,7 +323,7 @@ async def test_repeated_bad_children_do_not_pollute_or_replace_parent_stdio(
             elif target is _abort_after_stdio_write:
                 assert b"abort-child: stdout before abort\n" in stdout
                 assert b"abort-child: stderr before abort\n" in stderr
-                assert exitcode == -signal.SIGABRT
+                assert exitcode == _ABORT_EXITCODE
             else:
                 assert stdout == b""
                 assert b"stderr before exception\n" in stderr
@@ -415,3 +420,21 @@ async def test_death(capsys: CaptureFixture[str]) -> None:
 
         print("CHILD out:", stdout.decode("utf-8", errors="replace"))
         print("CHILD err:", stderr.decode("utf-8", errors="replace"), "hello :)")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows pipe reader")
+async def test_read_pipe_win32_returns_data_then_eof() -> None:
+    read_fd, pipe_write_fd = os.pipe()
+    write_fd: int | None = pipe_write_fd
+    try:
+        os.write(pipe_write_fd, b"runner output")
+        with fail_after(5):
+            assert await _read_pipe_win32(read_fd) == b"runner output"
+        os.close(pipe_write_fd)
+        write_fd = None
+        with fail_after(5):
+            assert await _read_pipe_win32(read_fd) == b""
+    finally:
+        os.close(read_fd)
+        if write_fd is not None:
+            os.close(write_fd)

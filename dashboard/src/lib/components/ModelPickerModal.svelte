@@ -1,4 +1,8 @@
 <script lang="ts">
+  import {
+    isModelLoadable,
+    type ModelFitStatus,
+  } from "$lib/utils/windows-model-capacity";
   import { tick } from "svelte";
   import { fade, fly } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
@@ -49,8 +53,6 @@
     last_modified: string;
     tags: string[];
   }
-
-  type ModelFitStatus = "fits_now" | "fits_cluster_capacity" | "too_large";
 
   export type InstanceStatus = {
     status: string;
@@ -152,7 +154,9 @@
 
       const modelSizeBytes = (model.storage_size_megabytes || 0) * 1024 * 1024;
       result.set(model.id, {
-        available: modelSizeBytes > 0 && totalRamBytes >= modelSizeBytes,
+        available:
+          getModelFitStatus(model.id) === "ram_offload" ||
+          (modelSizeBytes > 0 && totalRamBytes >= modelSizeBytes),
         nodeNames: nodeIds.map(getNodeName),
         nodeIds,
       });
@@ -543,7 +547,7 @@
         let hasClusterCapacityOnly = false;
         for (const variant of group.variants) {
           const fitStatus = getModelFitStatus(variant.id);
-          if (fitStatus === "fits_now") return 0;
+          if (isModelLoadable(fitStatus)) return 0;
           if (fitStatus === "fits_cluster_capacity") {
             hasClusterCapacityOnly = true;
           }
@@ -612,12 +616,12 @@
   // Split filtered groups into recommended (fits_now) and others for visual separation
   const recommendedGroups = $derived(
     filteredGroups.filter((g) =>
-      g.variants.some((v) => getModelFitStatus(v.id) === "fits_now"),
+      g.variants.some((v) => isModelLoadable(getModelFitStatus(v.id))),
     ),
   );
   const otherGroups = $derived(
     filteredGroups.filter(
-      (g) => !g.variants.some((v) => getModelFitStatus(v.id) === "fits_now"),
+      (g) => !g.variants.some((v) => isModelLoadable(getModelFitStatus(v.id))),
     ),
   );
 
@@ -981,7 +985,13 @@
                 >Recommended for your cluster</span
               >
               <span class="text-xs font-mono text-green-400/50"
-                >— fits in available memory</span
+                >{recommendedGroups.some((g) =>
+                  g.variants.some(
+                    (v) => getModelFitStatus(v.id) === "ram_offload",
+                  ),
+                )
+                  ? "— fits in VRAM or uses RAM offload"
+                  : "— fits in available memory"}</span
               >
             </div>
           {/if}

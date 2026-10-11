@@ -293,6 +293,9 @@ def pipeline_auto_parallel(
     start_layer, end_layer = model_shard_meta.start_layer, model_shard_meta.end_layer
     device_rank, world_size = model_shard_meta.device_rank, model_shard_meta.world_size
 
+    from exo.utils.windows_weights import validate_windows_weight_budget
+
+    validate_windows_weight_budget(model, layers, layers[start_layer:end_layer])
     layers = layers[start_layer:end_layer]
     total = len(layers)
     for i, layer in enumerate(layers):

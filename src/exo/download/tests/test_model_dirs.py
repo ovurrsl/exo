@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import struct
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +22,59 @@ from exo.shared.types.common import ModelId
 
 MODEL_ID = ModelId("test-org/test-model")
 NORMALIZED = MODEL_ID.normalize()
+
+
+def _create_monolithic_conversion(model_dir: Path) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    header = json.dumps(
+        {"layer.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    ).encode()
+    header += b" " * (-len(header) % 8)
+    (model_dir / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(header)) + header + struct.pack("<f", 1)
+    )
+    (model_dir / "config.json").write_text('{"model_type": "test"}')
+
+
+@pytest.mark.parametrize("stale_index", [False, True])
+def test_complete_monolithic_conversion_with_optional_stale_index(
+    tmp_path: Path, stale_index: bool
+) -> None:
+    from exo.download.download_utils import is_model_directory_complete
+
+    _create_monolithic_conversion(tmp_path)
+    if stale_index:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {"weight_map": {"layer.weight": "model-00001-of-00002.safetensors"}}
+            )
+        )
+    assert is_model_directory_complete(tmp_path)
+
+
+def test_stale_index_does_not_hide_partial_shards_or_truncated_conversion(
+    tmp_path: Path,
+) -> None:
+    from exo.download.download_utils import is_model_directory_complete
+
+    _create_monolithic_conversion(tmp_path)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a": "model-00001-of-00002.safetensors",
+                    "b": "model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+    first_shard = tmp_path / "model-00001-of-00002.safetensors"
+    first_shard.write_bytes(b"partial")
+    assert not is_model_directory_complete(tmp_path)
+    first_shard.unlink()
+    weights = tmp_path / "model.safetensors"
+    weights.write_bytes(weights.read_bytes()[:-1])
+    assert not is_model_directory_complete(tmp_path)
 
 
 def _create_complete_model(model_dir: Path) -> None:

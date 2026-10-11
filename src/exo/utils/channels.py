@@ -245,9 +245,10 @@ class MpSender[T]:
     """
 
     _state: MpState[T] = field()
+    _closed: bool = field(default=False, init=False)
 
     def send_nowait(self, item: T) -> None:
-        if self._state.closed.is_set():
+        if self._closed or self._state.closed.is_set():
             raise ClosedResourceError
         try:
             self._state.buffer.put(item, block=False)
@@ -258,7 +259,7 @@ class MpSender[T]:
             raise ClosedResourceError from e
 
     def send(self, item: T) -> None:
-        if self._state.closed.is_set():
+        if self._closed or self._state.closed.is_set():
             raise ClosedResourceError
         try:
             self.send_nowait(item)
@@ -271,17 +272,23 @@ class MpSender[T]:
             self.send, item, limiter=CapacityLimiter(1), abandon_on_cancel=True
         )
 
-    def close(self) -> None:
-        if not self._state.closed.is_set():
+    def close(self, *, graceful: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if graceful and not self._state.closed.is_set():
+            # Only the EOF marker closes the receiver, after queued messages.
+            self._state.buffer.put(_MpEndOfStream())
+        else:
             self._state.closed.set()
-        with contextlib.suppress(Exception):
-            self._state.buffer.put_nowait(_MpEndOfStream())
+            with contextlib.suppress(Exception):
+                self._state.buffer.put_nowait(_MpEndOfStream())
         self._state.buffer.close()
 
     # == unique to Mp channels ==
     def join(self) -> None:
         """Ensure any queued messages are resolved before continuing"""
-        assert self._state.closed.is_set(), (
+        assert self._closed or self._state.closed.is_set(), (
             "Mp channels must be closed before being joined"
         )
         self._state.buffer.join_thread()

@@ -1,7 +1,6 @@
 import argparse
 import multiprocessing as mp
 import os
-import resource
 import signal
 import sys
 from dataclasses import dataclass, field
@@ -9,7 +8,6 @@ from typing import Self
 
 import anyio
 from anyio.lowlevel import checkpoint as anyio_checkpoint
-from daemon import DaemonContext  # pyright: ignore[reportMissingTypeStubs]
 from exo_rs import Pidfile, PidfileError
 from loguru import logger
 from pydantic import PositiveInt
@@ -29,7 +27,9 @@ from exo.shared.types.common import NodeId, SessionId
 from exo.utils import STDIO_FDS
 from exo.utils.channels import Receiver, channel
 from exo.utils.pydantic_ext import FrozenModel
+from exo.utils.rlimits import raise_nofile_limit
 from exo.utils.task_group import TaskGroup
+from exo.utils.windows_shutdown import watch_windows_shutdown_event
 from exo.worker.main import Worker
 
 
@@ -48,6 +48,7 @@ class Node:
     offline: bool
     _api_port: int
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
+    _windows_shutdown_started: bool = field(init=False, default=False)
 
     @classmethod
     async def create(cls, args: "Args") -> Self:
@@ -156,6 +157,10 @@ class Node:
         async with self._tg as tg:
             signal.signal(signal.SIGINT, lambda _, __: self.shutdown())
             signal.signal(signal.SIGTERM, lambda _, __: self.shutdown())
+            if sys.platform == "win32":
+                # Ctrl+Break / console close on Windows.
+                signal.signal(signal.SIGBREAK, lambda _, __: self.shutdown())
+                tg.start_soon(watch_windows_shutdown_event, self.shutdown)
             tg.start_soon(self.router.run)
             tg.start_soon(self.event_router.run)
             tg.start_soon(self.election.run)
@@ -170,16 +175,37 @@ class Node:
             tg.start_soon(self._elect_loop)
 
     def shutdown(self):
+        if sys.platform == "win32":
+            if self._windows_shutdown_started or self._tg.cancel_called():
+                return
+            self._windows_shutdown_started = True
+            self._tg.start_soon(self._shutdown_windows)
+            return
         # if this is our second call to shutdown, just sys.exit
         if self._tg.cancel_called():
-            import sys
-
             sys.exit(1)
         self._tg.cancel_tasks()
+
+    async def _shutdown_windows(self) -> None:
+        # Keep the router/event consumers alive while cooperative runner
+        # shutdown drains its final acknowledgements and closes MLX normally.
+        try:
+            with anyio.move_on_after(8.5) as shutdown:
+                if self.api is not None:
+                    self.api.paused = True
+                if self.worker is not None:
+                    await self.worker.stop_windows_admission()
+                    await self.worker.close_windows_instances()
+            if shutdown.cancel_called:
+                logger.warning("Windows cooperative shutdown exceeded its deadline")
+        finally:
+            self._tg.cancel_tasks()
 
     async def _elect_loop(self):
         with self.election_result_receiver as results:
             async for result in results:
+                if self._windows_shutdown_started:
+                    return
                 # This function continues to have a lot of very specific entangled logic
                 # At least it's somewhat contained
 
@@ -194,6 +220,8 @@ class Node:
 
                 if result.is_new_master:
                     await anyio_checkpoint()
+                    if self._windows_shutdown_started:
+                        return
                     self.event_router.shutdown()
                     self.event_router = EventRouter(
                         result.session_id,
@@ -235,6 +263,8 @@ class Node:
                         f"Node {result.session_id.master_node_id} elected master - demoting self"
                     )
                     await self.master.shutdown()
+                    if self._windows_shutdown_started:
+                        return
                     self.master = None
                 else:
                     logger.info(
@@ -243,6 +273,8 @@ class Node:
                 if result.is_new_master:
                     if self.download_coordinator:
                         await self.download_coordinator.shutdown()
+                        if self._windows_shutdown_started:
+                            return
                         self.download_coordinator = DownloadCoordinator(
                             self.node_id,
                             exo_shard_downloader(offline=self.offline),
@@ -255,6 +287,8 @@ class Node:
                         self._tg.start_soon(self.download_coordinator.run)
                     if self.worker:
                         await self.worker.shutdown()
+                        if self._windows_shutdown_started:
+                            return
                         # TODO: add profiling etc to resource monitor
                         self.worker = Worker(
                             self.node_id,
@@ -288,6 +322,12 @@ def main():
 
     try:
         if args.legacy_daemon:
+            if sys.platform == "win32":
+                print("--legacy-daemon is not supported on Windows", file=sys.stderr)
+                raise SystemExit(2)
+
+            from daemon import DaemonContext
+
             # keep stdio backed by explicit /dev/null streams. multiprocessing spawn expects
             # valid stdio FDs; letting DaemonContext close/reopen them can break runner startup.
             for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
@@ -330,9 +370,7 @@ def main():
 
 
 def main_inner(args: "Args"):
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    target = min(max(soft, 65535), hard)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    raise_nofile_limit(65535)
 
     mp.set_start_method("spawn", force=True)
 
@@ -344,7 +382,7 @@ def main_inner(args: "Args"):
         raise ValueError(
             "EXO_LIBP2P_NAMESPACE has been removed - use EXO_ZENOH_NAMESPACE instead"
         )
-    logger.info(f"EXO_ZENOH_NAMESPACE: {os.getenv('EXO_ZENOH_NAMESPACE')}")
+    logger.info(f"EXO_ZENOH_NAMESPACE: {args.namespace}")
 
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
@@ -467,7 +505,7 @@ class Args(FrozenModel):
         parser.add_argument(
             "--namespace",
             type=str,
-            default=__version__,
+            default=(os.getenv("EXO_ZENOH_NAMESPACE") or "").strip() or __version__,
             dest="namespace",
             help="Discovery namespace, nodes with different namespaces will not connect.",
         )

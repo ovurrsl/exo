@@ -176,6 +176,15 @@ def _get_shard_assignments_for_cfg_parallel(
         layers_before = sum(layer_allocations[:pipeline_rank])
         node_layers = layer_allocations[pipeline_rank]
 
+        # Both CFG groups execute the same layers, but can have different memory.
+        required_memory = (model_card.storage_size * node_layers) // model_card.n_layers
+        if required_memory > node_memory[node_id].ram_available:
+            raise ValueError(
+                f"CFG group {cfg_rank} node {node_id} has insufficient memory "
+                f"for {node_layers} layers: requires {required_memory.in_gb:.2f} GB, "
+                f"available {node_memory[node_id].ram_available.in_gb:.2f} GB"
+            )
+
         shard = CfgShardMetadata(
             model_card=model_card,
             device_rank=device_rank,

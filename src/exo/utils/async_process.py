@@ -7,8 +7,7 @@ import os
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from multiprocessing.process import BaseProcess
-from multiprocessing.resource_sharer import DupFd
-from typing import final
+from typing import Protocol, cast, final
 
 from anyio import (
     TASK_STATUS_IGNORED,
@@ -30,10 +29,46 @@ from exo.utils.channels import Receiver, Sender, channel
 
 _READ_CHUNK_SIZE = 64 * 1024
 _JOIN_GRACE_SECONDS = 3.0
+_WIN_PIPE_POLL_SECONDS = 0.01
+_WIN_PIPE_SPIN_CHECKS = 64
 _TERMINATE_GRACE_SECONDS = 5.0
 _TERMINATE_RETRY_GRACE_SECONDS = 2.0
 _TERMINATE_ATTEMPTS = 10
 _KILL_GRACE_SECONDS = 2.0
+
+
+class _DetachableWriteFd(Protocol):
+    def detach(self) -> int: ...
+
+
+def _share_write_fd(fd: int) -> _DetachableWriteFd:
+    """Wrap a pipe write-end so it can be unpickled in a spawned child."""
+    if sys.platform == "win32":
+        import _winapi
+        import msvcrt
+        from multiprocessing.reduction import DupHandle
+
+        return _WinSharedWriteFd(
+            DupHandle(msvcrt.get_osfhandle(fd), _winapi.DUPLICATE_SAME_ACCESS)
+        )
+
+    from multiprocessing.resource_sharer import DupFd
+
+    return DupFd(fd)
+
+
+class _WinSharedWriteFd:
+    """Convert a Windows DupHandle back into a Python file descriptor."""
+
+    def __init__(self, handle: _DetachableWriteFd) -> None:
+        self._handle = handle
+
+    def detach(self) -> int:
+        if sys.platform != "win32":
+            raise NotImplementedError("_WinSharedWriteFd is only used on Windows")
+        import msvcrt
+
+        return msvcrt.open_osfhandle(self._handle.detach(), 0)
 
 
 @final
@@ -91,8 +126,8 @@ class AsyncProcess:
                     target=_run_with_captured_stdio,
                     name=self._name,
                     args=(
-                        DupFd(stdout_write_fd),
-                        DupFd(stderr_write_fd),
+                        _share_write_fd(stdout_write_fd),
+                        _share_write_fd(stderr_write_fd),
                         self._target,
                         *self._args,
                     ),
@@ -245,8 +280,8 @@ class AsyncProcess:
 
 # Spawn-mode multiprocessing requires a module-level target that can be pickled.
 def _run_with_captured_stdio(
-    stdout: DupFd,
-    stderr: DupFd,
+    stdout: _DetachableWriteFd,
+    stderr: _DetachableWriteFd,
     target: Callable[..., object] | None,
     *target_args: object,
     **target_kwargs: object,
@@ -270,8 +305,11 @@ def _run_with_captured_stdio(
 async def _drain_fd(fd: int, tx: Sender[bytes]) -> None:
     try:
         while True:
-            await wait_readable(fd)
-            chunk = os.read(fd, _READ_CHUNK_SIZE)
+            if sys.platform == "win32":
+                chunk = await _read_pipe_win32(fd)
+            else:
+                await wait_readable(fd)
+                chunk = os.read(fd, _READ_CHUNK_SIZE)
             if not chunk:
                 return
             await tx.send(chunk)
@@ -280,6 +318,38 @@ async def _drain_fd(fd: int, tx: Sender[bytes]) -> None:
     finally:
         _close_fd(fd)
         await tx.aclose()
+
+
+async def _read_pipe_win32(fd: int) -> bytes:
+    """Wait until the pipe has data (or EOF), then read it without blocking.
+
+    anyio.wait_readable only supports sockets on Windows. Reading in a worker
+    thread is not a substitute: the UCRT holds a per-fd lock for the whole
+    blocking ReadFile, so closing the fd after a cancelled read blocks the
+    event loop until the child writes or exits. PeekNamedPipe returns at once
+    while no other thread reads the handle, so cancellation stays immediate,
+    like wait_readable on POSIX.
+    """
+    if sys.platform != "win32":
+        raise NotImplementedError("_read_pipe_win32 is only used on Windows")
+    import _winapi
+    import msvcrt
+
+    handle = msvcrt.get_osfhandle(fd)
+    checks = 0
+    while True:
+        try:
+            available, _ = cast(tuple[int, int], _winapi.PeekNamedPipe(handle, 0))
+        except BrokenPipeError:
+            return b""  # every write end is closed and the pipe is drained
+        if available:
+            return os.read(fd, min(available, _READ_CHUNK_SIZE))
+        checks += 1
+        # os.pipe() buffers only ~4 KiB, so a chatty child is usually in the
+        # middle of its next write right after a read: re-check a few times
+        # before falling back to timer polling, or bulk output gets paced by
+        # the event-loop timer (~15 ms per write on Windows).
+        await sleep(0 if checks < _WIN_PIPE_SPIN_CHECKS else _WIN_PIPE_POLL_SECONDS)
 
 
 def _close_fd(fd: int | None) -> None:
